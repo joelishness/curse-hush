@@ -50,7 +50,8 @@ def extract_raw(
     the job store regardless of keep_intermediates, because it is the
     essential resume artifact for future per-channel reprocessing (§13.3).
 
-    Writes audio codec metadata to job.json and marks '1a_extract_raw' done.
+    Writes audio codec metadata (including the source title tag, when
+    present) to job.json and marks '1a_extract_raw' done.
     Returns the path to audio_raw.{ext}.
     """
     if log is None:
@@ -64,11 +65,23 @@ def extract_raw(
     layout  = stream.get("channel_layout", "unknown")
     rate    = stream.get("sample_rate", "?")
     bitrate = stream.get("bit_rate", "?")
+    title   = stream.get("tags", {}).get("title")
 
     log.info(
         "  codec: %s  |  channels: %d (%s)  |  sample_rate: %s Hz  |  bitrate: %s bps",
         codec, ch, layout, rate, bitrate,
     )
+    # The stream title is a free-text label a human sees in a media
+    # player's audio-track picker (e.g. "Surround 7.1") -- it's set once
+    # at encode time and never validated against the stream's actual
+    # codec/channels/bitrate, so the two can silently disagree (a title
+    # promising "Surround 7.1" on a stream ffprobe reports as 2-channel
+    # mp3 -- exactly the case above -- means the file was downmixed at
+    # some point and the title was never updated to match it). Logged
+    # unconditionally, not only when present, so a missing title is just
+    # as visible here as one that contradicts the probed values, rather
+    # than either kind only being noticed by ear in a media player.
+    log.info("  title: %s", title if title else "(none)")
     if ch > 2:
         log.info(
             "  ℹ  Multi-channel source (%s ch, %s) — will be downmixed to stereo at Step 1b.",
@@ -101,6 +114,7 @@ def extract_raw(
         "channel_layout": layout,
         "sample_rate":    rate,
         "bit_rate":       bitrate,
+        "title":          title,
         "raw_file":       out_path.name,
     }
     write_job(job_dir, state)
@@ -188,13 +202,15 @@ def _probe_audio_stream(video_path: Path, log: logging.LoggerAdapter) -> dict:
     """
     Run ffprobe on the first audio stream of video_path.
     Returns the stream dict with codec_name, channels, channel_layout,
-    sample_rate, bit_rate.
+    sample_rate, bit_rate, and tags (a nested dict holding 'title' when
+    the source sets one -- see extract_raw() for why that's logged).
     """
     result = run_cmd(
         [
             "ffprobe", "-v", "quiet",
             "-select_streams", "a:0",
-            "-show_entries", "stream=codec_name,bit_rate,sample_rate,channels,channel_layout",
+            "-show_entries",
+            "stream=codec_name,bit_rate,sample_rate,channels,channel_layout:stream_tags=title",
             "-of", "json",
             str(video_path),
         ],
