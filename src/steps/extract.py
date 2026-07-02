@@ -129,7 +129,12 @@ def downmix_to_stereo(
     audio_raw.{ext} is always preserved for future per-channel reprocessing.
 
     audio_stereo.wav is large (~300 MB/hour) and is kept only when
-    keep_intermediates is set; otherwise it is deleted after Step 2 completes.
+    keep_intermediates is set; otherwise it is deleted after Step 3b (merge)
+    completes -- not Step 2. Step 2 (separate.py) only reads this file (or
+    its per-segment audio_stereo_NN.wav splits) as Demucs input and never
+    deletes it; the actual cleanup happens in steps/merge.py, alongside the
+    per-segment splits, once they're no longer needed. See steps/merge.py's
+    module docstring and design doc §6.
 
     Marks '1b_downmix' done.  Returns path to audio_stereo.wav.
     """

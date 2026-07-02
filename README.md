@@ -115,7 +115,10 @@ Set `output.naming_style: suffix` in `config.yaml` for a plain suffix instead: `
 ```bash
 # Copy and edit the environment file
 cp .env.example .env
-# Edit .env — at minimum set INPUT_DIR to the directory containing your video
+# Edit .env — at minimum set INPUT_DIR to the directory containing your video.
+# Also set HOST_UID/HOST_GID (see comments in .env.example) — unlike hush.sh,
+# docker compose can't detect these automatically, and skipping them leaves
+# job/cache/output files owned by root on the host.
 
 # Run
 docker compose run --rm hush /input/movie.mkv
@@ -133,7 +136,7 @@ Measured on a 16 GB machine, `htdemucs_ft`, `large-v2` WhisperX:
 | Stage | Per segment (30 min) | For a 2-hour film |
 |---|---|---|
 | Demucs `--shifts 1` (default) | ~33 min | ~2.2 hours (4 segments) |
-| Demucs `--shifts 4` (quality) | ~2 hours (estimated†) | ~8.7 hours (estimated†) |
+| Demucs `--shifts 4` (quality) | ~2.2 hours (estimated†) | ~8.7 hours (estimated†) |
 | WhisperX `large-v2` | — | ~30–60 min total |
 | **Total (shifts=1)** | | **~3–4 hours** |
 
@@ -231,12 +234,18 @@ Every run creates a job record under `~/.local/share/profanity-hush/jobs/`, in a
 
 Large intermediate WAV files are deleted by default once each is no longer needed. Pass `--keep-tmp` to retain all of them (including ones not needed for corrections); see `output.keep_correction_artifacts` in `config.yaml` to control just the two needed for corrections independently.
 
-Files are written owned by the user who ran `hush.sh`, not root. If you have job, cache, or output files from before this was fixed, they'll still be owned by root — clean them up once with:
+Files are written owned by the user who ran `hush.sh`, not root. If you have job or cache files from before this was fixed, they'll still be owned by root — clean them up once with:
 
 ```bash
 sudo chown -R "$(id -u):$(id -g)" \
     ~/.local/share/profanity-hush \
     ~/.cache/profanity-hush
+```
+
+If you also ran with a custom `-o`/`--output` directory before this was fixed, chown that too — its location isn't fixed the way the job/cache paths above are (it defaults to the same directory as your input video, or wherever `-o` pointed), so it isn't included in the command above:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" /path/to/your/output/dir
 ```
 
 ---

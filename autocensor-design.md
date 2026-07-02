@@ -190,8 +190,15 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
           │
           ▼
 ┌─────────────────────┐
-│  STEP 7: Mux to     │  ffmpeg -c:v copy → Movie (Year) {edition-Hushed}.mkv
-│  video              │  (output.naming_style: suffix → Movie_censored.mkv)
+│  STEP 6b: Encode    │  ffmpeg, single input — re-encodes audio_censored.wav to
+│  audio              │  match the original codec/bitrate/channels → audio_encoded.mka
+└─────────────────────┘
+          │
+          ▼
+┌─────────────────────┐
+│  STEP 7: Mux to     │  mkv (default) → mkvmerge; mp4 → ffmpeg -c:v copy -c:a copy
+│  video              │  → Movie (Year) {edition-Hushed}.mkv
+│                     │  (output.naming_style: suffix → Movie_censored.mkv)
 └─────────────────────┘
  
 OUTPUT: the final censored video, in /output  [+ job record in jobs store]
@@ -211,9 +218,14 @@ Single CPU-only image. No CUDA, no nvidia-container-toolkit required on either h
 ```
 Dockerfile
 ├── FROM python:3.11-slim
-├── apt: ffmpeg, git, libsndfile1
-├── pip: torch (cpu build), demucs, whisperx, faster-whisper, pysrt, rapidfuzz, tqdm, pyyaml
-└── COPY src/ /app/
+├── apt: ffmpeg, mkvtoolnix (mkvmerge — Step 7 mkv path, see §8 steps/mux.py),
+│        git, libsndfile1, libgomp1 (OpenMP runtime; demucs)
+├── pip: torch (cpu build), demucs, whisperx, faster-whisper, soundfile
+│        (torchaudio save() backend), pysrt, rapidfuzz, tqdm, pyyaml
+├── COPY src/ /app/
+└── COPY config/word_list.txt /app/defaults/word_list.txt  — built-in fallback
+    word list, used when /config/word_list.txt isn't mounted (§7.2,
+    steps/matching.py's resolve_word_list_path())
     ENTRYPOINT ["python", "/app/pipeline.py"]
 ```
  
@@ -268,30 +280,38 @@ profanity-hush/
 │   └── word_list.txt           # word/phrase match list; see §7.2 for format notation
 │
 ├── src/
-│   ├── pipeline.py             # orchestrator; runs steps 1–7 in order; manages job state
+│   ├── pipeline.py             # orchestrator; runs steps 1a–7 in order; manages job state
 │   ├── steps/
 │   │   ├── extract.py          # step 1a+1b: bitstream copy + stereo downmix
 │   │   ├── segment.py          # step 1c: split audio_stereo.wav into segments
 │   │   ├── separate.py         # step 2: demucs wrapper (per-segment)
 │   │   ├── transcribe.py       # step 3: whisperx wrapper (per-segment)
 │   │   ├── merge.py            # step 3b: apply global offsets; concatenate stems + transcripts
-│   │   ├── align_srt.py        # step 4: optional SRT cross-reference
+│   │   ├── align_srt.py        # step 4: optional SRT cross-reference — Phase 3 (§1, §10),
+│   │   │                       #   NOT YET IMPLEMENTED / not present in this repo yet;
+│   │   │                       #   listed here only for its planned location
 │   │   ├── matching.py         # shared word-list parsing + transcript matching; called once,
 │   │   │                       #   by review.py's flag phase below — mute.py never calls it
 │   │   ├── review.py           # step 4b: flag phase (always runs) + optional interactive
 │   │   │                       #   review phase, run in sequence — see §4
 │   │   ├── mute.py             # step 5: mutes the dialog stem from review.py's flagged
 │   │   │                       #   matches (no transcript re-scan); generates the ffmpeg filter
-│   │   ├── recombine.py        # step 6: amix stems
-│   │   └── mux.py              # step 7: probe codec, mux audio to video
+│   │   ├── recombine.py        # step 6: amix stems → audio_censored.wav
+│   │   ├── encode.py           # step 6b: standalone single-input ffmpeg re-encode of
+│   │   │                       #   audio_censored.wav to match the original codec →
+│   │   │                       #   audio_encoded.mka — split out of mux.py; see §8
+│   │   └── mux.py              # step 7: mkvmerge (mkv) or ffmpeg (mp4) mux of
+│   │                           #   audio_encoded.mka into the original video — see §8
 │   └── utils.py                # shared helpers (logging, job state, path mgmt)
 │
-├── tests/
+├── tests/                       # NOT YET PRESENT in this repo — aspirational, see note below
 │   ├── samples/                # short test clips (5–10s)
 │   └── test_pipeline.py
 │
 └── README.md
 ```
+ 
+`align_srt.py` and `tests/` above are not in the current tree — the repo contains no `tests/` directory and no test suite of any kind yet. Everything else in this listing exists in the repo as shown, including `steps/encode.py` (Step 6b), which earlier revisions of this tree omitted despite being implemented — see the module's own spec in §8.
  
 ### Job Store Design Principle
  
@@ -425,21 +445,36 @@ interactive:
   enabled: false                # true to pause and review flagged words before muting
                                 # override with --interactive flag on the CLI
   show_context_words: 8         # words of surrounding context to display per flagged entry
-  min_confidence_for_prompt: 0.0 # only prompt for entries at or below this confidence
-                                 # 0.0 = prompt for all; 1.0 = never prompt (same as disabled)
+  min_confidence_for_prompt: 0.0 # auto-approved only if confidence is STRICTLY > this value
+                                 # 0.0 = prompt for all (special-cased); 1.0 = ALSO prompts for
+                                 # all, since no score ever exceeds 1.0 -- not "auto-approve
+                                 # everything". No setting here skips review entirely.
  
 # Censoring behavior
 censoring:
-  method: mute                  # mute | beep
+  method: mute                  # mute | beep (beep not yet implemented — §10, Phase 4)
   beep_frequency_hz: 1000       # only used when method: beep
   padding_ms: 50                # ms of silence/beep added before and after each word
   word_list: /config/word_list.txt
  
 # Output
 output:
-  suffix: _censored             # appended to input filename before extension
-  format: mkv                   # mkv | mp4
-  keep_intermediates: false     # keep large WAV stems after run (transcript JSONs always kept)
+  naming_style: plex_edition    # plex_edition (default) | suffix
+                                # plex_edition: Plex-friendly {edition-Name} tag, inserted
+                                #   after "(YYYY)" if present, else appended at the end:
+                                #     "Movie (1986).sd.hevc.mkv" ->
+                                #     "Movie (1986) {edition-Hushed}.sd.hevc.mkv"
+                                # suffix: the original v1 behaviour — see `suffix` below
+  edition_name: Hushed          # used inside the {edition-...} tag; naming_style: plex_edition only
+  suffix: _censored             # appended to input filename before extension;
+                                # naming_style: suffix only
+  format: mkv                   # mkv (mkvmerge — see §8 steps/mux.py) | mp4 (ffmpeg,
+                                # no subtitle/attachment passthrough)
+  keep_intermediates: false     # keep large WAV/audio stems after run (transcript JSONs,
+                                # matches.json, review.json, censor_log.json always kept)
+  keep_correction_artifacts: true # keep dialog.wav/score_sfx.wav specifically, independent
+                                 # of keep_intermediates above, so --skip-index/--add-interval/
+                                 # --redo-review only redo Steps 5, 6, 6b, 7 — not Step 2's Demucs
   log_level: info               # debug | info | warning
  
 # Job storage
@@ -556,7 +591,9 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
   ```
 - `-ac 2` handles any channel layout (stereo passthrough, mono upmix, 5.1/7.1 downmix)
 - Output feeds Step 1c (segmentation); regenerable from `audio_raw` if deleted
-- Kept only if `keep_intermediates` is set; otherwise deleted after Step 2 completes
+- Kept only if `keep_intermediates` is set; otherwise deleted after Step 3b (merge)
+  completes — Step 2 (separate.py) only reads it as Demucs input and never deletes
+  it; see `steps/segment.py`'s own spec just below, and §6
 - This is v1's deliberate boundary for multi-channel handling — see §13.3 for the future path
 ### `steps/segment.py` *(Step 1c)*
 - **Input:** `audio_stereo.wav`
@@ -827,7 +864,7 @@ ffmpeg \
   -c:v copy -c:a copy \
   -avoid_negative_ts make_zero \
   -f mp4 \
-  output_censored.mp4.tmp.mp4   # renamed to output_censored.mp4 only after ffmpeg exits 0
+  output_censored.tmp.mp4   # renamed to output_censored.mp4 only after ffmpeg exits 0
 ```
 `-avoid_negative_ts make_zero` is defensive here, for the same reason as Step 6b's — there's no evidence from testing that mp4 output needs it, but it costs nothing to pin explicitly. No subtitle/attachment passthrough is attempted for mp4 — PGS/VOBSUB bitmap subtitles in particular generally aren't valid in MP4 at all, and attempting the copy would make ffmpeg fail outright rather than just producing a censored file without subtitles. Chapters are carried forward (MP4 represents them internally via a different mechanism than Matroska; ffmpeg already does this by default for a single input, but `-map_chapters 0` is kept explicit rather than relying on that default).
 

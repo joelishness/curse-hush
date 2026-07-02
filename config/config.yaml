@@ -117,10 +117,17 @@ interactive:
   # make a confident approve/reject decision.
   show_context_words: 8
 
-  # Confidence threshold for auto-approval.
-  #   0.0  — prompt for every flagged word regardless of confidence (default)
-  #   0.7  — auto-approve words with confidence ≥ 0.7; prompt for the rest
-  #   1.0  — auto-approve everything (equivalent to disabled)
+  # Confidence threshold for auto-approval. A flagged word is auto-approved
+  # (never shown in the review prompt) only when its confidence is
+  # STRICTLY GREATER than this value (see steps/review.py).
+  #   0.0  — prompt for every flagged word regardless of confidence (default;
+  #          special-cased to always prompt, rather than "score > 0.0", since
+  #          nearly every real match would otherwise clear that bar)
+  #   0.7  — auto-approve words with confidence > 0.7; prompt for the rest
+  #   1.0  — NOT "auto-approve everything": confidence never exceeds 1.0, so
+  #          nothing can ever be "> 1.0" -- this behaves the same as 0.0
+  #          (prompt for every flagged word). There is no threshold value
+  #          that skips review entirely; run without --interactive for that.
   # Use this to reduce review burden when most detections are high-confidence.
   # See §13.6 for the full Confidence-Guided Review roadmap item.
   min_confidence_for_prompt: 0.0
