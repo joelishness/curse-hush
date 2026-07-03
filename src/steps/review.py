@@ -123,6 +123,9 @@ def flag(
     interactive mode. Step 5 needs matches.json to exist either way. This
     is the *only* place find_matches() is called; Step 5 never re-scans.
 
+    Writes job.json's "flag" block with word_count/candidates stats plus
+    a "file" field naming matches.json.
+
     Returns the path to matches.json.
     """
     if log is None:
@@ -158,7 +161,11 @@ def flag(
     _write_matches_json(matches_path, matches)
 
     state = read_job(job_dir)
-    state["flag"] = {"word_count": len(words), "candidates": len(matches)}
+    state["flag"] = {
+        "word_count": len(words),
+        "candidates": len(matches),
+        "file":       matches_path.name,
+    }
     write_job(job_dir, state)
     mark_step_done(job_dir, "4b_flag")
 
@@ -195,6 +202,11 @@ def review(
     Returns the path to review.json. Raises ReviewAborted if the user
     quits mid-review (caller should treat this distinctly from a step
     failure).
+
+    Writes job.json's "review" block with the candidates/approved/
+    rejected/added/auto_approved summary plus a "file" field naming
+    review.json -- see also apply_corrections() below, which updates
+    just the "file" field via a completely separate, non-interactive path.
     """
     if log is None:
         log = step_logger("review")
@@ -235,7 +247,7 @@ def review(
         summary = {"candidates": 0, "approved": 0, "rejected": 0, "added": 0, "auto_approved": 0}
         _write_review_json(review_path, [])
         state = read_job(job_dir)
-        state["review"] = summary
+        state["review"] = {**summary, "file": review_path.name}
         write_job(job_dir, state)
         mark_step_done(job_dir, "4b_review")
         return review_path
@@ -244,7 +256,7 @@ def review(
 
     _write_review_json(review_path, overrides)
     state = read_job(job_dir)
-    state["review"] = summary
+    state["review"] = {**summary, "file": review_path.name}
     write_job(job_dir, state)
     mark_step_done(job_dir, "4b_review")
 
@@ -300,6 +312,13 @@ def apply_corrections(
     Returns the path to review.json. Does not touch matches.json or
     re-run find_matches() — flag()'s output is untouched by corrections,
     only what's layered on top of it.
+
+    Also ensures job.json's "review" block has a "file" field naming
+    review.json, without disturbing any candidates/approved/rejected/
+    added/auto_approved stats a prior interactive review() already
+    recorded there — this path has no comparable stats of its own to
+    report, since it edits overrides directly rather than running a
+    review pass.
     """
     if log is None:
         log = step_logger("correct")
@@ -362,6 +381,20 @@ def apply_corrections(
         log.info("  add   %-22r %s - %s", text, fmt_timestamp(start), fmt_timestamp(end))
 
     _write_review_json(review_path, overrides)
+
+    # Preserve any stats already recorded by a prior interactive review()
+    # pass (candidates/approved/rejected/added/auto_approved) -- this path
+    # only ever adds/edits overrides, it doesn't re-run a review pass, so
+    # it has no comparable stats of its own to report. If this is the
+    # *first* write to review.json (corrections applied with no prior
+    # interactive review), state.get("review", {}) starts empty and this
+    # ends up recording just the filename, which is still strictly better
+    # than the previous behavior of recording nothing at all here.
+    state = read_job(job_dir)
+    review_state = state.get("review", {})
+    review_state["file"] = review_path.name
+    state["review"] = review_state
+    write_job(job_dir, state)
     mark_step_done(job_dir, "4b_review")
 
     log.info("  ✓  review.json updated — %d total override(s).", len(overrides))

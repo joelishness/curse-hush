@@ -43,6 +43,9 @@ Logic:
      utils.fmt_timestamp()) -- a finer-grained record than the merged
      ffmpeg intervals, useful for review and for the future correction
      workflow (§13.4).
+  7. Persist both filenames to job.json's "mute" block ("files":
+     {"dialog_censored", "censor_log"}), alongside the method/padding/
+     candidate stats it already recorded.
 
 If zero intervals remain after overrides (no candidates were flagged, or
 every candidate was rejected), dialog_censored.wav is a plain copy of
@@ -203,6 +206,10 @@ def mute(
         "skipped":         n_skipped,
         "added":           n_added,
         "muted_intervals": len(merged),
+        "files": {
+            "dialog_censored": censored_out.name,
+            "censor_log":      censor_log_out.name,
+        },
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "5_mute")

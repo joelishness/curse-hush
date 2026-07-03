@@ -150,7 +150,12 @@ def downmix_to_stereo(
     per-segment splits, once they're no longer needed. See steps/merge.py's
     module docstring and design doc §6.
 
-    Marks '1b_downmix' done.  Returns path to audio_stereo.wav.
+    Marks '1b_downmix' done.  Writes a 'downmix' block to job.json naming
+    the output file (mirrors '1a_extract_raw's own "audio" block above --
+    kept separate rather than folded into it, since this describes a
+    structurally different artifact: always 2ch/44.1kHz/pcm_s16le,
+    regardless of the source's own codec/channels/bitrate).
+    Returns path to audio_stereo.wav.
     """
     if log is None:
         log = step_logger("extract")
@@ -192,6 +197,17 @@ def downmix_to_stereo(
         )
         log.info("  ✓  audio_stereo.wav  (%s)", fmt_size(out))
 
+    # Written unconditionally (not only on a fresh downmix) so a resumed
+    # run's job.json still names this file even when this call just took
+    # the ↩ skip branch above -- same reasoning as extract_raw's "audio"
+    # block, which re-persists every call rather than only on first write.
+    state = read_job(job_dir)
+    state["downmix"] = {
+        "channels":    2,
+        "sample_rate": 44100,
+        "file":        out.name,
+    }
+    write_job(job_dir, state)
     mark_step_done(job_dir, "1b_downmix")
     return out
 
