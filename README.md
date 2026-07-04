@@ -13,7 +13,7 @@ Automatically censor profanity from movie files. Feed it a video; get back a cen
 5. **Mute** — Flagged words are silenced only in the dialog stem; music and sound effects play through uninterrupted
 6. **Recombine** — The stems are mixed back together and muxed into the output video (video stream is a bit-for-bit copy)
 
-Optionally: cross-reference an SRT subtitle file (coming soon™️) or pause for interactive review before muting (available now via `--interactive`).
+Optionally: cross-reference an SRT subtitle file (Phase 3) or pause for interactive review before muting (available now via `--interactive`).
 
 ---
 
@@ -31,7 +31,7 @@ Optionally: cross-reference an SRT subtitle file (coming soon™️) or pause fo
 ### 1. Build the Docker image
 
 ```bash
-git clone https://github.com/joelishness/profanity-hush.git
+git clone https://github.com/yourname/profanity-hush.git
 cd profanity-hush
 docker build -t profanity-hush .
 ```
@@ -151,7 +151,8 @@ spare and have validated the quality difference is meaningful on your content
 
 **Memory:** Peak memory is bounded per segment by the 30-minute segment size (default).
 Reduce `audio.segment_size_sec` in `config.yaml` if you see OOM errors on machines
-with less than 16 GB RAM.
+with less than 16 GB RAM. Still hitting this on a bigger machine, or inconsistently?
+See [Troubleshooting](#troubleshooting) — RAM size isn't the whole story.
 
 ---
 
@@ -335,6 +336,22 @@ This can't be combined with `--skip-index`/`--add-interval` in the same run — 
 Repeatable, and valid for `4b_flag`, `4b_review`, `5_mute`, `6_recombine`, `6b_encode`, and `7_mux`. Steps 1a–3b aren't offered: they're resumed as a single atomic block, and their per-segment intermediates may already be gone, so redoing one of them alone isn't safe. `--redo-step` never touches `review.json` and can't be combined with `--skip-index`/`--add-interval`/`--redo-review` in the same run.
 
 It also requires the job to actually be found first: if `compute_job_id()` doesn't land on an existing job for this input file (same path, unchanged), `hush.sh` refuses with a clear error rather than silently falling through to a full from-scratch run. This is also why hand-editing `steps_completed` in `job.json` directly isn't recommended, even though each step does check its own entry independently and the edit can appear to work: a single stray character (a trailing comma is the classic one) makes the whole file invalid JSON, and an unparseable `job.json` looks identical to "no job exists yet" to the code that's trying to find it — the visible symptom is a full multi-hour re-run with no explanation, not an error. `--redo-step` is the safe, validated way to get the same result.
+
+---
+
+## Troubleshooting
+
+### Step 2 (Demucs) fails with "Command failed (exit -9)"
+
+```
+[ERROR] [separate ] Step 2 failed: Command failed (exit -9)
+```
+
+with no traceback — the process just stops. `exit -9` is SIGKILL: the OOM killer (or a container memory limit) killing `demucs`, not a code or input-file problem.
+
+RAM size alone doesn't fully protect against this — it depends on what else is using memory at the time, so the crash point can shift between runs, or disappear after a plain **reboot** with nothing else changed. Confirm with `docker inspect <container> --format='{{.State.OOMKilled}}'` or `dmesg -T | grep -i "killed process"`.
+
+**To fix:** reboot or free other memory first; otherwise lower `audio.segment_size_sec` (or `AC_SEGMENT_SIZE`) below the 1800s default (see [Configuration](#configuration)), switch `demucs.model` to `htdemucs` instead of `htdemucs_ft` (~1/4 the memory, at some quality cost), or lower `demucs.shifts`.
 
 ---
 
