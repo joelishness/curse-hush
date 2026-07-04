@@ -196,6 +196,7 @@ See the full file at `config/config.yaml` for all options and their documentatio
 | `AC_INTERACTIVE=1` | Enable interactive review (same as `--interactive`) |
 | `AC_SEGMENT_SIZE` | Override `audio.segment_size_sec` in seconds; `0` disables segmentation |
 | `AC_TZ_OFFSET` / `AC_TZ_NAME` | Host UTC offset (e.g. `-0700`) / cosmetic abbreviation (e.g. `PDT`) used for log timestamps. `hush.sh` sets both automatically from the host's clock — see [Logging](#logging) below — only needed by hand if you're running the container some other way. |
+| `AC_INPUT_HOST_DIR` / `AC_OUTPUT_HOST_DIR` | Real host directories for the input/output files, so `job.json` is readable outside the container. `hush.sh`/`docker compose` set both automatically — see [Logging](#logging) below — only needed by hand if you're running the container some other way. |
 
 ```bash
 AC_LOG_LEVEL=debug ./hush.sh movie.mkv
@@ -226,6 +227,8 @@ Console timestamps automatically match this machine's local clock: `hush.sh` det
 ```
 
 `job.json`'s `started_at`/`failed_at`/`completed_at` fields stay in UTC (ISO 8601, with a `+00:00` offset) — useful for comparing job records regardless of which time zone a given run happened to log in — alongside `*_local` companions for convenience when reading the file directly. The job folder's own leading timestamp (see [Job History](#job-history) below) uses the same local time as everything else above, for the same reason: it's a place you're likely to actually look (browsing the jobs folder directly), so it should read as what your clock said, not require doing offset arithmetic.
+
+`job.json`'s `input_path` and `mux.output_path` are similarly host-aware: `hush.sh`/`docker compose` also forward the real directories they're already using for the `-v` mounts (`AC_INPUT_HOST_DIR`/`AC_OUTPUT_HOST_DIR` — see [Configuration](#configuration) above), so those fields show somewhere you can actually navigate to (e.g. `/nas/media/movies/Movie (1986)/`) instead of the container's own `/input`/`/output` mount points, which mean nothing outside it.
 
 ---
 
