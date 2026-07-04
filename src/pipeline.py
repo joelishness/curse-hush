@@ -54,8 +54,10 @@ import utils
 from utils import (
     cfg_get,
     find_job_dir,
+    fmt_dir,
     fmt_duration,
     mark_job_failed,
+    paths_banner,
     read_job,
     retention_summary,
     setup_logging,
@@ -363,14 +365,28 @@ def main() -> None:
     log.info("Interactive : %s", interactive)
     for line in retention_summary(cfg).splitlines():
         log.info("%s", line)
+    for line in paths_banner(cfg).splitlines():
+        log.info("%s", line)
 
     state = read_job(job_dir)
     if not resuming:
         now = time.time()
         started_at_local, _ = utils.fmt_wall_clock(now)
+        # input_path is a *directory*, not the full path to the file --
+        # input_filename (bare, below) already carries the filename. When
+        # AC_INPUT_HOST_DIR reached the container (hush.sh/compose set it;
+        # see paths_banner() above), this is the real, host-navigable
+        # directory the video lives in (e.g. a NAS path) -- otherwise it
+        # falls back to this container's own view of that same directory
+        # (normally /input), which is still accurate, just not something
+        # a person could actually navigate to outside the container.
+        input_host_dir = cfg_get(cfg, "paths", "input_host_dir", default=None)
+        input_dir_display = (
+            fmt_dir(input_host_dir) if input_host_dir else fmt_dir(video.resolve().parent)
+        )
         state = {
             "job_id":           job_id,
-            "input_path":       str(video.resolve()),
+            "input_path":       input_dir_display,
             "input_filename":   video.name,
             "started_at":       datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
             "started_at_local": started_at_local,   # human convenience; started_at above is canonical

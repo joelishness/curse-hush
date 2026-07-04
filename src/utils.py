@@ -210,6 +210,15 @@ def load_config(config_path: "str | Path") -> dict[str, Any]:
                                        turning it *off* needs its own value, not just absence)
       AC_INTERACTIVE                → interactive.enabled                (1 = True)
       AC_SEGMENT_SIZE               → audio.segment_size_sec             (seconds, int)
+      AC_INPUT_HOST_DIR             → paths.input_host_dir               (see paths_banner() below)
+      AC_OUTPUT_HOST_DIR            → paths.output_host_dir              (see paths_banner() below)
+
+    The last two have no config.yaml equivalent, same reasoning as
+    AC_TZ_OFFSET/AC_TZ_NAME (see "Timezone resolution" above): a host
+    directory is host-environment information, not pipeline behaviour,
+    so there's nothing meaningful to put in a static config file -- only
+    hush.sh (or docker-compose.yml, or a person invoking `docker run` by
+    hand) can know it, at invocation time.
 
     Returns an empty dict if the config file is absent — the pipeline uses
     its own defaults in that case (same behaviour as config/config.yaml defaults).
@@ -239,6 +248,10 @@ def load_config(config_path: "str | Path") -> dict[str, Any]:
         cfg.setdefault("interactive", {})["enabled"] = True
     if v := os.environ.get("AC_SEGMENT_SIZE"):
         cfg.setdefault("audio", {})["segment_size_sec"] = int(v)
+    if v := os.environ.get("AC_INPUT_HOST_DIR"):
+        cfg.setdefault("paths", {})["input_host_dir"] = v
+    if v := os.environ.get("AC_OUTPUT_HOST_DIR"):
+        cfg.setdefault("paths", {})["output_host_dir"] = v
 
     return cfg
 
@@ -299,6 +312,45 @@ def retention_summary(cfg: dict) -> str:
         f"  audio_encoded.mka                                            : "
         f"{'kept' if ki else 'deleted after use'}"
     )
+
+
+def paths_banner(cfg: dict) -> str:
+    """
+    Two-line, human-readable summary of whether host-side directories
+    were resolved for input/output -- meant to be logged once, at
+    startup, at INFO level. Same motivation as retention_summary() and
+    timezone_banner(): a host path that silently failed to reach the
+    container (the exact same failure shape as the hush.sh
+    AC_KEEP_INTERMEDIATES forwarding bug -- see design doc §6) should be
+    visible in the first few lines of output, not discoverable only
+    after a multi-hour run finishes and job.json's input_path/
+    mux.output_path still show a container mount point instead of
+    something host-navigable.
+
+    Does not raise or fail the run either way -- unresolved host paths
+    degrade job.json's readability, not the pipeline's correctness, so
+    this only ever informs, matching AC_TZ_OFFSET's fallback philosophy
+    (an honest, clearly-labelled container path, not a placeholder that
+    could be mistaken for a real one).
+    """
+    input_host  = cfg_get(cfg, "paths", "input_host_dir", default=None)
+    output_host = cfg_get(cfg, "paths", "output_host_dir", default=None)
+
+    if input_host:
+        input_line = f"Paths       : input  = {input_host}"
+    else:
+        input_line = (
+            "Paths       : input  = (unresolved — AC_INPUT_HOST_DIR not set; "
+            "job.json will show the container path /input instead)"
+        )
+    if output_host:
+        output_line = f"              output = {output_host}"
+    else:
+        output_line = (
+            "              output = (unresolved — AC_OUTPUT_HOST_DIR not set; "
+            "job.json will show the container path /output instead)"
+        )
+    return f"{input_line}\n{output_line}"
 
 
 def cfg_get(cfg: dict, *keys: str, default: Any = None) -> Any:
@@ -780,3 +832,19 @@ def fmt_size(path: Path) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def fmt_dir(path: "str | Path") -> str:
+    """
+    Format a directory as a display string with exactly one trailing
+    slash, regardless of whether the input already had one.
+
+    Used for job.json's input_path/mux.output_path (and the startup
+    paths_banner() that mirrors them) so a directory reads as
+    unambiguously a directory -- not a file path missing its filename --
+    at a glance, whether it came from a host env var (AC_INPUT_HOST_DIR/
+    AC_OUTPUT_HOST_DIR, which may or may not include a trailing slash
+    depending on how it was set) or a container Path object (whose
+    str() form never does).
+    """
+    return str(path).rstrip("/") + "/"

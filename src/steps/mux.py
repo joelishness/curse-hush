@@ -121,7 +121,7 @@ from pathlib import Path
 from typing import Optional
 import logging
 
-from utils import cfg_get, fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
+from utils import cfg_get, fmt_dir, fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
 
 
 def mux(
@@ -138,6 +138,11 @@ def mux(
     docstring for why these differ).
 
     Returns the path to the final output file in /output.
+
+    Writes job.json's "mux" block with output_path (a host-navigable
+    directory when AC_OUTPUT_HOST_DIR reached the container, else this
+    container's own /output) and output_filename (bare filename),
+    alongside the format/tool it already recorded.
     """
     if log is None:
         log = step_logger("mux")
@@ -209,8 +214,20 @@ def mux(
         _unlink_if(audio_encoded_path, log)
 
     state = read_job(job_dir)
+    # output_path is a *directory*, not the full path to the file --
+    # output_filename (bare, below) already carries the filename. Same
+    # host-vs-container reasoning as pipeline.py's input_path: prefer
+    # AC_OUTPUT_HOST_DIR (the real, host-navigable directory this file
+    # was actually written to -- see utils.paths_banner()) and fall back
+    # to this container's own view of it (output_dir, normally /output)
+    # when that env var never reached the container.
+    output_host_dir = cfg_get(cfg, "paths", "output_host_dir", default=None)
+    output_dir_display = (
+        fmt_dir(output_host_dir) if output_host_dir else fmt_dir(output_dir)
+    )
     state["mux"] = {
-        "output": str(out_path),
+        "output_path":     output_dir_display,
+        "output_filename": out_path.name,
         "format": out_format,
         "tool":   tool,
     }
