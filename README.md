@@ -79,7 +79,8 @@ Options:
       --keep-tmp        Keep large intermediate WAV stems after the run
       --skip-index N    Correct a false positive — see "Correcting Mistakes" below
       --add-interval TEXT START END
-                        Correct a false negative — see "Correcting Mistakes" below
+                        Correct a false negative — START/END as seconds or
+                        H:MM:SS.mmm — see "Correcting Mistakes" below
       --redo-review     Re-enter interactive review on an already-completed job
       --redo-step STEP  Force a single step to redo on an existing job — see
                         "Re-running a Single Step" below
@@ -195,6 +196,7 @@ See the full file at `config/config.yaml` for all options and their documentatio
 | `AC_INTERACTIVE=1` | Enable interactive review (same as `--interactive`) |
 | `AC_SEGMENT_SIZE` | Override `audio.segment_size_sec` in seconds; `0` disables segmentation |
 | `AC_TZ_OFFSET` / `AC_TZ_NAME` | Host UTC offset (e.g. `-0700`) / cosmetic abbreviation (e.g. `PDT`) used for log timestamps. `hush.sh` sets both automatically from the host's clock — see [Logging](#logging) below — only needed by hand if you're running the container some other way. |
+| `AC_INPUT_HOST_DIR` / `AC_OUTPUT_HOST_DIR` | Real host directories for the input/output files, so `job.json` is readable outside the container. `hush.sh`/`docker compose` set both automatically — see [Logging](#logging) below — only needed by hand if you're running the container some other way. |
 
 ```bash
 AC_LOG_LEVEL=debug ./hush.sh movie.mkv
@@ -226,6 +228,8 @@ Console timestamps automatically match this machine's local clock: `hush.sh` det
 
 `job.json`'s `started_at`/`failed_at`/`completed_at` fields stay in UTC (ISO 8601, with a `+00:00` offset) — useful for comparing job records regardless of which time zone a given run happened to log in — alongside `*_local` companions for convenience when reading the file directly. The job folder's own leading timestamp (see [Job History](#job-history) below) uses the same local time as everything else above, for the same reason: it's a place you're likely to actually look (browsing the jobs folder directly), so it should read as what your clock said, not require doing offset arithmetic.
 
+`job.json`'s `input_path` and `mux.output_path` are similarly host-aware: `hush.sh`/`docker compose` also forward the real directories they're already using for the `-v` mounts (`AC_INPUT_HOST_DIR`/`AC_OUTPUT_HOST_DIR` — see [Configuration](#configuration) above), so those fields show somewhere you can actually navigate to (e.g. `/nas/media/movies/Movie (1986)/`) instead of the container's own `/input`/`/output` mount points, which mean nothing outside it.
+
 ---
 
 ## Job History
@@ -255,14 +259,14 @@ sudo chown -R "$(id -u):$(id -g)" /path/to/your/output/dir
 Pass `--interactive` to pause before muting and review each flagged word:
 
 ```
-[3 of 11]  Word: "crap"  |  Confidence: 0.94  |  Time: 00:23:14.8 – 00:23:15.1
+[3 of 11]  Word: "crap"  |  Confidence: 0.94  |  Time: 0:23:14.800 – 0:23:15.100
 Context: "...and then he said crap right in front of..."
 Action? [Y]es / [N]o / [A]dd word / [S]kip rest / [Q]uit  >
 ```
 
 - **Y** — approve; word will be muted (default)
 - **N** — reject; word will not be muted
-- **A** — add a missed word/phrase: searches the transcript for it first (picks automatically if there's one match, lets you choose if there are several); falls back to manual timestamp entry if it's not found at all
+- **A** — add a missed word/phrase: searches the transcript for it first (picks automatically if there's one match, lets you choose if there are several); falls back to manual timestamp entry if it's not found at all — accepts either raw seconds (`1203.14`) or `H:MM:SS.mmm` (`0:20:03.140`)
 - **S** — approve all remaining without prompting
 - **Q** — abort without writing output
 
@@ -274,7 +278,7 @@ Requires a real terminal. `hush.sh --interactive` allocates one automatically; r
 
 This is the expected day-to-day workflow: run unattended, watch the film (maybe with the people it was censored for), and fix anything wrong afterward — without waiting through separation and transcription again.
 
-**False positive** (a word got muted that shouldn't have been — e.g. WhisperX mis-hearing dialogue): find the entry in that job's `censor_log.json` (under `~/.local/share/profanity-hush/jobs/<job-folder>/` — see [Job History](#job-history) for the folder naming) by its approximate timestamp and note its `word_index`:
+**False positive** (a word got muted that shouldn't have been — e.g. WhisperX mis-hearing dialogue): find the entry in that job's `censor_log.json` (under `~/.local/share/profanity-hush/jobs/<job-folder>/` — see [Job History](#job-history) for the folder naming) by its timestamp — `start_hms`/`end_hms` are in `H:MM:SS.mmm`, the same notation your media player's seek bar/goto-time field uses, so you can jump straight to the moment instead of doing the seconds-to-minutes math by hand — and note its `word_index`:
 
 ```json
 {
@@ -283,7 +287,9 @@ This is the expected day-to-day workflow: run unattended, watch the film (maybe 
   "entry": "hell",
   "word_index": 4856,
   "start": 5275.01,
-  "end": 5275.23
+  "start_hms": "1:27:55.010",
+  "end": 5275.23,
+  "end_hms": "1:27:55.230"
 }
 ```
 
@@ -293,13 +299,14 @@ This is the expected day-to-day workflow: run unattended, watch the film (maybe 
 ./hush.sh --skip-index 4856 movie.mkv
 ```
 
-**False negative** (something that should have been muted wasn't): note the timestamp while watching, then:
+**False negative** (something that should have been muted wasn't): note the timestamp while watching, then pass it to `--add-interval` as either raw seconds or `H:MM:SS.mmm` (whichever's easier to read off your player):
 
 ```bash
 ./hush.sh --add-interval "missed word" 1203.14 1203.48 movie.mkv
+./hush.sh --add-interval "missed word" 0:20:03.140 0:20:03.480 movie.mkv   # same interval, H:MM:SS.mmm
 ```
 
-Both flags are repeatable and combinable in one run:
+Both flags are repeatable and combinable in one run (and the two timestamp notations can be mixed freely, even within the same `--add-interval`):
 
 ```bash
 ./hush.sh --skip-index 4856 --skip-index 412 --add-interval "oops" 88.0 88.4 movie.mkv

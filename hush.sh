@@ -10,6 +10,12 @@
 # fails. See AC_TZ_OFFSET / AC_TZ_NAME below if running the container some
 # other way (e.g. `docker compose`) and you want the same behaviour.
 #
+# job.json's input_path/mux.output_path likewise report the real,
+# host-navigable directories resolved below (INPUT_DIR/OUTPUT_DIR),
+# forwarded as AC_INPUT_HOST_DIR/AC_OUTPUT_HOST_DIR; they fall back to
+# this container's own /input //output mount points if that forwarding
+# ever fails to reach it some other way.
+#
 # Usage:
 #   hush.sh [OPTIONS] <input_video> [subtitle_file]
 #
@@ -24,7 +30,8 @@
 #       --skip-index N    Correction: un-mute the flagged match at this word_index
 #                         (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
 #       --add-interval TEXT START END
-#                         Correction: add a manual mute interval (seconds).
+#                         Correction: add a manual mute interval -- START/END
+#                         as raw seconds (1203.14) or H:MM:SS.mmm (0:20:03.140).
 #                         Repeatable. Re-runs Steps 5-7 only.
 #       --redo-review     Correction: re-enter interactive review from scratch
 #                         on an already-completed job (implies --interactive).
@@ -45,6 +52,7 @@
 #   hush.sh --dry-run movie.mkv movie.srt
 #   hush.sh --skip-index 4856 movie.mkv                     # un-mute a false positive
 #   hush.sh --add-interval "missed word" 1203.1 1203.5 movie.mkv
+#   hush.sh --add-interval "missed word" 0:20:03.1 0:20:03.5 movie.mkv  # same, H:MM:SS.mmm
 #   hush.sh --redo-step 7_mux movie.mkv                      # re-test a muxer change only
 # =============================================================================
 set -euo pipefail
@@ -68,7 +76,8 @@ Options:
       --skip-index N    Correction: un-mute the flagged match at this word_index
                         (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
       --add-interval TEXT START END
-                        Correction: add a manual mute interval (seconds).
+                        Correction: add a manual mute interval -- START/END
+                        as raw seconds (1203.14) or H:MM:SS.mmm (0:20:03.140).
                         Repeatable. Re-runs Steps 5-7 only.
       --redo-review     Correction: re-enter interactive review from scratch
                         on an already-completed job (implies --interactive).
@@ -89,6 +98,7 @@ Examples:
   ${SCRIPT_NAME} --dry-run --interactive movie.mkv movie.srt
   ${SCRIPT_NAME} --skip-index 4856 movie.mkv
   ${SCRIPT_NAME} --add-interval "missed word" 1203.1 1203.5 movie.mkv
+  ${SCRIPT_NAME} --add-interval "missed word" 0:20:03.1 0:20:03.5 movie.mkv  # same, H:MM:SS.mmm
   ${SCRIPT_NAME} --redo-step 7_mux movie.mkv                # re-test a muxer change only
 EOF
 }
@@ -364,6 +374,14 @@ fi
 ENV_ARGS+=(-e "AC_TZ_OFFSET=$(date +%z)")
 HOST_TZ_NAME="$(date +%Z)"
 [[ -n "$HOST_TZ_NAME" ]] && ENV_ARGS+=(-e "AC_TZ_NAME=${HOST_TZ_NAME}")
+# job.json logs input_path/mux.output_path as *directories* a human could
+# actually navigate to (see utils.paths_banner()) rather than this
+# container's own /input //output mount points, which mean nothing
+# outside it. INPUT_DIR/OUTPUT_DIR are already resolved, absolute host
+# paths above (used for the -v mounts themselves) -- forwarding them
+# under these names is what pipeline.py/steps/mux.py read.
+ENV_ARGS+=(-e "AC_INPUT_HOST_DIR=${INPUT_DIR}")
+ENV_ARGS+=(-e "AC_OUTPUT_HOST_DIR=${OUTPUT_DIR}")
 # AC_INTERACTIVE from the host env is only honoured when --interactive /
 # --no-interactive were not already set on the command line (those flags
 # translate directly into --interactive / --no-interactive pipeline args).

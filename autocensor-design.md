@@ -374,6 +374,8 @@ This principle is particularly important for CPU-only deployments where a full p
 
 **Single source of truth:** every one of those deletion decisions goes through `utils.keep_intermediate(cfg, correction_artifact=...)` — no step reads `output.keep_intermediates`/`output.keep_correction_artifacts` directly. This was a deliberate fix, not the original design: each step originally computed its own `bool(cfg_get(...))` locally, which is exactly the kind of duplication that let `hush.sh`'s forwarding bug (below) go unnoticed — the policy was correct in the design doc and in `config.yaml`'s comments the whole time, but nothing checked that the *host* setting actually reached the container. `pipeline.py` now also logs the fully-resolved retention settings once at startup (`utils.retention_summary()`), specifically so a setting that silently failed to arrive is visible in the first few lines of output instead of discoverable only after the run completes and an expected file isn't there.
 
+**`job.json` names its own artifacts:** every step's entry records the filename(s) it actually produced, not just summary statistics — `merge` (Step 3b) via a `files` dict (`transcript`/`dialog`/`score_sfx`), `flag`/`review` (Step 4b) via a `file` field (`matches.json`/`review.json` respectively — including from `apply_corrections()`, §13.4's non-interactive correction path, which previously wrote `review.json` to disk without recording anything about it in `job.json` at all), and `mute` (Step 5) via a `files` dict (`dialog_censored`/`censor_log`). `steps/segment.py`, `steps/separate.py`, `steps/transcribe.py` (Steps 1c/2/3) and `steps/recombine.py`/`steps/encode.py`/`steps/mux.py` (Steps 6/6b/7) already did this from the start; Steps 1a/1b's own version of the fix — a `title` field added to `audio`, and an entirely new `downmix` block, since Step 1b previously wrote nothing to `job.json` at all — is detailed in §8's `steps/extract.py` spec. Same motivation throughout as `retention_summary()`/`timezone_banner()`/`paths_banner()` (§6.1, §6.2): a fact a completed job's `job.json` could have recorded, but silently didn't, tends to be discovered only by accident, usually while debugging something else.
+
 **`hush.sh` bug (fixed):** `AC_LOG_LEVEL` and `AC_SEGMENT_SIZE` were forwarded from the host shell's environment into the container; `AC_KEEP_INTERMEDIATES` was not — it was only ever set when `--keep-tmp` was passed on the command line, silently ignoring the documented `AC_KEEP_INTERMEDIATES=1` host env var form (`config.yaml`'s own comment said this was supported). Anyone using the env var directly (rather than `--keep-tmp`) got the opposite of what they asked for, with no error or warning. Fixed by forwarding the host env var as a fallback when `--keep-tmp` isn't given, matching the precedence pattern `AC_INTERACTIVE`/`--interactive` already used. `AC_KEEP_CORRECTION_ARTIFACTS` (`1`/`0`) was added as the equivalent override for the newer setting.
 
 **Naming note (single-segment jobs):** `dialog.wav` / `score_sfx.wav` (no numeric suffix) are produced *directly* by Step 2 in the single-segment case — there is no intermediate `dialog_01.wav`. This is because Step 1c's passthrough re-uses `audio_stereo.wav` (also unsuffixed) as the sole segment file, and Step 2 derives its output suffix from the segment filename it's given (`steps/separate.py`: `seg_path.stem.removeprefix("audio_stereo")` → `""` when unsuffixed). `transcript_01.json`, by contrast, is **always** numbered by segment index regardless of segmentation — `steps/transcribe.py` names its output from the segment's loop position, not from the dialog filename's suffix. Step 3b (merge) always reads `transcript_01.json` (and `_02`, …) and writes the canonical un-suffixed `transcript.json`, even when there is only one segment.
@@ -389,6 +391,28 @@ Every timestamp in the pipeline — console log lines, `job.json`'s `started_at`
 `job.json`'s `started_at`/`failed_at`/`completed_at` fields stay in UTC ISO 8601 (unchanged) — the canonical, machine-comparable record, regardless of which (if any) offset a given run happened to log in — with `*_local` companions (`started_at_local`, etc.) added purely for a human reading the file directly. The job directory's leading timestamp (above), by contrast, switched fully to `LOCAL_TZ` — the same local time as everything else in this section — rather than staying in UTC. An earlier version of this kept it UTC for monotonic, DST-safe `ls` ordering, but that's the wrong tradeoff for what's actually the most-looked-at timestamp in the whole pipeline: a person browsing `~/.local/share/profanity-hush/jobs/` directly should see what their own clock said, not something requiring offset arithmetic, on literally every job — paid for by avoiding a sort-order quirk that (a) only arises if two jobs happen to straddle a DST "fall back" transition, and (b) wouldn't break anything even then, since nothing in this codebase resumes a job by parsing its directory name — `find_job_dir()` scans `job.json`'s contents instead (see "Job directory naming" above).
 
 **Console output is also persisted, separately from `job.json`** (`utils.attach_file_logging()`, called from `pipeline.py` as soon as `job_dir` is resolved): every line that scrolls past on the console is mirrored into `job_dir/logs/{YYYYMMDD_HHMMSS}.log` — same `_StepFormatter`, same `output.log_level` as the console handler, so the file is exactly what was on screen, not a separate, silently-more-verbose copy. Deliberately a flat per-invocation file rather than a field on `job.json`: `job.json` is structured and meant to stay small, and a `DEBUG`-level transcript of a multi-hour run (full Demucs/ffmpeg/whisperx output) doesn't belong stuffed into a JSON value. One file per invocation, not one growing file per job, so a resume, a correction-mode redo (§13.4), or a retry after a failure each leave behind their own independently-readable record rather than one file that grows unbounded or gets clobbered — which is exactly what makes it possible to diff *this* run's log against an earlier one when something behaved unexpectedly (e.g. a resume that unexpectedly started over instead of picking up where a prior run left off). Always kept regardless of `keep_intermediates` — see §6.
+
+### 6.2 Host-Navigable Paths
+
+`job.json`'s `input_path` and `mux`'s `output_path` describe *directories*, not files (`input_filename`/`output_filename`, unchanged, carry the bare filename alongside each) — but the only path a containerised process can see by default is its own mount point (§5.2: `/input`, `/output`), which means nothing outside the container and nothing to a person opening `job.json` later trying to find the actual file on their NAS or filesystem. Before this was fixed, both fields held the container-internal path verbatim (`/input/`, `/output/`) — technically accurate, but not navigable by anyone not already inside the container.
+
+**Fix:** `hush.sh` already resolves the real, absolute host directories for both mounts (`INPUT_DIR`/`OUTPUT_DIR` — §5.3/§9) in order to build the `-v` mount arguments in the first place; it now also forwards them into the container as `AC_INPUT_HOST_DIR`/`AC_OUTPUT_HOST_DIR`, unconditionally, the same way it already forwards `AC_TZ_OFFSET`/`AC_TZ_NAME` (§6.1). `docker-compose.yml` does the same, simply re-exporting the `INPUT_DIR`/`OUTPUT_DIR` variables it already uses for its own volume mounts — no shell-out needed there, unlike `AC_TZ_OFFSET` (compose can't run `date +%z` inline; see §6.1). `utils.load_config()` folds both into `cfg["paths"]["input_host_dir"]`/`cfg["paths"]["output_host_dir"]` (§7.3) alongside its other environment-variable overrides — unlike `AC_TZ_OFFSET`, which is read directly from `os.environ` at import time for reasons specific to timestamps (§6.1), these are only ever needed later, once `cfg` already exists, so they follow the more common path instead.
+
+`pipeline.py` writes `input_path` as `AC_INPUT_HOST_DIR` when it reached the container, formatted as a directory (`utils.fmt_dir()` — exactly one trailing slash, regardless of how the value arrived, so it reads as unambiguously a directory rather than a file path missing its filename); `steps/mux.py` does the same for `output_path` using `AC_OUTPUT_HOST_DIR`. Both fall back to this container's own view of the same directory (`/input/`, `/output/`) if the env var never arrived — still accurate, just not host-navigable, the same honest-fallback philosophy `AC_TZ_OFFSET` already uses (an explicit, clearly-labelled container path, not a placeholder that could be mistaken for a real one) rather than failing the run over what's a readability concern, not a correctness one.
+
+`pipeline.py` logs which case applies once at startup (`utils.paths_banner()`), immediately after `utils.retention_summary()` — same motivation as both that and `timezone_banner()`: a forwarding failure (the exact shape of bug §6's `hush.sh` `AC_KEEP_INTERMEDIATES` writeup above describes) should be visible in the first few lines of output, not discovered only after a run finishes and `job.json` still shows a container mount point instead of somewhere the file can actually be found.
+
+Example, run via `hush.sh` against a file at `/nas/media/arm/movies/Casper (1995)/Casper (1995).sd.hevc.mkv`:
+```json
+{
+  "input_path": "/nas/media/arm/movies/Casper (1995)/",
+  "input_filename": "Casper (1995).sd.hevc.mkv",
+  "mux": {
+    "output_path": "/nas/media/arm/movies/",
+    "output_filename": "Casper (1995) {edition-Hushed}.sd.hevc.mkv"
+  }
+}
+```
 
 ---
  
@@ -551,6 +575,7 @@ holy crap
 | `AC_INTERACTIVE` | `1` to enable interactive review mode |
 | `AC_SEGMENT_SIZE` | override `audio.segment_size_sec`; seconds; `0` to disable segmentation |
 | `AC_TZ_OFFSET` / `AC_TZ_NAME` | host UTC offset (e.g. `-0700`) / cosmetic abbreviation (e.g. `PDT`) for log timestamps — not a `config.yaml` setting, since it's host-environment information rather than pipeline behaviour; `hush.sh` sets both automatically (see §6.1) |
+| `AC_INPUT_HOST_DIR` / `AC_OUTPUT_HOST_DIR` | real, host-navigable directories for the input video / output file, used in `job.json`'s `input_path`/`mux.output_path` — not a `config.yaml` setting, same reasoning as `AC_TZ_OFFSET` above; `hush.sh`/`docker-compose.yml` set both automatically from the directories they already resolve for their own `-v` mounts (see §6.2) |
  
 ---
  
@@ -559,14 +584,14 @@ holy crap
 ### `pipeline.py`
 - Parses CLI arguments (input path, optional SRT path, optional config override)
 - Computes a `job_id` = `sha256[:12]` of the input file's absolute path + mtime; creates a job directory under `storage.jobs_dir/{YYYYMMDD_HHMMSS}_{slug}_{hex8}/` (`make_job_dir_name()` — **not** a bare `{job_id}/`; see §6's "Job directory naming" for why, and §6.1 for why the timestamp is local time rather than UTC)
-- Writes `job.json` at job start with: input path, config snapshot, a canonical UTC `started_at` timestamp (plus a `started_at_local` companion — see §6.1), and a `steps_completed: []` list
+- Writes `job.json` at job start with: `input_path`/`input_filename` as a directory+filename pair (`input_path` host-navigable when `AC_INPUT_HOST_DIR` reached the container, else this container's own view of it — see §6.2), config snapshot, a canonical UTC `started_at` timestamp (plus a `started_at_local` companion — see §6.1), and a `steps_completed: []` list
 - Calls Steps 1a, 1b, and 1c in sequence; receives the segment list (paths + start offsets) from Step 1c
 - Calls Step 2 (separate) across all segments, then Step 3 (transcribe) across all segments; each step marks one `steps_completed` entry (`2_separate`, `3_transcribe`) once *all* its segments are done. Per-segment resume is handled inside each step by checking whether that segment's own output file(s) already exist (see `steps/separate.py`, `steps/transcribe.py`) — not via finer-grained job-state entries.
 - **Once `3b_merge` is in `steps_completed`, Steps 1a-3b are skipped entirely on every subsequent run** — `pipeline.py` derives `transcript.json`/`dialog.wav`/`score_sfx.wav` by their fixed canonical names directly, rather than calling `extract_raw`/`segment`/`separate`/`transcribe`/`merge` again. This isn't just an optimization: `steps/merge.py`'s own cleanup deletes the per-segment intermediates (`dialog_NN.wav`, `score_sfx_NN.wav`, `audio_stereo_NN.wav`) once they're consolidated, and `steps/separate.py`'s "already done" resume path assumes those files are still on disk — calling it again after Step 3b's cleanup has run throws a missing-file error even though nothing is actually wrong. The fix is structural, not a patch to `separate.py`'s resume check: once Step 3b is done, nothing downstream ever needs the per-segment files again, so the orchestrator should never ask for them again either.
 - Calls Step 3b (merge) once all segments are complete
 - Calls Steps 4, 4b, 5, 6, 7 in sequence on the merged artifacts, as before
 - Handles step failures: log error with step name and exception, update `job.json` with failure info (`status`, `failed_at`/`failed_at_local`, `failure.step`/`.error`/`.traceback`), exit with non-zero code
-- On success: moves final output to `/output/`, marks job complete in `job.json` (`status`, plus `completed_at`/`completed_at_local`)
+- On success: moves final output to `/output/` (`job.json`'s own record of this, `mux.output_path`/`output_filename`, prefers a host-navigable directory when available — see §6.2), marks job complete in `job.json` (`status`, plus `completed_at`/`completed_at_local`)
 - Always preserves all `transcript_NN.json` and `transcript.json` files; removes large WAV stems unless `keep_intermediates` is set
 
 **Correction workflow (§13.4 — implemented, not just groundwork):** `steps_completed`, combined with the preserved transcript/match/review files above, is what `--skip-index`/`--add-interval`/`--redo-review` build on to invalidate and redo only Steps 5, 6, 6b, and 7 rather than the full pipeline — see §13.4 for the mechanism. (An earlier draft of this doc described this only as future groundwork for a planned `--resume` mode; that mode has since shipped under the flag names above, not as a separate `--resume` flag.)
@@ -576,7 +601,7 @@ holy crap
 Two distinct functions, called in sequence by the pipeline orchestrator and tracked as separate entries in `steps_completed`.
  
 **`extract_raw(video_path, job_dir)`** *(Step 1a)*
-- Probes audio codec and channel layout via `ffprobe`; records both in `job.json`
+- Probes audio codec, channel layout, and the stream's `title` tag via `ffprobe`; records all three in `job.json`'s `audio` block. `title` is a free-text label a media player shows in its audio-track picker (e.g. `"Surround 7.1"`) — set once at encode time and never validated against the stream's own codec/channels/bitrate, so the two can silently disagree (a title claiming surround on a stream `ffprobe` reports as 2-channel means the source was downmixed upstream without the title being updated to match). Logged and recorded unconditionally — `null` in `job.json`, `"(none)"` in the console log — rather than the field being omitted when absent, so a missing title is exactly as visible as a contradicting one.
 - Extracts audio as a bitstream copy — no decode, no re-encode:
   ```bash
   ffmpeg -i video.mkv -vn -c:a copy {job_dir}/audio_raw.{ext}
@@ -590,6 +615,7 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
   ffmpeg -i audio_raw.{ext} -ac 2 -ar 44100 -c:a pcm_s16le audio_stereo.wav
   ```
 - `-ac 2` handles any channel layout (stereo passthrough, mono upmix, 5.1/7.1 downmix)
+- Records a `downmix` block in `job.json` (`channels`, `sample_rate`, `file`) — a separate block from Step 1a's `audio` above rather than folded into it, since this describes a structurally different artifact (always 2ch/44.1kHz/pcm_s16le, regardless of the source's own codec/channels/bitrate). Written on every call, including one that takes the "`audio_stereo.wav` already exists" shortcut below, so a resumed job's `job.json` still names the file rather than only a freshly-downmixed one's.
 - Output feeds Step 1c (segmentation); regenerable from `audio_raw` if deleted
 - Kept only if `keep_intermediates` is set; otherwise deleted after Step 3b (merge)
   completes — Step 2 (separate.py) only reads it as Demucs input and never deletes
@@ -681,7 +707,7 @@ ffmpeg -i "concat:score_sfx_01.wav|score_sfx_02.wav|..." -c copy score_sfx.wav
 ### `steps/matching.py` *(called once, from Step 4b's flag phase)*
 - **Purpose:** word-list parsing and transcript matching. Used by `steps/review.py`'s flag phase to scan the transcript and produce `matches.json` — this is the pipeline's **only** call to `find_matches()`. Step 5 (`steps/mute.py`) does not import this module at all; it consumes `matches.json` directly. Keeping the scan in exactly one place means there is no second code path that could ever disagree with the first about what counts as a match — a word a human approved (or rejected) during Step 4b's review phase is, by construction, one of the exact candidates Step 5 acts on, because Step 5 never independently re-derives that set.
 - `load_word_list(path) -> list[WordListEntry]` — parses `word_list.txt` per the notation table in §7.2. Malformed entries (e.g. a lone leading `*` with no trailing `*`, or `*` notation on a multi-word phrase) are skipped with a warning rather than silently mis-parsed — a stray character producing an unintended broad match is a worse failure mode for a profanity filter than dropping one entry.
-- `find_matches(words, entries) -> list[Match]` — walks the transcript's flat `words` array (from `transcript.json` or, once Step 4 exists, `transcript_aligned.json` — same schema) and returns every match, each with `word_index`, `span` (1 for a single word, >1 for a phrase), `matched_text` (original casing + punctuation, for display), the word-list `entry` that matched, global `start`/`end`, and `score` (the minimum confidence across a phrase's words, for the conservative case).
+- `find_matches(words, entries) -> list[Match]` — walks the transcript's flat `words` array (from `transcript.json` or, once Step 4 exists, `transcript_aligned.json` — same schema) and returns every match, each with `word_index`, `span` (1 for a single word, >1 for a phrase), `matched_text` (original casing + punctuation, for display), the word-list `entry` that matched, global `start`/`end` (seconds) plus `start_hms`/`end_hms` (media-player-friendly `H:MM:SS.mmm` companions — see `utils.fmt_timestamp()`), and `score` (the minimum confidence across a phrase's words, for the conservative case).
   - Words with no alignment timing (`start`/`end` null — see `steps/transcribe.py`) are excluded: there is nothing to review or mute about a word with no timestamp.
   - Matches are **not** de-duplicated or merged across overlapping spans (e.g. a single-word entry `ass` and a phrase entry `kiss my ass` can both independently match the same audio) — that is Step 5's job (see its "merge overlapping intervals" logic below), which already has to merge regardless of how many separate matches produced the overlap.
 - `steps/review.py`'s flag phase serializes the returned `list[Match]` verbatim (via `dataclasses.asdict`) to `matches.json` as `{"matches": [...]}`. Step 5 reads that file back into the same shape and never needs this module to do so.
@@ -707,14 +733,14 @@ Two phases, both implemented in this module and invoked separately by `pipeline.
 For each word in `matches.json` that the flag phase found, display a review entry:
  
 ```
-[3 of 11]  Word: "crap"  |  Confidence: 0.94  |  Time: 00:23:14.8 – 00:23:15.1
+[3 of 11]  Word: "crap"  |  Confidence: 0.94  |  Time: 0:23:14.800 – 0:23:15.100
 Context: "...and then he said crap right in front of..."
 Action? [Y]es / [N]o / [A]dd word / [S]kip rest / [Q]uit  >
 ```
  
 - **Y (default):** approve; word will be muted
 - **N:** reject; recorded as a `skip` override; word will not be muted
-- **A:** prompt for an additional word/phrase to add (manual false-negative correction). No audio playback in v1 (see note below), so this searches the transcript text for the word/phrase typed: if found once, it's used directly; if found multiple times, the candidates are listed (with context and timestamps) for the reviewer to pick from; if not found at all (mis-transcribed, or never said in a way Whisper caught), it falls back to manual `start`/`end` entry in seconds or `HH:MM:SS.mmm`. After an add, the *same* candidate is re-shown for its own Y/N/A/S/Q decision — adding doesn't consume a turn.
+- **A:** prompt for an additional word/phrase to add (manual false-negative correction). No audio playback in v1 (see note below), so this searches the transcript text for the word/phrase typed: if found once, it's used directly; if found multiple times, the candidates are listed (with context and timestamps) for the reviewer to pick from; if not found at all (mis-transcribed, or never said in a way Whisper caught), it falls back to manual `start`/`end` entry in seconds or `H:MM:SS.mmm`/`M:SS.mmm` (`utils.parse_timestamp()` — the input-side counterpart to the `H:MM:SS.mmm` display format above and to `start_hms`/`end_hms` in `matches.json`/`review.json`/`censor_log.json`, so a timestamp can be copied from any of those straight back into a prompt). After an add, the *same* candidate is re-shown for its own Y/N/A/S/Q decision — adding doesn't consume a turn.
 - **S:** approve this and all remaining flagged entries without further prompting
 - **Q:** abort the run; **nothing is written**, including `review.json` itself — re-running re-enters the review phase from scratch. (`matches.json` from the flag phase is unaffected and is *not* re-scanned on the retry.)
 After the review loop, a summary is printed:
@@ -742,12 +768,14 @@ Proceeding to mute step.
       "word_index": 913,
       "text": "bastard",
       "start": 1203.14,
-      "end": 1203.48
+      "start_hms": "0:20:03.140",
+      "end": 1203.48,
+      "end_hms": "0:20:03.480"
     }
   ]
 }
 ```
-`word_index` on a `skip` override is required — it identifies which auto-flagged match (by index into the transcript's flat `words` array) is being rejected. On an `add` override it is informational only: present (and authoritative for display) when the reviewer found the word/phrase by searching the transcript, `null` when it was a true manual entry with no matching transcript word at all. Either way, `start`/`end` are self-sufficient for Step 5 to build a mute interval — it never needs to resolve `word_index` back through the transcript for an `add`. `text` records what was added or rejected, so a future correction tool (§13.4) can read `review.json` on its own without cross-referencing `transcript.json`.
+`word_index` on a `skip` override is required — it identifies which auto-flagged match (by index into the transcript's flat `words` array) is being rejected; a `skip` override carries no `start`/`end` of its own (that timing already lives in `matches.json`, keyed by the same `word_index`). On an `add` override `word_index` is informational only: present (and authoritative for display) when the reviewer found the word/phrase by searching the transcript, `null` when it was a true manual entry with no matching transcript word at all. Either way, `start`/`end` (seconds) are self-sufficient for Step 5 to build a mute interval — it never needs to resolve `word_index` back through the transcript for an `add` — and each carries a `start_hms`/`end_hms` media-player-friendly `H:MM:SS.mmm` companion (`utils.fmt_timestamp()`), for the same reason `matches.json`/`censor_log.json` do. `text` records what was added or rejected, so a future correction tool (§13.4) can read `review.json` on its own without cross-referencing `transcript.json`.
  
 **Note on audio playback:** Displaying a playable audio snippet during review is a natural future enhancement (§13.4) but is out of scope for v1 due to the complexity of audio output from inside a Docker container.
 
@@ -763,7 +791,7 @@ Proceeding to mute step.
   5. `method: mute` (v1's only implemented method) — build ffmpeg `volume` filter expression:
      `volume=enable='between(t,s1,e1)+between(t,s2,e2)+...':volume=0`
   6. `method: beep` — **not yet implemented in v1** (§10, Phase 4 polish item). Step 5 raises a clear, actionable error rather than silently falling back to `mute` or producing an output that's actually muted but labeled as beeped.
-- **`censor_log.json`** records every individual word/addition muted with its timestamp (both raw and padded) — useful for review and for the future correction workflow (§13.4)
+- **`censor_log.json`** records every individual word/addition muted with its timestamp (both raw and padded, each with a media-player-friendly `start_hms`/`end_hms`/`padded_start_hms`/`padded_end_hms` companion — `utils.fmt_timestamp()`) — useful for review and for the future correction workflow (§13.4)
 - If zero intervals remain after overrides (no candidates were flagged, or all were rejected), `dialog_censored.wav` is a copy of `dialog.wav` and a warning is logged
 ### `steps/recombine.py` *(Step 6)*
 - **Input:** `dialog_censored.wav` (Step 5), `score_sfx.wav` (Step 3b)
@@ -834,7 +862,7 @@ ffmpeg \
 **Intermediate cleanup:** `audio_censored.wav` is fully consumed once `audio_encoded.mka` exists — nothing downstream needs the raw PCM again — so it's deleted here unless `keep_intermediates` is set (the same cleanup `audio_censored.wav` used to get from Step 7, before this split). `audio_encoded.mka` itself is deleted by Step 7, once it's no longer needed there — never by this step, matching the convention that every step cleans up only its own *input*.
 ### `steps/mux.py` *(Step 7 — final step of v1's core pipeline)*
 - **Input:** original video file, `audio_encoded.mka` (Step 6b)
-- **Output:** `/output/{filename per output.naming_style}` — two supported styles:
+- **Output:** `/output/{filename per output.naming_style}` (`job.json`'s own record of this, `mux.output_path`/`output_filename`, prefers a host-navigable directory over `/output` when available — see §6.2) — two supported styles:
   - `plex_edition` (default) — a Plex-friendly `{edition-Name}` tag (see [Plex's multi-edition docs](https://support.plex.tv/articles/multiple-editions/)), inserted right after the `(YYYY)` release-year portion of the filename if present, so Plex shows the censored file as a selectable Edition of the same movie instead of an unrelated second item: `"Movie (1986).sd.hevc.mkv"` → `"Movie (1986) {edition-Hushed}.sd.hevc.mkv"` (edition name configurable via `output.edition_name`). Falls back to appending the tag at the very end — still valid Plex syntax, since Plex's own docs say tag order doesn't matter to its parser — if no `(YYYY)` pattern is found in the filename at all.
   - `suffix` — the original plan's behavior: a plain suffix appended before the extension, no Plex Edition semantics. `Path(name).stem` strips only the final extension either way, so `"movie.sd.hevc.mkv"` → `"movie.sd.hevc_censored.mkv"`, not `"movie_censored.sd.hevc.mkv"`.
 - **Both streams:** copied bitstream-exact — neither is re-encoded here. The encoding decision (which encoder, what bitrate, matching the original codec) happens one step earlier, in `steps/encode.py` (Step 6b).
@@ -894,7 +922,8 @@ Options:
   --skip-index N       Correction: un-mute the flagged match at this word_index
                        (see censor_log.json). Repeatable. Re-runs Steps 5, 6, 6b, 7 only.
   --add-interval TEXT START END
-                       Correction: add a manual mute interval (seconds).
+                       Correction: add a manual mute interval. START/END
+                       accept raw seconds (1203.1) or H:MM:SS.mmm (0:20:03.1).
                        Repeatable. Re-runs Steps 5, 6, 6b, 7 only.
   --redo-review        Correction: re-enter interactive review from scratch
                        on an already-completed job (implies --interactive).
@@ -907,6 +936,7 @@ Examples:
   hush.sh -o ~/censored/ movie.mkv movie.srt
   hush.sh --skip-index 4856 movie.mkv
   hush.sh --add-interval "missed word" 1203.1 1203.5 movie.mkv
+  hush.sh --add-interval "missed word" 0:20:03.1 0:20:03.5 movie.mkv  # same, H:MM:SS.mmm
 ```
  
 The script resolves absolute paths before mounting — Docker requires absolute paths for `-v`.
@@ -1121,15 +1151,16 @@ The interactive review in Step 4b is v1's primary quality mechanism, but it can 
  
 1. Run `hush.sh movie.mkv` normally (unattended or interactive)
 2. Watch the film, ideally with the people it was censored for
-3. Note any mistakes — for a false positive, the muted moment's approximate timestamp is enough to find the `word_index` in `censor_log.json` (every muted entry records its source word/timestamp); for a false negative, note the timestamp and what was actually said
+3. Note any mistakes — for a false positive, the muted moment's timestamp (`start_hms`/`end_hms`, in the same `H:MM:SS.mmm` notation as a media player's seek bar) is enough to find the `word_index` in `censor_log.json` (every muted entry records its source word/timestamp); for a false negative, note the timestamp and what was actually said
 4. Re-run `hush.sh` on the **same** input file with a correction flag:
  
 ```bash
 # False positive: un-mute the flagged match at this word_index
 hush.sh --skip-index 4856 movie.mkv
  
-# False negative: add a manual mute interval (seconds)
+# False negative: add a manual mute interval -- raw seconds or H:MM:SS.mmm, either works
 hush.sh --add-interval "missed word" 1203.14 1203.48 movie.mkv
+hush.sh --add-interval "missed word" 0:20:03.14 0:20:03.48 movie.mkv   # same interval
  
 # Both flags are repeatable and combinable in one invocation
 hush.sh --skip-index 4856 --skip-index 412 --add-interval "oops" 88.0 88.4 movie.mkv

@@ -210,6 +210,15 @@ def load_config(config_path: "str | Path") -> dict[str, Any]:
                                        turning it *off* needs its own value, not just absence)
       AC_INTERACTIVE                → interactive.enabled                (1 = True)
       AC_SEGMENT_SIZE               → audio.segment_size_sec             (seconds, int)
+      AC_INPUT_HOST_DIR             → paths.input_host_dir               (see paths_banner() below)
+      AC_OUTPUT_HOST_DIR            → paths.output_host_dir              (see paths_banner() below)
+
+    The last two have no config.yaml equivalent, same reasoning as
+    AC_TZ_OFFSET/AC_TZ_NAME (see "Timezone resolution" above): a host
+    directory is host-environment information, not pipeline behaviour,
+    so there's nothing meaningful to put in a static config file -- only
+    hush.sh (or docker-compose.yml, or a person invoking `docker run` by
+    hand) can know it, at invocation time.
 
     Returns an empty dict if the config file is absent — the pipeline uses
     its own defaults in that case (same behaviour as config/config.yaml defaults).
@@ -239,6 +248,10 @@ def load_config(config_path: "str | Path") -> dict[str, Any]:
         cfg.setdefault("interactive", {})["enabled"] = True
     if v := os.environ.get("AC_SEGMENT_SIZE"):
         cfg.setdefault("audio", {})["segment_size_sec"] = int(v)
+    if v := os.environ.get("AC_INPUT_HOST_DIR"):
+        cfg.setdefault("paths", {})["input_host_dir"] = v
+    if v := os.environ.get("AC_OUTPUT_HOST_DIR"):
+        cfg.setdefault("paths", {})["output_host_dir"] = v
 
     return cfg
 
@@ -299,6 +312,45 @@ def retention_summary(cfg: dict) -> str:
         f"  audio_encoded.mka                                            : "
         f"{'kept' if ki else 'deleted after use'}"
     )
+
+
+def paths_banner(cfg: dict) -> str:
+    """
+    Two-line, human-readable summary of whether host-side directories
+    were resolved for input/output -- meant to be logged once, at
+    startup, at INFO level. Same motivation as retention_summary() and
+    timezone_banner(): a host path that silently failed to reach the
+    container (the exact same failure shape as the hush.sh
+    AC_KEEP_INTERMEDIATES forwarding bug -- see design doc §6) should be
+    visible in the first few lines of output, not discoverable only
+    after a multi-hour run finishes and job.json's input_path/
+    mux.output_path still show a container mount point instead of
+    something host-navigable.
+
+    Does not raise or fail the run either way -- unresolved host paths
+    degrade job.json's readability, not the pipeline's correctness, so
+    this only ever informs, matching AC_TZ_OFFSET's fallback philosophy
+    (an honest, clearly-labelled container path, not a placeholder that
+    could be mistaken for a real one).
+    """
+    input_host  = cfg_get(cfg, "paths", "input_host_dir", default=None)
+    output_host = cfg_get(cfg, "paths", "output_host_dir", default=None)
+
+    if input_host:
+        input_line = f"Paths       : input  = {input_host}"
+    else:
+        input_line = (
+            "Paths       : input  = (unresolved — AC_INPUT_HOST_DIR not set; "
+            "job.json will show the container path /input instead)"
+        )
+    if output_host:
+        output_line = f"              output = {output_host}"
+    else:
+        output_line = (
+            "              output = (unresolved — AC_OUTPUT_HOST_DIR not set; "
+            "job.json will show the container path /output instead)"
+        )
+    return f"{input_line}\n{output_line}"
 
 
 def cfg_get(cfg: dict, *keys: str, default: Any = None) -> Any:
@@ -675,6 +727,99 @@ def fmt_duration(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d}"
 
 
+def fmt_timestamp(seconds: float) -> str:
+    """
+    Format a position in seconds as a media-player-friendly timestamp:
+    H:MM:SS.mmm -- hours unpadded (no leading zero, but always present,
+    even for sub-hour positions: "0:23:14.800" not "23:14.800"), minutes
+    and seconds zero-padded to two digits, milliseconds zero-padded to
+    three. This is the format shown in matches.json/review.json/
+    censor_log.json's *_hms companion fields (alongside the canonical
+    float-seconds value, which stays machine-readable for arithmetic) and
+    in steps/review.py's interactive review prompts.
+
+    Deliberately not "HH:MM:SS" (hours zero-padded to two digits): the
+    motivating examples (e.g. "1:28:00.267") are unpadded, and most media
+    players' own seek bars/goto-time fields render the same way. Always
+    keeping the hour field present (even at 0) -- rather than dropping it
+    for sub-hour positions, the way an on-screen player clock often does --
+    keeps every timestamp in a given file the same shape regardless of
+    where in the film it falls, which matters more here than it does on a
+    player's live, single-position display.
+
+    Computed via integer milliseconds (not repeated float division) so
+    carries (e.g. 59.9996s -> 1:00:00.000, not 0:59:100.000 or a
+    floating-point-rounding-induced "60" in the seconds field) are exact.
+
+    Round-trips through parse_timestamp() below: fmt_timestamp(parse_timestamp(s))
+    reproduces the same string for any s already in this format.
+
+    Examples:
+      0.0      -> '0:00:00.000'
+      75.5     -> '0:01:15.500'
+      5280.267 -> '1:28:00.267'
+    """
+    total_ms = int(round(max(0.0, seconds) * 1000))
+    ms, total_s = total_ms % 1000, total_ms // 1000
+    s,  total_m = total_s % 60,    total_s // 60
+    m,  h       = total_m % 60,    total_m // 60
+    return f"{h}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def parse_timestamp(raw: str) -> Optional[float]:
+    """
+    Parse a human-entered time string into seconds (float). Accepts:
+      - raw seconds:                  "1203.14", "90"
+      - "M:SS[.mmm]" / "MM:SS[.mmm]"   (no hour field)
+      - "H:MM:SS[.mmm]" / "HH:MM:SS[.mmm]"
+
+    This is the input-side counterpart to fmt_timestamp() above -- it
+    accepts that function's own output verbatim (so a timestamp copied
+    out of matches.json/review.json/censor_log.json's *_hms fields can be
+    pasted straight back in), as well as the zero-padded "HH:" two-digit-
+    hour style most media players' own goto-time dialogs use, and bare
+    seconds for scripted/programmatic callers. Leading/trailing whitespace
+    is stripped; the hour field, if present, may be any number of digits
+    (not just one or two), since a long-enough file would need it.
+
+    Used by steps/review.py's interactive manual-entry fallback (the "A"
+    action when a typed word/phrase isn't found in the transcript) and by
+    pipeline.py's --add-interval START/END arguments (via
+    steps/review.py's apply_corrections()) -- both accept either notation
+    interchangeably.
+
+    Returns None if the string is empty, malformed, or negative -- callers
+    are expected to report that back to whoever typed it rather than
+    silently substituting a default.
+    """
+    s = raw.strip()
+    if not s:
+        return None
+
+    if ":" not in s:
+        try:
+            value = float(s)
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+
+    parts = s.split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if any(n < 0 for n in nums):
+        return None
+
+    if len(nums) == 2:
+        h, m, sec = 0.0, nums[0], nums[1]
+    else:
+        h, m, sec = nums
+    return h * 3600 + m * 60 + sec
+
+
 def fmt_size(path: Path) -> str:
     """
     Return a human-readable file size for the given path.
@@ -687,3 +832,19 @@ def fmt_size(path: Path) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def fmt_dir(path: "str | Path") -> str:
+    """
+    Format a directory as a display string with exactly one trailing
+    slash, regardless of whether the input already had one.
+
+    Used for job.json's input_path/mux.output_path (and the startup
+    paths_banner() that mirrors them) so a directory reads as
+    unambiguously a directory -- not a file path missing its filename --
+    at a glance, whether it came from a host env var (AC_INPUT_HOST_DIR/
+    AC_OUTPUT_HOST_DIR, which may or may not include a trailing slash
+    depending on how it was set) or a container Path object (whose
+    str() form never does).
+    """
+    return str(path).rstrip("/") + "/"

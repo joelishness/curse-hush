@@ -38,9 +38,14 @@ Logic:
      silently falling back to mute or producing an output that's actually
      muted but labeled as beeped.
   6. Write censor_log.json with every individual muted word/addition (both
-     raw and padded timestamps) -- a finer-grained record than the merged
+     raw and padded timestamps, each with a media-player-friendly
+     start_hms/end_hms/padded_start_hms/padded_end_hms companion -- see
+     utils.fmt_timestamp()) -- a finer-grained record than the merged
      ffmpeg intervals, useful for review and for the future correction
      workflow (§13.4).
+  7. Persist both filenames to job.json's "mute" block ("files":
+     {"dialog_censored", "censor_log"}), alongside the method/padding/
+     candidate stats it already recorded.
 
 If zero intervals remain after overrides (no candidates were flagged, or
 every candidate was rejected), dialog_censored.wav is a plain copy of
@@ -76,7 +81,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from utils import cfg_get, fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
+from utils import cfg_get, fmt_size, fmt_timestamp, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
 
 
 def mute(
@@ -201,6 +206,10 @@ def mute(
         "skipped":         n_skipped,
         "added":           n_added,
         "muted_intervals": len(merged),
+        "files": {
+            "dialog_censored": censored_out.name,
+            "censor_log":      censor_log_out.name,
+        },
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "5_mute")
@@ -261,15 +270,19 @@ def _resolve_intervals(
         p_start, p_end = max(0.0, start - pad), end + pad
         intervals.append((p_start, p_end))
         log_entries.append({
-            "source":       "matched",
-            "word":         m.get("matched_text"),
-            "entry":        m.get("entry"),
-            "word_index":   m.get("word_index"),
-            "start":        round(start, 4),
-            "end":          round(end, 4),
-            "padded_start": round(p_start, 4),
-            "padded_end":   round(p_end, 4),
-            "score":        m.get("score"),
+            "source":         "matched",
+            "word":           m.get("matched_text"),
+            "entry":          m.get("entry"),
+            "word_index":     m.get("word_index"),
+            "start":          round(start, 4),
+            "start_hms":      fmt_timestamp(start),
+            "end":            round(end, 4),
+            "end_hms":        fmt_timestamp(end),
+            "padded_start":   round(p_start, 4),
+            "padded_start_hms": fmt_timestamp(p_start),
+            "padded_end":     round(p_end, 4),
+            "padded_end_hms": fmt_timestamp(p_end),
+            "score":          m.get("score"),
         })
 
     for ov in add_overrides:
@@ -277,15 +290,19 @@ def _resolve_intervals(
         p_start, p_end = max(0.0, start - pad), end + pad
         intervals.append((p_start, p_end))
         log_entries.append({
-            "source":       "review_add",
-            "word":         ov.get("text"),
-            "entry":        None,
-            "word_index":   ov.get("word_index"),
-            "start":        round(start, 4),
-            "end":          round(end, 4),
-            "padded_start": round(p_start, 4),
-            "padded_end":   round(p_end, 4),
-            "score":        None,
+            "source":         "review_add",
+            "word":           ov.get("text"),
+            "entry":          None,
+            "word_index":     ov.get("word_index"),
+            "start":          round(start, 4),
+            "start_hms":      fmt_timestamp(start),
+            "end":            round(end, 4),
+            "end_hms":        fmt_timestamp(end),
+            "padded_start":   round(p_start, 4),
+            "padded_start_hms": fmt_timestamp(p_start),
+            "padded_end":     round(p_end, 4),
+            "padded_end_hms": fmt_timestamp(p_end),
+            "score":          None,
         })
 
     # Stable sort: ties keep their original (matched-before-added) order in

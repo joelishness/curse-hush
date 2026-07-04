@@ -40,7 +40,9 @@ Intermediate cleanup:
   so it can't drift between steps the way it could when each one
   re-implemented its own condition.
 
-Marks '3b_merge' done.
+Marks '3b_merge' done.  Writes the three filenames above into job.json's
+"merge" block ("files": {"transcript", "dialog", "score_sfx"}), alongside
+the segment/word_count stats it already recorded.
 Returns (transcript.json, dialog.wav, score_sfx.wav) as a 3-tuple.
 """
 
@@ -232,6 +234,11 @@ def merge(
     state["merge"] = {
         "segments":   n,
         "word_count": total_words,
+        "files": {
+            "transcript": transcript_out.name,
+            "dialog":     dialog_out.name,
+            "score_sfx":  score_sfx_out.name,
+        },
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "3b_merge")

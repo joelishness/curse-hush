@@ -78,6 +78,14 @@ services:
       # Optional cosmetic abbreviation alongside the offset, e.g. "PDT"
       # (run `date +%Z` to get yours). Has no effect without AC_TZ_OFFSET.
       AC_TZ_NAME: ${AC_TZ_NAME:-}
+      # job.json logs input_path/mux.output_path as real, host-navigable
+      # directories (see utils.paths_banner()) rather than this
+      # container's own /input //output mount points, which mean nothing
+      # outside it. Unlike AC_TZ_OFFSET above, no shell-out is needed
+      # here: INPUT_DIR/OUTPUT_DIR (used for the volume mounts themselves,
+      # above) are already the exact values pipeline.py/steps/mux.py need.
+      AC_INPUT_HOST_DIR: ${INPUT_DIR}
+      AC_OUTPUT_HOST_DIR: ${OUTPUT_DIR:-${INPUT_DIR}}
 
     # stdin_open + tty are required for interactive review mode (Step 4b).
     # They are harmless in unattended mode — a TTY is simply never used.
