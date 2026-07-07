@@ -52,13 +52,17 @@ from pathlib import Path
 from typing import Optional
 
 from utils import (
+    check_duration_matches,
+    finalize_output,
     fmt_duration,
     fmt_size,
     keep_intermediate,
     mark_step_done,
+    probe_duration_sec,
     read_job,
     run_cmd,
     step_logger,
+    tmp_output_path,
     write_job,
 )
 
@@ -178,10 +182,22 @@ def merge(
         # would otherwise re-enter this branch on the next run with the
         # canonical files already correct but their per-segment sources
         # already gone, and fail outright on a redo that wasn't needed.
+        #
+        # That existence check is only trustworthy because _ffmpeg_concat()
+        # writes to a temp path and is only published under dialog_out /
+        # score_fx_out via finalize_output() once ffmpeg has actually
+        # succeeded -- a concat interrupted mid-write leaves nothing under
+        # the final name at all, rather than a truncated file this check
+        # would otherwise have no way to tell apart from a real one. The
+        # duration check right after (either branch) is the second,
+        # independent layer: it's what would catch a file that predates
+        # that fix, or any other way a "complete" file might not actually
+        # be one -- see steps/extract.py's _validate_audio_raw() for the
+        # fuller version of this same reasoning at Step 1a.
         if dialog_out.exists() and score_sfx_out.exists():
             log.info(
-                "  ↩  dialog.wav + score_sfx.wav already exist — skipping concat "
-                "(resumed after a prior interrupted run)."
+                "  ↩  dialog.wav + score_sfx.wav already exist — verifying "
+                "(resumed after a prior interrupted run) ..."
             )
         else:
             log.info("  Concatenating %d dialog stems ...", n)
@@ -194,6 +210,21 @@ def merge(
                 "  ✓  dialog.wav (%s)  score_sfx.wav (%s)",
                 fmt_size(dialog_out), fmt_size(score_sfx_out),
             )
+
+        total_sec = float(state.get("total_duration_sec", 0.0))
+        if total_sec:
+            for merged, name in ((dialog_out, "dialog.wav"), (score_sfx_out, "score_sfx.wav")):
+                try:
+                    check_duration_matches(
+                        probe_duration_sec(merged, log), total_sec, log=log,
+                        label=f"{name} vs. recorded total_duration_sec",
+                        tolerance_sec=5.0,
+                    )
+                except RuntimeError:
+                    merged.unlink(missing_ok=True)
+                    log.error("  Deleted incomplete %s — re-run to merge it fresh.", name)
+                    raise
+        log.info("  ✓  merged audio passed integrity check.")
 
     # ── 3. Cleanup intermediates ──────────────────────────────────────────────
     # Delete audio_stereo_NN.wav per-segment files (multi-segment) or
@@ -266,10 +297,12 @@ def _ffmpeg_concat(sources: list[Path], dest: Path, log: logging.LoggerAdapter) 
     and is the ffmpeg-recommended approach for concatenating file streams.
     """
     list_path = dest.parent / f".concat_{dest.stem}.txt"
+    tmp = tmp_output_path(dest)
     try:
         list_path.write_text(
             "\n".join(f"file '{p.resolve()}'" for p in sources) + "\n"
         )
+        tmp.unlink(missing_ok=True)   # clear a partial attempt from an interrupted prior run
         run_cmd(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -278,10 +311,11 @@ def _ffmpeg_concat(sources: list[Path], dest: Path, log: logging.LoggerAdapter) 
                 "-safe", "0",
                 "-i", str(list_path),
                 "-c", "copy",
-                str(dest),
+                str(tmp),
             ],
             log,
         )
+        finalize_output(tmp, dest)
     finally:
         if list_path.exists():
             list_path.unlink()

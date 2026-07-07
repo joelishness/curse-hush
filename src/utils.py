@@ -489,6 +489,37 @@ def mark_job_failed(job_dir: Path, step: str, exc: Exception) -> None:
     write_job(job_dir, state)
 
 
+def mark_job_interrupted(job_dir: Path, step: str) -> None:
+    """
+    Record that the job was deliberately stopped (Ctrl-C / SIGINT) while
+    `step` was in progress -- pipeline.py's counterpart to
+    mark_job_failed() above, for a stop that wasn't an error.
+
+    Distinguishing this from a plain 'running' status matters: without
+    it, a job sitting mid-Ctrl-C looks identical in job.json to one still
+    genuinely executing in another terminal or tmux pane -- nothing
+    tells "safe to resume this" apart from "don't, something else
+    already has it." It's kept separate from 'failed' too: an
+    interruption is an expected, intentional stop, not something to
+    investigate, so it gets its own status and its own small metadata
+    block rather than overloading 'failure' -- pipeline.py's "Resuming"
+    branch clears a stale record of either kind on the next attempt (the
+    same way it already cleared a stale 'failure' block).
+
+    `step` is deliberately never added to steps_completed here -- it was,
+    by definition, still in progress when the interrupt landed, so the
+    next run's resume logic redoes it from scratch, exactly as if it had
+    never started.
+    """
+    state = read_job(job_dir)
+    state["status"] = "interrupted"
+    now = time.time()
+    state["interrupted_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+    state["interrupted_at_local"], _ = fmt_wall_clock(now)
+    state["interruption"] = {"step": step}
+    write_job(job_dir, state)
+
+
 # ── Subprocess helper ─────────────────────────────────────────────────────────
 
 # Matches tqdm's default bar format: "  45%|████...| 107.9/239.85 [...]".
@@ -613,20 +644,39 @@ def run_cmd(
 
     # Poll for exit so we can interleave heartbeat emission without
     # blocking on the reader threads (which run independently above).
-    while proc.poll() is None:
-        if next_beat is not None and time.monotonic() >= next_beat:
-            elapsed = time.monotonic() - start
-            if heartbeat_msg is not None:
-                try:
-                    msg = heartbeat_msg(elapsed)
-                except Exception as exc:
-                    log.debug("  heartbeat_msg callback raised %r", exc)
+    try:
+        while proc.poll() is None:
+            if next_beat is not None and time.monotonic() >= next_beat:
+                elapsed = time.monotonic() - start
+                if heartbeat_msg is not None:
+                    try:
+                        msg = heartbeat_msg(elapsed)
+                    except Exception as exc:
+                        log.debug("  heartbeat_msg callback raised %r", exc)
+                        msg = f"... still running ({fmt_duration(elapsed)} elapsed)"
+                else:
                     msg = f"... still running ({fmt_duration(elapsed)} elapsed)"
-            else:
-                msg = f"... still running ({fmt_duration(elapsed)} elapsed)"
-            log.info("  %s", msg)
-            next_beat += heartbeat_sec
-        time.sleep(0.5)
+                log.info("  %s", msg)
+                next_beat += heartbeat_sec
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        # Ctrl-C at an attached terminal delivers SIGINT to this whole
+        # process group, so proc has very likely already received it
+        # directly and is on its way out. But this call site doesn't get
+        # to assume that: if it's ever reached somewhere that signal
+        # isn't forwarded to children, terminate proc explicitly rather
+        # than abandoning it to finish (or fail to) unsupervised after
+        # this function has already unwound -- best-effort, a short grace
+        # period for a clean exit, then an unconditional kill.
+        log.warning("  Interrupted — terminating subprocess (pid %d) ...", proc.pid)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log.warning("  Subprocess did not exit within 5s — killing (pid %d).", proc.pid)
+            proc.kill()
+            proc.wait()
+        raise
 
     t_out.join()
     t_err.join()
@@ -647,6 +697,187 @@ def run_cmd(
         )
 
     return result
+
+
+# ── Resumable-output helpers ──────────────────────────────────────────────────
+#
+# Every subprocess invocation in this pipeline whose output is later trusted
+# via `<path>.exists()` on resume needs two things: the write itself must be
+# atomic (so a process killed mid-write can never leave a truncated file
+# sitting under the name resume logic looks for), and the result should be
+# validated against what it was expected to contain (so resume logic doesn't
+# have to take "it exists" on faith even when the write *was* atomic --
+# e.g. a job directory populated before this pair of functions existed).
+#
+# tmp_output_path()/finalize_output() below are the first half of that;
+# probe_duration_sec()/check_duration_matches() are the second. Together they
+# would have caught job 1d55099e2bb7's audio_raw.mp3: Step 1a's
+# `ffmpeg -c:a copy` was interrupted 7:51 into a source whose own audio stream
+# reports roughly 100 minutes, and the truncated result was later treated as
+# a finished extraction purely because it existed at all under the expected
+# filename (see steps/extract.py, which was the one caller not yet using
+# either mechanism).
+
+def tmp_output_path(final_path: Path) -> Path:
+    """
+    Temp sibling path a subprocess should write to before being published
+    under final_path via finalize_output().
+
+    Inserts '.part' before the real extension (audio_raw.mp3 becomes
+    audio_raw.part.mp3) rather than appending it (audio_raw.mp3.part).
+    ffmpeg -- and most other media tools -- infer their output container
+    format from the filename's own extension, so a temp path needs to
+    keep a recognizable one as its actual suffix, or the write fails
+    outright before there's anything to even worry about renaming
+    ("Unable to choose an output format for '...audio_raw.mp3.part'").
+
+    Always placed alongside final_path -- same directory, so
+    finalize_output()'s rename is guaranteed same-filesystem -- with a
+    name that can't collide with any real pipeline filename and sorts
+    visibly next to its target in a directory listing. Callers should
+    remove any leftover file at this path (from a previous interrupted
+    attempt) before starting a fresh one, e.g.:
+
+        tmp = tmp_output_path(out_path)
+        tmp.unlink(missing_ok=True)
+        run_cmd([..., str(tmp)], log)
+        finalize_output(tmp, out_path)
+    """
+    return final_path.with_name(final_path.stem + ".part" + final_path.suffix)
+
+
+def finalize_output(tmp_path: Path, final_path: Path) -> None:
+    """
+    Atomically publish a subprocess's completed output under its final
+    name -- the write-then-rename counterpart to tmp_output_path() above,
+    the same idiom write_job() already uses for job.json.
+
+    os.replace() rather than Path.rename(): both are atomic on POSIX when
+    source and destination share a filesystem (guaranteed here --
+    tmp_output_path() always places the temp file next to its target),
+    but os.replace() also overwrites atomically on Windows, where
+    Path.rename() raises FileExistsError instead of replacing. Not
+    load-bearing for this project's Linux-only container today, but free
+    to get right.
+    """
+    os.replace(tmp_path, final_path)
+
+
+def probe_duration_sec(path: Path, log: logging.LoggerAdapter) -> float:
+    """
+    Return the duration of path's first audio stream in seconds, measured
+    by actually reading the bitstream through to its end -- stream-copied
+    into the null muxer, so this costs a fast demux pass, not a real
+    decode -- rather than trusting the container's own self-reported
+    duration metadata.
+
+    That distinction is not theoretical: some formats embed a header
+    that declares a duration up front, specifically to let a player seek
+    without scanning the whole file first (MP3's Xing/LAME VBR header
+    and FLAC's STREAMINFO block both do this), and a demuxer that trusts
+    it outright keeps reporting the *original* duration even after the
+    file's tail has been chopped off by an interrupted write. Confirmed
+    by testing against this exact fix: an MP3 and a FLAC file, each
+    truncated to a fifth of their size, both still reported their full,
+    pre-truncation duration from a plain `ffprobe -show_entries
+    format=duration` -- silently defeating the entire integrity check
+    this function exists to support. (AAC and AC3 happened not to
+    exhibit this in the same test, but nothing about that generalizes to
+    every codec steps/extract.py might encounter, so the robust method
+    is used unconditionally rather than per-codec.) WAV -- Steps
+    1b/1c/3b's format throughout the rest of the pipeline -- computes
+    duration from actual data-chunk bytes present and reflected
+    truncation correctly in the same test, but is measured the same way
+    here regardless, both for consistency and because actually reading
+    the file through is a fast demux either way.
+
+    Raises RuntimeError if ffmpeg can't read the file at all (rather
+    than returning 0.0), so a caller comparing against an expected value
+    never mistakes "unreadable" for "empty."
+    """
+    try:
+        result = run_cmd(
+            [
+                "ffmpeg", "-v", "error",
+                "-i", str(path),
+                "-map", "0:a:0",
+                "-c", "copy",
+                "-f", "null",
+                "-progress", "pipe:1",
+                "-nostats",
+                "-",
+            ],
+            log,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"Could not read {path} to determine its duration: {exc}") from None
+
+    out_time_us = None
+    for line in result.stdout.splitlines():
+        if line.startswith("out_time_us="):
+            value = line.split("=", 1)[1].strip()
+            if value not in ("", "N/A"):
+                out_time_us = int(value)
+
+    if out_time_us is None:
+        raise RuntimeError(
+            f"ffmpeg could not determine a duration for {path} -- it may "
+            "be empty, corrupt, or an unsupported format."
+        )
+    return out_time_us / 1_000_000
+
+
+def check_duration_matches(
+    actual_sec: float,
+    expected_sec: float,
+    *,
+    label: str,
+    tolerance_sec: float = 5.0,
+    log: Optional[logging.LoggerAdapter] = None,
+) -> None:
+    """
+    Raise RuntimeError if actual_sec doesn't match expected_sec within
+    tolerance_sec -- the shared compare-and-raise half of this pipeline's
+    duration integrity checks. Takes already-measured durations rather
+    than probing internally, so each caller is free to choose whichever
+    ffprobe strategy suits its own file type (probe_duration_sec() above
+    for most things; steps/segment.py's own _probe_duration() for WAV)
+    and to log around the call however fits its own step's style.
+
+    tolerance_sec is a flat, absolute value rather than a percentage of
+    expected_sec: a lossless bitstream copy, PCM downmix, split, or
+    concat should reproduce its source's duration to within a small,
+    constant margin (container-level timestamp rounding, slightly
+    different stream start references) regardless of how long the
+    source itself is -- there's no mechanism by which that margin would
+    legitimately grow proportionally with duration the way, say,
+    frame-rate drift over a long recording might. A truncation caused by
+    an interrupted run is typically tens of seconds to hours short, so
+    even a fairly tight flat tolerance has enormous margin against a
+    real corruption while comfortably tolerating benign container
+    quirks in a genuinely intact file.
+
+    label identifies what's being compared, purely for the error message
+    (e.g. "audio_raw.mp3 vs. source video") -- this function has no
+    other use for it.
+    """
+    delta = abs(actual_sec - expected_sec)
+    if delta > tolerance_sec:
+        raise RuntimeError(
+            f"Integrity check failed for {label}:\n"
+            f"  measured   : {fmt_duration(actual_sec)}  ({actual_sec:.1f}s)\n"
+            f"  expected   : {fmt_duration(expected_sec)}  ({expected_sec:.1f}s)\n"
+            f"  difference : {fmt_duration(delta)}  ({delta:.1f}s, tolerance {tolerance_sec:.0f}s)\n"
+            "This usually means the file was left truncated by a previous "
+            "run interrupted mid-write (Ctrl-C, OOM-kill, host shutdown, "
+            "etc.)."
+        )
+    if log is not None:
+        log.debug(
+            "  ✓  duration check passed for %s (%.1fs vs expected %.1fs, "
+            "Δ%.1fs ≤ tolerance %.1fs)",
+            label, actual_sec, expected_sec, delta, tolerance_sec,
+        )
 
 
 # ── Wall-clock timestamps (local + UTC) ─────────────────────────────────────────

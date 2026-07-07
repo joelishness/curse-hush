@@ -57,6 +57,7 @@ from utils import (
     fmt_dir,
     fmt_duration,
     mark_job_failed,
+    mark_job_interrupted,
     paths_banner,
     read_job,
     retention_summary,
@@ -411,6 +412,16 @@ def main() -> None:
                 cleared_failure = True
         if cleared_failure:
             log.info("  Cleared stale failure record from a prior attempt.")
+        # Same idea, for a job that was Ctrl-C'd (see mark_job_interrupted())
+        # rather than failed outright -- otherwise a resumed-and-now-running
+        # job would sit there still claiming 'interrupted' from whichever
+        # step got Ctrl-C'd last time.
+        cleared_interruption = False
+        for key in ("interruption", "interrupted_at", "interrupted_at_local"):
+            if state.pop(key, None) is not None:
+                cleared_interruption = True
+        if cleared_interruption:
+            log.info("  Cleared stale interruption record from a prior attempt.")
         # Backfill for job.json files written before started_at_local
         # existed -- a display convenience only (started_at, above, is
         # and remains the canonical UTC field), so it's fine for this to
@@ -579,6 +590,10 @@ def main() -> None:
         ext_log = step_logger("extract")
         try:
             extract_raw(video, job_dir, cfg, ext_log)
+        except KeyboardInterrupt:
+            ext_log.error("Step 1a interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "1a_extract_raw")
+            sys.exit(130)
         except Exception as exc:
             ext_log.error("Step 1a failed: %s", exc)
             mark_job_failed(job_dir, "1a_extract_raw", exc)
@@ -587,6 +602,10 @@ def main() -> None:
         # ── Step 1b: downmix to stereo ─────────────────────────────────────────
         try:
             downmix_to_stereo(job_dir, cfg, ext_log)
+        except KeyboardInterrupt:
+            ext_log.error("Step 1b interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "1b_downmix")
+            sys.exit(130)
         except Exception as exc:
             ext_log.error("Step 1b failed: %s", exc)
             mark_job_failed(job_dir, "1b_downmix", exc)
@@ -596,6 +615,10 @@ def main() -> None:
         seg_log = step_logger("segment")
         try:
             segments = run_segment(job_dir, cfg, seg_log)
+        except KeyboardInterrupt:
+            seg_log.error("Step 1c interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "1c_segment")
+            sys.exit(130)
         except Exception as exc:
             seg_log.error("Step 1c failed: %s", exc)
             mark_job_failed(job_dir, "1c_segment", exc)
@@ -605,6 +628,10 @@ def main() -> None:
         sep_log = step_logger("separate")
         try:
             stem_pairs = run_separate(job_dir, segments, cfg, sep_log)
+        except KeyboardInterrupt:
+            sep_log.error("Step 2 interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "2_separate")
+            sys.exit(130)
         except Exception as exc:
             sep_log.error("Step 2 failed: %s", exc)
             mark_job_failed(job_dir, "2_separate", exc)
@@ -614,6 +641,10 @@ def main() -> None:
         tr_log = step_logger("transcribe")
         try:
             transcript_paths = run_transcribe(job_dir, segments, stem_pairs, cfg, tr_log)
+        except KeyboardInterrupt:
+            tr_log.error("Step 3 interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "3_transcribe")
+            sys.exit(130)
         except Exception as exc:
             tr_log.error("Step 3 failed: %s", exc)
             mark_job_failed(job_dir, "3_transcribe", exc)
@@ -625,6 +656,10 @@ def main() -> None:
             transcript_out, dialog_out, score_sfx_out = run_merge(
                 job_dir, segments, stem_pairs, transcript_paths, cfg, mg_log,
             )
+        except KeyboardInterrupt:
+            mg_log.error("Step 3b interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "3b_merge")
+            sys.exit(130)
         except Exception as exc:
             mg_log.error("Step 3b failed: %s", exc)
             mark_job_failed(job_dir, "3b_merge", exc)
@@ -642,6 +677,10 @@ def main() -> None:
     fl_log = step_logger("flag")
     try:
         matches_out = run_flag(job_dir, transcript_out, cfg, fl_log)
+    except KeyboardInterrupt:
+        fl_log.error("Step 4b (flag) interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "4b_flag")
+        sys.exit(130)
     except Exception as exc:
         fl_log.error("Step 4b (flag) failed: %s", exc)
         mark_job_failed(job_dir, "4b_flag", exc)
@@ -656,6 +695,10 @@ def main() -> None:
         except ReviewAborted:
             rv_log.info("Step 4b (review) aborted by user — no changes written. Re-run to try again.")
             sys.exit(0)
+        except KeyboardInterrupt:
+            rv_log.error("Step 4b (review) interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "4b_review")
+            sys.exit(130)
         except Exception as exc:
             rv_log.error("Step 4b (review) failed: %s", exc)
             mark_job_failed(job_dir, "4b_review", exc)
@@ -666,6 +709,10 @@ def main() -> None:
     mu_log = step_logger("mute")
     try:
         dialog_censored_out = run_mute(job_dir, dialog_out, cfg, mu_log)
+    except KeyboardInterrupt:
+        mu_log.error("Step 5 interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "5_mute")
+        sys.exit(130)
     except Exception as exc:
         mu_log.error("Step 5 failed: %s", exc)
         mark_job_failed(job_dir, "5_mute", exc)
@@ -675,6 +722,10 @@ def main() -> None:
     rc_log = step_logger("recombine")
     try:
         audio_censored_out = run_recombine(job_dir, dialog_censored_out, score_sfx_out, cfg, rc_log)
+    except KeyboardInterrupt:
+        rc_log.error("Step 6 interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "6_recombine")
+        sys.exit(130)
     except Exception as exc:
         rc_log.error("Step 6 failed: %s", exc)
         mark_job_failed(job_dir, "6_recombine", exc)
@@ -684,6 +735,10 @@ def main() -> None:
     en_log = step_logger("encode")
     try:
         audio_encoded_out = run_encode(job_dir, video, audio_censored_out, cfg, en_log)
+    except KeyboardInterrupt:
+        en_log.error("Step 6b interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "6b_encode")
+        sys.exit(130)
     except Exception as exc:
         en_log.error("Step 6b failed: %s", exc)
         mark_job_failed(job_dir, "6b_encode", exc)
@@ -693,6 +748,10 @@ def main() -> None:
     mx_log = step_logger("mux")
     try:
         output_video = run_mux(job_dir, video, audio_encoded_out, OUTPUT_DIR, cfg, mx_log)
+    except KeyboardInterrupt:
+        mx_log.error("Step 7 interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "7_mux")
+        sys.exit(130)
     except Exception as exc:
         mx_log.error("Step 7 failed: %s", exc)
         mark_job_failed(job_dir, "7_mux", exc)
