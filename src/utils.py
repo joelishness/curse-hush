@@ -3,6 +3,7 @@ profanity-hush — shared utilities
 
 Imported by pipeline.py and every steps/ module.
 """
+import hashlib
 import json
 import logging
 import os
@@ -878,6 +879,34 @@ def check_duration_matches(
             "Δ%.1fs ≤ tolerance %.1fs)",
             label, actual_sec, expected_sec, delta, tolerance_sec,
         )
+
+
+def sha256_file(
+    path: Path,
+    log: Optional[logging.LoggerAdapter] = None,
+    chunk_size: int = 1024 * 1024,
+) -> Optional[str]:
+    """
+    Return path's SHA-256 hex digest, reading it in fixed-size chunks so
+    this works for large files without loading them fully into memory.
+
+    Best-effort and provenance-only: returns None (and logs a warning, if
+    a logger is given) rather than raising on an I/O error, since this is
+    an audit aid for confirming "is this exactly the file we started
+    from" later, not a correctness gate the way check_duration_matches()
+    is -- a hash that fails to compute shouldn't be able to fail a step
+    on its own.
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError as exc:
+        if log is not None:
+            log.warning("  Could not hash %s: %s", path, exc)
+        return None
 
 
 # ── Wall-clock timestamps (local + UTC) ─────────────────────────────────────────

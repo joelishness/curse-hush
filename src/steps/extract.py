@@ -28,6 +28,7 @@ from utils import (
     probe_duration_sec,
     read_job,
     run_cmd,
+    sha256_file,
     step_logger,
     tmp_output_path,
     unmark_step_done,
@@ -178,6 +179,21 @@ def extract_raw(
     _validate_audio_raw(job_dir, out_path, source_duration, log)
     log.info("  ✓  %s passed integrity check.", out_path.name)
 
+    # A durable provenance record, not an active gate: -c:a copy makes
+    # out_path a verbatim bitstream copy of the source's audio stream, so
+    # this hash is -- for practical purposes -- a hash of "the audio we
+    # started from," computed here (once, against the local file we just
+    # wrote) rather than by re-reading video_path itself, which may sit on
+    # a slower NAS/network mount. It's logged and persisted so a person
+    # can confirm later whether a source file is "the same" one a given
+    # job was built from; it isn't re-verified automatically on every
+    # resume (that would reintroduce a dependency on the source still
+    # being reachable, which source_duration_sec's fallback above
+    # deliberately avoids) and a failure to compute it never blocks the
+    # step -- see sha256_file()'s own docstring.
+    source_hash = sha256_file(out_path, log)
+    log.info("  sha256: %s", source_hash or "(could not be computed)")
+
     # Persist audio metadata for later steps and for job inspection
     state["audio"] = {
         "codec":               codec,
@@ -188,6 +204,7 @@ def extract_raw(
         "title":               title,
         "raw_file":            out_path.name,
         "source_duration_sec": source_duration,
+        "source_audio_sha256": source_hash,
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "1a_extract_raw")
@@ -354,40 +371,62 @@ def _validate_audio_raw(
     was accepted as a finished extraction purely because it existed at
     all under the expected filename.
 
-    Two independent signals, either one sufficient to fail:
+    The duration check (below) is the only one of these that gates
+    success or failure. Its embedded-chapters cross-check used to also
+    raise on a mismatch, but that signal isn't as trustworthy as it looks:
+    a chapter list is metadata riding along in the same file, not an
+    independent remeasurement, so a genuine authoring mistake in the
+    *source* (a chapter placed past its actual runtime, unrelated to
+    anything this pipeline does) would reproduce byte-for-byte on every
+    retry. Failing hard on the duration check is safe -- a retry either
+    reproduces the same correct measurement or fixes a real truncation --
+    but failing hard here could turn one mis-authored source file into a
+    permanently unprocessable one, which is worse than the bug this
+    function exists to catch. So a chapters/duration mismatch is now
+    logged as a warning rather than treated as failure; see below.
 
-      1. out_path's own probed duration vs. expected_source_duration (the
-         source video's audio-stream duration, recorded in job.json at
-         extraction time so a resume never needs the original video file
-         to still be reachable). probe_duration_sec() measures this by
-         actually demuxing the file through to its end rather than
-         trusting embedded metadata (see that function's own docstring
-         for why that distinction matters -- confirmed by testing, not
-         theoretical), so a `-c:a copy` bitstream copy that's genuinely
-         intact reproduces the source's duration almost exactly; a real
-         discrepancy here is tens of seconds to hours, not the
-         container-level rounding a truly intact copy might show.
-         Skipped if expected_source_duration is unavailable (rare, but
-         validation should degrade gracefully rather than block a run
-         over a duration ffprobe couldn't determine for the *source*).
+    The one signal that gates success or failure:
 
-      2. out_path's own embedded chapter list, if it has one (ffmpeg's
-         bitstream copy carries the source container's chapters along
-         with it), vs. out_path's own duration. Chapters are written
-         once from the complete source material, so any chapter ending
-         after the file's own measured duration means the audio data was
-         cut short after the chapter metadata was already in place --
-         exactly the shape of job 1d55099e2bb7's file (chapters ran to
-         6008s / Chapter 20; actual duration 471.8s). A file with no
-         chapters at all just skips this half of the check -- it isn't
-         required for a file to be valid, only informative when present.
+      out_path's own probed duration vs. expected_source_duration (the
+      source video's audio-stream duration, recorded in job.json at
+      extraction time so a resume never needs the original video file to
+      still be reachable). probe_duration_sec() measures this by actually
+      demuxing the file through to its end rather than trusting embedded
+      metadata (see that function's own docstring for why that
+      distinction matters -- confirmed by testing, not theoretical), so a
+      `-c:a copy` bitstream copy that's genuinely intact reproduces the
+      source's duration almost exactly; a real discrepancy here is tens
+      of seconds to hours, not the container-level rounding a truly
+      intact copy might show. Skipped if expected_source_duration is
+      unavailable (rare, but validation should degrade gracefully rather
+      than block a run over a duration ffprobe couldn't determine for the
+      *source*).
 
-    On failure: deletes out_path and unmarks '1a_extract_raw' from
-    steps_completed, so the next run doesn't get stuck re-validating (or
-    worse, refusing to touch) the same bad file -- just re-running
-    hush.sh regenerates it cleanly. pipeline.py's caller marks Step 1a
-    failed and exits; the next invocation redoes the extraction from
-    scratch.
+    A second, informational-only signal:
+
+      out_path's own embedded chapter list, if it has one (ffmpeg's
+      bitstream copy carries the source container's chapters along with
+      it), vs. out_path's own duration. Chapters are normally written
+      once from the complete source material, so a chapter ending after
+      the file's own measured duration usually does mean the audio data
+      was cut short after the chapter metadata was already in place --
+      this is exactly the shape job 1d55099e2bb7's file was found in
+      (chapters ran to 6008s / Chapter 20; actual duration 471.8s), and
+      it's still logged prominently for that reason. It just isn't
+      trusted *on its own* to fail the job the way the duration check is
+      -- if the duration check above already passed, that's independent,
+      ground-truth confirmation the extraction itself is complete, which
+      makes a lingering chapters mismatch a source-authoring quirk to
+      note rather than something to act on. A file with no chapters at
+      all just skips this half of the check -- it isn't required for a
+      file to be valid, only informative when present.
+
+    On a duration-check failure: deletes out_path and unmarks
+    '1a_extract_raw' from steps_completed, so the next run doesn't get
+    stuck re-validating (or worse, refusing to touch) the same bad file
+    -- just re-running hush.sh regenerates it cleanly. pipeline.py's
+    caller marks Step 1a failed and exits; the next invocation redoes the
+    extraction from scratch.
     """
     actual_duration = probe_duration_sec(out_path, log)
 
@@ -406,18 +445,18 @@ def _validate_audio_raw(
 
     max_chapter_end = _max_chapter_end_sec(out_path, log)
     if max_chapter_end is not None and max_chapter_end > actual_duration + 2.0:
-        out_path.unlink(missing_ok=True)
-        unmark_step_done(job_dir, "1a_extract_raw")
-        raise RuntimeError(
-            f"Integrity check failed for {out_path.name}: it carries "
-            f"chapter markers extending to {fmt_duration(max_chapter_end)} "
-            f"({max_chapter_end:.1f}s), but the file itself is only "
-            f"{fmt_duration(actual_duration)} ({actual_duration:.1f}s) long. "
-            "Chapters are copied once from the complete source material, "
-            "so this means the audio data was cut short after they were "
-            "already in place — almost always a previous run interrupted "
-            "mid-extraction. Deleted the incomplete file; re-run to "
-            "extract it fresh."
+        log.warning(
+            "  ⚠  %s carries chapter markers extending to %s (%.1fs), but "
+            "the file itself is only %s (%.1fs) long. This can mean a "
+            "previous run was interrupted mid-extraction -- but if the "
+            "duration check above passed, the extraction itself has "
+            "already been confirmed complete against the source, so this "
+            "more likely just means the source's own chapter metadata "
+            "doesn't match its actual runtime (an authoring mistake "
+            "upstream, not something re-running this pipeline can fix). "
+            "Not treated as a failure; proceeding.",
+            out_path.name, fmt_duration(max_chapter_end), max_chapter_end,
+            fmt_duration(actual_duration), actual_duration,
         )
 
 
@@ -449,11 +488,21 @@ def _validate_audio_stereo(job_dir: Path, raw_path: Path, out: Path, log: loggin
 
 def _max_chapter_end_sec(path: Path, log: logging.LoggerAdapter) -> Optional[float]:
     """
-    Return the latest chapter end time embedded in path, or None if it
-    has no chapters at all -- most extracted audio bitstreams won't;
-    it's only ever present because ffmpeg's bitstream copy carries the
-    source container's own chapter list along with it. See
+    Return the latest chapter end time, in seconds, embedded in path, or
+    None if it has no chapters at all -- most extracted audio bitstreams
+    won't; it's only ever present because ffmpeg's bitstream copy carries
+    the source container's own chapter list along with it. See
     _validate_audio_raw() above for how this is used.
+
+    Reads each chapter's 'end_time' field, not 'end': ffprobe reports
+    'end' as a raw integer tick count in units of that chapter's own
+    'time_base' (which varies by file -- 1/1000, 1/90000, whatever the
+    source container used -- and isn't necessarily seconds at all), while
+    'end_time' is the same value ffprobe has already converted to decimal
+    seconds for you. Using 'end' directly as if it were already seconds
+    is a real bug, not a hypothetical one -- caught by testing against a
+    file with a 1/1000 time_base, where it read a chapter actually ending
+    at 24.977s as ending at 24977 seconds (about 6h56m) instead.
     """
     result = run_cmd(
         ["ffprobe", "-v", "quiet", "-show_chapters", "-of", "json", str(path)],
@@ -461,5 +510,5 @@ def _max_chapter_end_sec(path: Path, log: logging.LoggerAdapter) -> Optional[flo
     )
     data     = json.loads(result.stdout)
     chapters = data.get("chapters", [])
-    ends     = [float(c["end"]) for c in chapters if c.get("end") is not None]
+    ends     = [float(c["end_time"]) for c in chapters if c.get("end_time") is not None]
     return max(ends) if ends else None
