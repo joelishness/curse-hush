@@ -909,6 +909,86 @@ def sha256_file(
         return None
 
 
+def verify_stem_before_reuse(
+    path: Path,
+    expected_duration_sec: Optional[float],
+    expected_sha256: Optional[str],
+    log: logging.LoggerAdapter,
+    *,
+    label: str,
+) -> None:
+    """
+    Re-verify a long-lived stem file (dialog.wav / score_sfx.wav) against
+    the duration and hash steps/merge.py recorded when it finalized them,
+    immediately before steps/mute.py or steps/recombine.py actually
+    consumes it. That may happen much later and in an entirely separate
+    invocation than the one that wrote it, via pipeline.py's
+    --skip-index/--add-interval/--redo-review correction workflow (see
+    that module's docstring) -- the whole point of this check is that
+    nothing re-verifies these two files between when Step 3b writes them
+    and whenever a later correction re-run reads them again, which could
+    be a long dwell time for something to go wrong in unnoticed. See
+    steps/merge.py's _verify_and_hash_stem() for the write-time half.
+
+    Deliberately does NOT delete path or unmark any step on a mismatch,
+    unlike every other integrity check in this pipeline. Those all guard
+    cheap-to-regenerate outputs (a fresh Step 1a extraction, a re-split
+    segment, a redone concat) where "delete it, let the next run redo it"
+    is a safe, no-cost default. dialog.wav and score_sfx.wav are the
+    opposite: they're kept specifically *because* regenerating them means
+    re-running Step 2's Demucs separation, often the most expensive step
+    in the whole pipeline -- and there's no supported way to redo just
+    that (see pipeline.py's --redo-step, which explicitly excludes
+    2_separate/3b_merge: "their per-segment intermediates may already be
+    deleted, so redoing one alone isn't safe"). Silently deleting a
+    multi-hour artifact and triggering its own regeneration off the back
+    of one failed check would be a far bigger, more surprising action
+    than anything else this pipeline does on its own -- so this raises
+    with clear, actionable guidance instead, and leaves the job directory
+    exactly as it found it for a person to decide what to do next.
+
+    Skips whichever half of the check it doesn't have data for -- no
+    recorded duration/hash (a job directory from before this check
+    existed) just means less confidence, not a hard block over data that
+    predates the feature that would have produced it.
+    """
+    problems: list[str] = []
+
+    if expected_duration_sec:
+        actual_duration = probe_duration_sec(path, log)
+        delta = abs(actual_duration - expected_duration_sec)
+        if delta > 5.0:
+            problems.append(
+                f"duration is {fmt_duration(actual_duration)} ({actual_duration:.1f}s), "
+                f"expected {fmt_duration(expected_duration_sec)} ({expected_duration_sec:.1f}s) "
+                f"— Δ{delta:.1f}s"
+            )
+
+    if expected_sha256:
+        actual_hash = sha256_file(path, log)
+        if actual_hash is not None and actual_hash != expected_sha256:
+            problems.append(f"sha256 is {actual_hash[:16]}…, expected {expected_sha256[:16]}…")
+
+    if problems:
+        raise RuntimeError(
+            f"Integrity check failed for {label} ({path}):\n"
+            + "\n".join(f"  - {p}" for p in problems) + "\n"
+            "This file has changed since Step 3b (merge) wrote it -- "
+            "possibly corruption, possibly something else touched it. "
+            "dialog.wav and score_sfx.wav are kept specifically to avoid "
+            "re-running Step 2's Demucs separation, so this is deliberately "
+            "not auto-corrected -- redoing that work automatically, "
+            "unasked, over a single failed check is a bigger action than "
+            "this pipeline should take on its own. There is currently no "
+            "supported way to redo just Steps 2/3b (pipeline.py's "
+            "--redo-step explicitly excludes them); if this file is "
+            "genuinely bad, the safe fix is to delete the job directory "
+            "and re-run from scratch."
+        )
+
+    log.debug("  ✓  %s passed integrity check (duration + hash vs. Step 3b's record).", label)
+
+
 # ── Wall-clock timestamps (local + UTC) ─────────────────────────────────────────
 
 def fmt_wall_clock(epoch: Optional[float] = None) -> tuple[str, str]:

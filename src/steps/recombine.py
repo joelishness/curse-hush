@@ -10,6 +10,14 @@ on the isolated dialog stem instead of the full mix (see design doc §4).
 Input  : dialog_censored.wav (Step 5), score_sfx.wav (Step 3b)
 Output : audio_censored.wav
 
+score_sfx.wav may have been sitting untouched since Step 3b wrote it --
+see steps/mute.py's module docstring for the identical reasoning applied
+to dialog.wav -- so it's re-verified against the duration and hash
+steps/merge.py recorded at that time before this step actually reads it
+(utils.verify_stem_before_reuse()). A mismatch raises rather than
+silently regenerating anything, for the same reason: there's no cheap
+fix, since score_sfx.wav's only source is Step 2's Demucs separation.
+
 Tool (ffmpeg's amix filter):
   ffmpeg -i dialog_censored.wav -i score_sfx.wav \
       -filter_complex amix=inputs=2:duration=first:normalize=0 \
@@ -64,7 +72,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from utils import fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
+from utils import fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, verify_stem_before_reuse, write_job
 
 
 def recombine(
@@ -111,6 +119,14 @@ def recombine(
             f"Step 6: score/SFX stem not found at {score_sfx_path} — did Step 3b "
             "(merge) complete?"
         )
+    merge_info = state.get("merge", {})
+    verify_stem_before_reuse(
+        score_sfx_path,
+        state.get("total_duration_sec"),
+        merge_info.get("score_sfx_sha256"),
+        log,
+        label="score_sfx.wav",
+    )
 
     log.info("Step 6 — recombine dialog + score/SFX stems")
 

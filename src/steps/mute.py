@@ -19,6 +19,15 @@ Input  : matches.json (Step 4b flag phase, always present), review.json
          at least one candidate), dialog.wav
 Output : dialog_censored.wav, censor_log.json
 
+dialog.wav may have been sitting untouched since Step 3b wrote it --
+often long enough for a whole correction re-run's worth of Steps 1a-4b to
+be skipped entirely (see below) -- so it's re-verified against the
+duration and hash steps/merge.py recorded at that time before this step
+actually reads it (utils.verify_stem_before_reuse()). A mismatch raises
+rather than silently regenerating anything: unlike this pipeline's other
+integrity checks, there's no cheap fix here, since dialog.wav's only
+source is Step 2's Demucs separation. See that function's own docstring.
+
 Logic:
   1. Load matches.json (this is the *only* source of candidate matches —
      never recomputed).
@@ -81,7 +90,18 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from utils import cfg_get, fmt_size, fmt_timestamp, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
+from utils import (
+    cfg_get,
+    fmt_size,
+    fmt_timestamp,
+    keep_intermediate,
+    mark_step_done,
+    read_job,
+    run_cmd,
+    step_logger,
+    verify_stem_before_reuse,
+    write_job,
+)
 
 
 def mute(
@@ -138,6 +158,14 @@ def mute(
             f"Step 5: dialog stem not found at {dialog_path} — did Step 3b "
             "(merge) complete?"
         )
+    merge_info = state.get("merge", {})
+    verify_stem_before_reuse(
+        dialog_path,
+        state.get("total_duration_sec"),
+        merge_info.get("dialog_sha256"),
+        log,
+        label="dialog.wav",
+    )
 
     method     = cfg_get(cfg, "censoring", "method", default="mute")
     padding_ms = float(cfg_get(cfg, "censoring", "padding_ms", default=50))

@@ -61,6 +61,7 @@ from utils import (
     probe_duration_sec,
     read_job,
     run_cmd,
+    sha256_file,
     step_logger,
     tmp_output_path,
     write_job,
@@ -211,20 +212,24 @@ def merge(
                 fmt_size(dialog_out), fmt_size(score_sfx_out),
             )
 
-        total_sec = float(state.get("total_duration_sec", 0.0))
-        if total_sec:
-            for merged, name in ((dialog_out, "dialog.wav"), (score_sfx_out, "score_sfx.wav")):
-                try:
-                    check_duration_matches(
-                        probe_duration_sec(merged, log), total_sec, log=log,
-                        label=f"{name} vs. recorded total_duration_sec",
-                        tolerance_sec=5.0,
-                    )
-                except RuntimeError:
-                    merged.unlink(missing_ok=True)
-                    log.error("  Deleted incomplete %s — re-run to merge it fresh.", name)
-                    raise
-        log.info("  ✓  merged audio passed integrity check.")
+    # ── 2b. Integrity check + provenance hash ─────────────────────────────────
+    # Runs for both branches above (single-segment passthrough and
+    # multi-segment concat) and regardless of whether this merge just ran
+    # fresh or is resuming after an interruption -- dialog.wav and
+    # score_sfx.wav are the two artifacts a correction re-run
+    # (pipeline.py's --skip-index/--add-interval/--redo-review) depends
+    # on, possibly much later and in an entirely separate invocation, so
+    # this is the one place to both confirm they're good *now* and record
+    # what "good" looks like for steps/mute.py and steps/recombine.py to
+    # check again immediately before they actually consume these files --
+    # which may not be this run at all. Passing here only proves these
+    # files were fine at merge time; it says nothing about what might
+    # happen to them in the meantime, which is exactly the gap that later
+    # check exists to close.
+    total_sec      = float(state.get("total_duration_sec", 0.0))
+    dialog_hash    = _verify_and_hash_stem(dialog_out, "dialog.wav", total_sec, log)
+    score_sfx_hash = _verify_and_hash_stem(score_sfx_out, "score_sfx.wav", total_sec, log)
+    log.info("  ✓  dialog.wav + score_sfx.wav passed integrity check.")
 
     # ── 3. Cleanup intermediates ──────────────────────────────────────────────
     # Delete audio_stereo_NN.wav per-segment files (multi-segment) or
@@ -270,6 +275,8 @@ def merge(
             "dialog":     dialog_out.name,
             "score_sfx":  score_sfx_out.name,
         },
+        "dialog_sha256":    dialog_hash,
+        "score_sfx_sha256": score_sfx_hash,
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "3b_merge")
@@ -319,6 +326,51 @@ def _ffmpeg_concat(sources: list[Path], dest: Path, log: logging.LoggerAdapter) 
     finally:
         if list_path.exists():
             list_path.unlink()
+
+
+def _verify_and_hash_stem(
+    path: Path,
+    label: str,
+    expected_duration_sec: float,
+    log: logging.LoggerAdapter,
+) -> Optional[str]:
+    """
+    Confirm path (dialog.wav or score_sfx.wav) still matches
+    expected_duration_sec, then return its SHA-256 hex digest.
+
+    This is the write-time half of the integrity check; steps/mute.py and
+    steps/recombine.py each run the read-time half (re-measuring duration
+    and re-hashing, comparing against what's recorded here) immediately
+    before they actually consume these files -- which may happen much
+    later, in a separate invocation, via pipeline.py's
+    --skip-index/--add-interval/--redo-review correction workflow. Passing
+    here only proves the file was fine *at merge time*; it says nothing
+    about what might happen to it in between, which is exactly the gap
+    the later check exists to close.
+
+    expected_duration_sec of 0 (state had no recorded total_duration_sec
+    at all -- shouldn't happen in practice, but see steps/extract.py's
+    analogous "skip gracefully rather than block a run" handling) skips
+    the duration half and only hashes.
+
+    On a duration mismatch: deletes path and re-raises, the same
+    delete-then-raise pattern used throughout this pipeline's other
+    integrity checks, so a redo doesn't get stuck re-validating the same
+    bad file. Hashing failures are not fatal at all -- see sha256_file()'s
+    own docstring.
+    """
+    if expected_duration_sec:
+        try:
+            check_duration_matches(
+                probe_duration_sec(path, log), expected_duration_sec, log=log,
+                label=f"{label} vs. recorded total_duration_sec",
+                tolerance_sec=5.0,
+            )
+        except RuntimeError:
+            path.unlink(missing_ok=True)
+            log.error("  Deleted incomplete %s — re-run to merge it fresh.", label)
+            raise
+    return sha256_file(path, log)
 
 
 def _seg_duration(state: dict, seg_wav_name: str, fallback_index: int) -> float:
