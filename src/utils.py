@@ -381,21 +381,39 @@ def censoring_summary(cfg: dict) -> str:
     )
 
 
-def cfg_get(cfg: dict, *keys: str, default: Any = None) -> Any:
+def cfg_get(cfg: dict, *keys: str, default: Any = None, allow_null: bool = False) -> Any:
     """
     Safely navigate nested config keys.
-    Returns default if any key is missing or the value is None.
+    Returns default if any key (including an intermediate one) is missing.
 
-    Example:
+    By default (allow_null=False), a key that IS present but explicitly set
+    to `null` in config.yaml is also treated as missing, and `default` is
+    returned -- this is what nearly every setting wants, since config.yaml
+    has no way to "delete" a key, so a stray blank value should fall back
+    to the built-in default rather than propagate None to callers that
+    aren't expecting it.
+
+    Pass allow_null=True for the rare setting where an explicit `null` is
+    itself a meaningful value, distinct from the key being absent entirely
+    -- e.g. whisperx.language: null means "auto-detect" (see steps/
+    transcribe.py), which is different from the key being missing, which
+    means "use the language default of 'en'". Only the final key in the
+    path gets this treatment; a missing or null *intermediate* section
+    (e.g. "whisperx" itself absent) still falls through to `default`,
+    since the isinstance(node, dict) check on the next iteration catches
+    that regardless of allow_null.
+
+    Examples:
       cfg_get(cfg, "demucs", "shifts", default=1)
+      cfg_get(cfg, "whisperx", "language", default="en", allow_null=True)
     """
     node: Any = cfg
     for k in keys:
-        if not isinstance(node, dict):
+        if not isinstance(node, dict) or k not in node:
             return default
-        node = node.get(k)
-        if node is None:
-            return default
+        node = node[k]
+    if node is None and not allow_null:
+        return default
     return node
 
 

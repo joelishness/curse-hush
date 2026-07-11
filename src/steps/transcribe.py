@@ -90,7 +90,13 @@ def transcribe(
 
     # ── Config ────────────────────────────────────────────────────────────────
     model_name   = cfg_get(cfg, "whisperx", "model",        default="large-v2")
-    language     = cfg_get(cfg, "whisperx", "language",     default="en") or None
+    # allow_null=True: config.yaml documents `language: null` as meaning
+    # "auto-detect" (distinct from the key being absent, which means "use
+    # the default of en"). Plain cfg_get() can't make that distinction --
+    # it collapses "absent" and "explicit null" into the same default --
+    # so without allow_null=True, `language: null` silently resolved to
+    # "en" instead of auto-detect. See utils.cfg_get()'s docstring.
+    language     = cfg_get(cfg, "whisperx", "language",     default="en", allow_null=True)
     batch_size   = int(cfg_get(cfg, "whisperx", "batch_size",   default=4))
     beam_size    = int(cfg_get(cfg, "whisperx", "beam_size",    default=5))
     device       = cfg_get(cfg, "whisperx", "device",       default="cpu")
