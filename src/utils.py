@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import traceback as _traceback
+import yaml
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -196,12 +197,75 @@ def step_logger(name: str) -> logging.LoggerAdapter:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
+class ConfigError(RuntimeError):
+    """
+    Raised when the resolved config (built-in config.yaml + optional host
+    override + env vars -- see load_config()) is missing a setting the
+    pipeline needs, or has it set to something that setting doesn't accept
+    (an explicit null on a field that isn't allow_null=True in cfg_get()).
+
+    Deliberately not silently papered over with a hardcoded Python value --
+    that used to be exactly how a config.yaml edit could go unnoticed, with
+    the pipeline quietly running on a stale literal nobody remembered was
+    there. See cfg_get()'s docstring.
+    """
+
+
+# config.yaml baked into the image at build time (see Dockerfile) -- the
+# base layer for every setting, and the only "default" left in the system.
+# To change a default: edit config/config.yaml and rebuild the image.
+# Nothing in src/*.py should ever need a matching edit again.
+DEFAULT_CONFIG_PATH = Path("/app/defaults/config.yaml")
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """
+    Recursively merge `override` onto `base`, returning a new dict.
+
+    A key present in `override` always wins, at whatever nesting level it
+    appears -- including an explicit `null`, which is a real, intentional
+    value for the handful of settings that treat it that way (see
+    cfg_get's allow_null). Only when BOTH sides have a dict at the same
+    key do we recurse and merge key-by-key; anything else (scalar, list,
+    or a type mismatch) is a full replacement of that key, not a merge.
+
+    This is what lets a host-mounted config.yaml override just the one or
+    two settings someone actually wants to change, without needing to be
+    a full copy of the template -- everything it doesn't mention inherits
+    from `base` (the built-in config.yaml).
+    """
+    merged = dict(base)
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def load_config(config_path: "str | Path") -> dict[str, Any]:
     """
     Load config.yaml and apply environment variable overrides.
 
+    config/config.yaml (this repo) is the single source of truth for every
+    tunable default -- there is no parallel set of hardcoded Python
+    literals to keep in sync with it any more. In order:
+
+      1. The built-in config.yaml baked into the image at build time
+         (DEFAULT_CONFIG_PATH, a copy of config/config.yaml as of the last
+         build -- see Dockerfile) is always loaded first, as the base
+         layer. This is the only "default" left in the system.
+      2. If a config.yaml is ALSO found at `config_path` (normally the
+         host's bind-mounted /config/config.yaml -- see hush.sh /
+         docker-compose.yml), it's deep-merged on top of the base layer
+         (see _deep_merge()). A host config.yaml only needs to specify
+         the settings it wants to override; everything else inherits from
+         the built-in one.
+      3. AC_* environment variables are applied last, same as before.
+
     Override precedence (highest wins):
-      environment variables > config.yaml values > pipeline built-in defaults
+      environment variables  >  host-mounted config.yaml (config_path)
+        >  built-in config.yaml baked into the image
 
     Env vars applied:
       AC_LOG_LEVEL                  → output.log_level
@@ -221,20 +285,30 @@ def load_config(config_path: "str | Path") -> dict[str, Any]:
     hush.sh (or docker-compose.yml, or a person invoking `docker run` by
     hand) can know it, at invocation time.
 
-    Returns an empty dict if the config file is absent — the pipeline uses
-    its own defaults in that case (same behaviour as config/config.yaml defaults).
+    Raises ConfigError if even the built-in config.yaml is missing or
+    fails to parse -- that should never happen in a correctly-built image
+    (see Dockerfile); it means the image needs rebuilding from a repo
+    checkout that still has a valid config/config.yaml.
     """
+    def _read(p: Path) -> dict[str, Any]:
+        with p.open() as f:
+            return yaml.safe_load(f) or {}
+
     try:
-        import yaml  # type: ignore
-    except ImportError:
-        yaml = None
+        cfg: dict[str, Any] = _read(DEFAULT_CONFIG_PATH)
+    except (OSError, yaml.YAMLError) as e:
+        raise ConfigError(
+            f"built-in config.yaml ({DEFAULT_CONFIG_PATH}) is missing or "
+            f"invalid -- this should not happen in a correctly-built "
+            f"image: {e}"
+        ) from e
 
     path = Path(config_path)
-    if path.exists() and yaml is not None:
-        with path.open() as f:
-            cfg: dict[str, Any] = yaml.safe_load(f) or {}
-    else:
-        cfg = {}
+    if path.exists():
+        try:
+            cfg = _deep_merge(cfg, _read(path))
+        except (OSError, yaml.YAMLError) as e:
+            raise ConfigError(f"could not read config.yaml at {path}: {e}") from e
 
     # Environment variable overrides
     if v := os.environ.get("AC_LOG_LEVEL"):
@@ -283,10 +357,10 @@ def keep_intermediate(cfg: dict, *, correction_artifact: bool = False) -> bool:
       output.keep_intermediates OR output.keep_correction_artifacts
       (default true) is true.
     """
-    keep_intermediates = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
+    keep_intermediates = bool(cfg_get(cfg, "output", "keep_intermediates"))
     if not correction_artifact:
         return keep_intermediates
-    keep_correction = bool(cfg_get(cfg, "output", "keep_correction_artifacts", default=True))
+    keep_correction = bool(cfg_get(cfg, "output", "keep_correction_artifacts"))
     return keep_intermediates or keep_correction
 
 
@@ -303,8 +377,8 @@ def retention_summary(cfg: dict) -> str:
     resolved -- not what the user thinks they asked for on the host --
     makes that mismatch visible immediately instead.
     """
-    ki = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
-    kc = bool(cfg_get(cfg, "output", "keep_correction_artifacts", default=True))
+    ki = bool(cfg_get(cfg, "output", "keep_intermediates"))
+    kc = bool(cfg_get(cfg, "output", "keep_correction_artifacts"))
     return (
         f"Retention   : keep_intermediates={ki}  keep_correction_artifacts={kc}\n"
         f"  transcript*.json, matches.json, review.json, censor_log.json : always kept\n"
@@ -372,49 +446,130 @@ def censoring_summary(cfg: dict) -> str:
     kind of "did my setting actually take effect" gap the other three
     banners exist to close for retention/paths/timezone.
     """
-    method     = cfg_get(cfg, "censoring", "method", default="mute")
-    padding_ms = cfg_get(cfg, "censoring", "padding_ms", default=50)
-    word_list  = cfg_get(cfg, "censoring", "word_list", default="/config/word_list.txt")
+    method     = cfg_get(cfg, "censoring", "method")
+    padding_ms = cfg_get(cfg, "censoring", "padding_ms")
+    word_list  = cfg_get(cfg, "censoring", "word_list")
     return (
         f"Censoring   : method={method}  padding={padding_ms}ms\n"
         f"              word_list = {word_list}"
     )
 
 
-def cfg_get(cfg: dict, *keys: str, default: Any = None, allow_null: bool = False) -> Any:
+_UNSET = object()  # sentinel: distinguishes "no default given" from "default=None"
+
+
+def cfg_get(cfg: dict, *keys: str, default: Any = _UNSET, allow_null: bool = False) -> Any:
     """
     Safely navigate nested config keys.
-    Returns default if any key (including an intermediate one) is missing.
 
-    By default (allow_null=False), a key that IS present but explicitly set
-    to `null` in config.yaml is also treated as missing, and `default` is
-    returned -- this is what nearly every setting wants, since config.yaml
-    has no way to "delete" a key, so a stray blank value should fall back
-    to the built-in default rather than propagate None to callers that
-    aren't expecting it.
+    If `default` is omitted, a missing key -- or, unless allow_null=True,
+    an explicit `null` -- raises ConfigError rather than silently
+    returning some Python-side value. config.yaml (built-in + optional
+    host override, see load_config()) is expected to define every setting
+    the pipeline actually reads; a key that's truly missing means
+    config.yaml itself is incomplete or has a typo, which is worth
+    surfacing immediately and clearly (see validate_config(), which does
+    this once at startup rather than however far into a run the first
+    reader of that key happens to be) rather than papering over with a
+    hardcoded fallback that can silently drift out of sync with
+    config.yaml over time -- which is exactly the failure mode this
+    function used to have, and the reason it no longer does.
 
-    Pass allow_null=True for the rare setting where an explicit `null` is
-    itself a meaningful value, distinct from the key being absent entirely
-    -- e.g. whisperx.language: null means "auto-detect" (see steps/
-    transcribe.py), which is different from the key being missing, which
-    means "use the language default of 'en'". Only the final key in the
-    path gets this treatment; a missing or null *intermediate* section
-    (e.g. "whisperx" itself absent) still falls through to `default`,
-    since the isinstance(node, dict) check on the next iteration catches
-    that regardless of allow_null.
+    Pass an explicit `default=` only for settings that are legitimately
+    optional and have no entry in config.yaml's schema at all -- e.g.
+    paths.input_host_dir / paths.output_host_dir, which are populated
+    solely from AC_INPUT_HOST_DIR / AC_OUTPUT_HOST_DIR and were never
+    meant to be config.yaml keys (see load_config()'s docstring). That's
+    a genuinely different situation from "this config.yaml setting has a
+    fallback value" -- there's no config.yaml value to fall back to.
+
+    allow_null=True: treat an explicit `null` as a real, meaningful value
+    rather than "missing" -- e.g. whisperx.language: null means
+    "auto-detect", distinct from the key being absent (an error, same as
+    any other required setting) or set to a real language code. Only the
+    final key in the path gets this treatment; a missing or null
+    *intermediate* section still raises/returns default regardless, since
+    the isinstance(node, dict) check on the next iteration catches that
+    before allow_null ever comes into play.
 
     Examples:
-      cfg_get(cfg, "demucs", "shifts", default=1)
-      cfg_get(cfg, "whisperx", "language", default="en", allow_null=True)
+      cfg_get(cfg, "demucs", "shifts")                          # required
+      cfg_get(cfg, "whisperx", "language", allow_null=True)     # required, null is meaningful
+      cfg_get(cfg, "paths", "input_host_dir", default=None)     # genuinely optional
     """
+    def _missing() -> Any:
+        if default is _UNSET:
+            raise ConfigError(
+                f"config.yaml is missing required setting "
+                f"'{'.'.join(keys)}' -- check it against the shipped "
+                f"template at config/config.yaml."
+            )
+        return default
+
     node: Any = cfg
     for k in keys:
         if not isinstance(node, dict) or k not in node:
-            return default
+            return _missing()
         node = node[k]
     if node is None and not allow_null:
-        return default
+        return _missing()
     return node
+
+
+# The one setting where an explicit `null` is a real value rather than
+# "missing" -- kept in sync with the one actual allow_null=True call site
+# (steps/transcribe.py), so validate_config() below checks each leaf the
+# same way its real reader will.
+_ALLOW_NULL_KEYS = {("whisperx", "language")}
+
+
+def validate_config(cfg: dict) -> None:
+    """
+    Confirm the resolved config has a usable value everywhere the built-in
+    config.yaml (the always-complete base layer -- see load_config())
+    defines one, raising a single ConfigError listing everything missing
+    at once if not.
+
+    Deliberately self-maintaining: it walks whatever config/config.yaml's
+    own structure currently is (via DEFAULT_CONFIG_PATH) rather than
+    checking against a separate hand-written list of "required keys" --
+    there's nothing to remember to update when a setting is added,
+    renamed, or removed from config.yaml. The shipped config.yaml file
+    *is* the schema.
+
+    Called once, at startup, by pipeline.py's main() -- right after
+    load_config() and before anything else runs -- specifically so a
+    config.yaml edit that drops or misspells a key fails in the first
+    second of a run instead of hours in, at whichever step happens to be
+    the first reader of that key. This pipeline is explicitly designed
+    for unattended overnight runs; finding out about a bad config.yaml at
+    Step 5 after Steps 1-4 already burned CPU-hours is a far worse
+    experience than finding out before Step 1 starts.
+    """
+    with DEFAULT_CONFIG_PATH.open() as f:
+        base = yaml.safe_load(f) or {}
+
+    missing: list[str] = []
+
+    def _walk(section: dict, path: tuple) -> None:
+        for key, value in section.items():
+            full_path = path + (key,)
+            if isinstance(value, dict):
+                _walk(value, full_path)
+            else:
+                try:
+                    cfg_get(cfg, *full_path, allow_null=full_path in _ALLOW_NULL_KEYS)
+                except ConfigError:
+                    missing.append(".".join(full_path))
+
+    _walk(base, ())
+
+    if missing:
+        raise ConfigError(
+            f"config.yaml is missing {len(missing)} required setting(s):\n  "
+            + "\n  ".join(missing)
+            + "\ncheck it against the shipped template at config/config.yaml."
+        )
 
 
 # ── Job state ─────────────────────────────────────────────────────────────────

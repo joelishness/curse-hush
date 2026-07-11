@@ -290,11 +290,13 @@ for dir in "$OUTPUT_DIR" "$CONFIG_DIR" "$CACHE_DIR" "$JOBS_DIR"; do
     fi
 done
 
-# Warn if config directory is empty — the pipeline will use its built-in defaults
-# but the user should supply their own word list for a real run.
+# Warn if config directory is empty — the pipeline will run on the
+# config.yaml baked into the image at build time (see Dockerfile /
+# utils.load_config()), but you'll want your own word list for a real run.
 if [[ -z "$(ls -A "$CONFIG_DIR" 2>/dev/null)" ]]; then
     echo "${SCRIPT_NAME}: warning: config directory is empty: ${CONFIG_DIR}" >&2
-    echo "  Copy config/config.yaml and config/word_list.txt from the repo into that directory." >&2
+    echo "  Copy config/config.yaml and config/word_list.txt from the repo into that directory," >&2
+    echo "  or leave it empty to use the image's built-in config.yaml as-is." >&2
 fi
 
 # ── Check Docker is available ─────────────────────────────────────────────────

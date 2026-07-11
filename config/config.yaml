@@ -1,10 +1,20 @@
 # profanity-hush — pipeline configuration
 # ============================================================================
-# All settings here can be overridden by environment variables (see bottom).
-# For unattended overnight runs, the defaults in this file are already tuned
-# for quality over speed.  Processing a 2-hour film at the defaults takes
-# roughly 3-4 hours on a 16 GB CPU machine (Steps 2+3 combined); queue it
-# before bed.
+# This file IS the default for every setting below -- there is no separate,
+# hardcoded fallback anywhere in src/*.py any more. It's baked into the
+# Docker image at build time (see Dockerfile), so even a container with no
+# host config directory mounted at all runs on exactly what's written here.
+# To change a default: edit this file and rebuild the image. Nothing in
+# src/*.py needs to change. (A host-mounted config.yaml, if you use one --
+# see hush.sh -c / docker-compose.yml's CONFIG_DIR -- only needs to specify
+# the settings it wants to override; everything else still inherits from
+# here. See utils.load_config() for the exact merge behaviour.)
+#
+# All settings here can also be overridden by environment variables (see
+# bottom). For unattended overnight runs, the defaults in this file are
+# already tuned for quality over speed. Processing a 2-hour film at the
+# defaults takes roughly 3-4 hours on a 16 GB CPU machine (Steps 2+3
+# combined); queue it before bed.
 # ============================================================================
 
 

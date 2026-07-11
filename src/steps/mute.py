@@ -177,8 +177,8 @@ def mute(
         label="dialog.wav",
     )
 
-    method     = cfg_get(cfg, "censoring", "method", default="mute")
-    padding_ms = float(cfg_get(cfg, "censoring", "padding_ms", default=50))
+    method     = cfg_get(cfg, "censoring", "method")
+    padding_ms = float(cfg_get(cfg, "censoring", "padding_ms"))
 
     log.info("Step 5 — mute dialog stem  (method=%s, padding=%.0fms)", method, padding_ms)
 

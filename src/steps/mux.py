@@ -171,7 +171,7 @@ def mux(
         log = step_logger("mux")
 
     state      = read_job(job_dir)
-    out_format = str(cfg_get(cfg, "output", "format", default="mkv")).lower()
+    out_format = str(cfg_get(cfg, "output", "format")).lower()
     if out_format not in ("mkv", "mp4"):
         raise RuntimeError(
             f"Step 7: unknown output.format '{out_format}' (expected 'mkv' or 'mp4')."
@@ -295,11 +295,11 @@ def _output_path(video_path: Path, output_dir: Path, cfg: dict, out_format: str)
     "movie.sd.hevc.mkv" keeps everything after the first dot intact in
     either style above.
     """
-    naming_style = str(cfg_get(cfg, "output", "naming_style", default="plex_edition")).lower()
+    naming_style = str(cfg_get(cfg, "output", "naming_style")).lower()
     stem = Path(video_path.name).stem
 
     if naming_style == "plex_edition":
-        edition_name = str(cfg_get(cfg, "output", "edition_name", default="Hushed"))
+        edition_name = str(cfg_get(cfg, "output", "edition_name"))
         tag = f"{{edition-{edition_name}}}"
         year_match = re.search(r"\(\d{4}\)", stem)
         if year_match:
@@ -307,7 +307,7 @@ def _output_path(video_path: Path, output_dir: Path, cfg: dict, out_format: str)
         else:
             new_stem = f"{stem} {tag}"
     elif naming_style == "suffix":
-        suffix = str(cfg_get(cfg, "output", "suffix", default="_censored"))
+        suffix = str(cfg_get(cfg, "output", "suffix"))
         new_stem = f"{stem}{suffix}"
     else:
         raise RuntimeError(

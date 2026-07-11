@@ -126,17 +126,23 @@ ENV PYTHONPATH=/app
 WORKDIR /app
 COPY src/ /app/
 
-# ── Built-in default word list ──────────────────────────────────────────────
-# config.yaml's absence is already handled by Python-side defaults
-# (cfg_get(..., default=...) throughout the code) — but a word list is a
-# whole file's worth of content, not a single scalar, so it needs an actual
-# fallback *file*, not just a fallback value. Baking in a copy of the repo's
-# own config/word_list.txt is what makes "you can skip installing config
-# files entirely and the container uses its built-in defaults" (README
-# install step 3 / hush.sh's startup warning) true for the word list too,
-# not just for config.yaml's tunable settings. steps/matching.py falls back
-# to this path when /config/word_list.txt isn't present on the host.
-COPY config/word_list.txt /app/defaults/word_list.txt
+# ── Built-in defaults: config.yaml + word list ──────────────────────────────
+# Both of the repo's config/ files are baked into the image so the container
+# is fully self-contained: "you can skip installing config files entirely
+# and the container uses its built-in defaults" (README install step 3 /
+# hush.sh's startup warning) is true for BOTH of them, the same way, via the
+# same mechanism -- utils.load_config() falls back to DEFAULT_CONFIG_PATH
+# and steps/matching.py falls back to DEFAULT_WORD_LIST_PATH whenever the
+# host-mounted /config/config.yaml or /config/word_list.txt isn't present.
+#
+# This is now the ONLY place a "default" lives for any tunable setting --
+# there is no separate, hand-maintained set of Python-side literals to keep
+# in sync with config.yaml any more (see utils.cfg_get(), which raises
+# rather than silently substituting a hardcoded value if a setting is
+# genuinely missing). To change a default: edit config/config.yaml and
+# rebuild the image. Nothing in src/*.py needs to change.
+COPY config/config.yaml    /app/defaults/config.yaml
+COPY config/word_list.txt  /app/defaults/word_list.txt
 
 # `COPY` preserves the exact file-mode bits each source file has in the
 # build context — it does NOT guarantee they're world-readable. That

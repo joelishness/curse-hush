@@ -143,7 +143,7 @@ def flag(
             )
         return matches_path
 
-    word_list_path = Path(cfg_get(cfg, "censoring", "word_list", default="/config/word_list.txt"))
+    word_list_path = Path(cfg_get(cfg, "censoring", "word_list"))
     word_list_path = resolve_word_list_path(word_list_path, log)
 
     log.info("Step 4b — flag candidates against word list")
@@ -223,8 +223,8 @@ def review(
             )
         return review_path
 
-    show_context    = int(cfg_get(cfg, "interactive", "show_context_words", default=8))
-    min_conf_prompt = float(cfg_get(cfg, "interactive", "min_confidence_for_prompt", default=0.0))
+    show_context    = int(cfg_get(cfg, "interactive", "show_context_words"))
+    min_conf_prompt = float(cfg_get(cfg, "interactive", "min_confidence_for_prompt"))
 
     matches_data = json.loads(matches_path.read_text())
     # SimpleNamespace gives dot-access (m.word_index, m.score, ...) matching

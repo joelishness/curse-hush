@@ -90,7 +90,7 @@ def segment(
             f"Step 1c: audio_stereo.wav not found in {job_dir} — did Step 1b complete?"
         )
 
-    size_sec = int(cfg_get(cfg, "audio", "segment_size_sec", default=1800))
+    size_sec = int(cfg_get(cfg, "audio", "segment_size_sec"))
 
     log.info("Step 1c — probing audio_stereo.wav ...")
     duration = _probe_duration(stereo, log)

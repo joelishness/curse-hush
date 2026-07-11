@@ -310,8 +310,12 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Config + logging ──────────────────────────────────────────────────────
-    cfg       = utils.load_config(args.config)
-    log_level = cfg_get(cfg, "output", "log_level", default="info")
+    cfg = utils.load_config(args.config)
+    # Validate the WHOLE config upfront, before reading any individual
+    # setting below -- see utils.validate_config()'s docstring for why
+    # this matters for a pipeline meant to run unattended for hours.
+    utils.validate_config(cfg)
+    log_level = cfg_get(cfg, "output", "log_level")
     setup_logging(log_level)
     log = step_logger("pipeline")
 
@@ -322,7 +326,7 @@ def main() -> None:
     # Reading it from config here (rather than a hardcoded constant)
     # means the setting is no longer inert -- previously nothing in this
     # file consulted it at all.
-    jobs_dir = Path(cfg_get(cfg, "storage", "jobs_dir", default="/jobs"))
+    jobs_dir = Path(cfg_get(cfg, "storage", "jobs_dir"))
 
     log.info("==" * 30)
     log.info("profanity-hush  (Phase 2 — core pipeline)")
@@ -371,7 +375,7 @@ def main() -> None:
     elif args.no_interactive:
         interactive = False
     else:
-        interactive = cfg_get(cfg, "interactive", "enabled", default=False)
+        interactive = cfg_get(cfg, "interactive", "enabled")
 
     if args.redo_review:
         interactive = True  # correction mode forces this, regardless of config/other flags
@@ -400,7 +404,7 @@ def main() -> None:
     # the word list, not just for config.yaml's scalar settings. Step 5
     # (mute) no longer touches the word list at all — it only consumes
     # Step 4b's already-resolved matches.json.
-    word_list_path = Path(cfg_get(cfg, "censoring", "word_list", default="/config/word_list.txt"))
+    word_list_path = Path(cfg_get(cfg, "censoring", "word_list"))
     word_list_path = resolve_word_list_path(word_list_path, log)
     cfg.setdefault("censoring", {})["word_list"] = str(word_list_path)
 
