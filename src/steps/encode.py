@@ -57,6 +57,16 @@ Probe phase, codec map, and the ac3-fallback rules below are unchanged
 from the pre-split design (still per design doc §8) — only *where* they
 run has moved, from inside the mux command to here, one step earlier.
 
+audio_censored.wav gets the same re-verify-before-consuming treatment
+dialog_censored.wav gets in steps/recombine.py, against the duration/
+hash steps/recombine.py recorded: --skip-index/--add-interval/
+--redo-review always redo Steps 5/6/6b/7 together, so this file is
+never stale in that workflow, but pipeline.py's --redo-step can name
+6b_encode (or 7_mux) without also naming 5_mute/6_recombine, in which
+case this step runs fresh against whatever audio_censored.wav happened
+to be left over from a previous run. Its own audio_encoded.mka is, in
+turn, hashed here for steps/mux.py to verify the same way.
+
 Intermediate cleanup (conditional on keep_intermediates):
   audio_censored.wav is fully consumed once audio_encoded.mka exists — it
   was the last consumer of dialog_censored.wav/score_sfx.wav, and nothing
@@ -77,7 +87,17 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from utils import cfg_get, fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
+from utils import (
+    fmt_size,
+    keep_intermediate,
+    mark_step_done,
+    read_job,
+    run_cmd,
+    step_logger,
+    verify_and_hash_before_publish,
+    verify_stem_before_reuse,
+    write_job,
+)
 
 # ffprobe codec_name -> ffmpeg encoder for a normal (non-fallback) re-encode.
 # "dca" is ffmpeg's DTS encoder (lossy core DTS only — see _pick_encoder
@@ -161,6 +181,22 @@ def encode(
     if not video_path.exists():
         raise RuntimeError(f"Step 6b: original video not found at {video_path}.")
 
+    total_sec     = float(state.get("total_duration_sec", 0.0))
+    recombine_info = state.get("recombine", {})
+    verify_stem_before_reuse(
+        audio_censored_path,
+        total_sec,
+        recombine_info.get("audio_censored_sha256"),
+        log,
+        label="audio_censored.wav",
+        written_by="Step 6 (recombine)",
+        regenerate_hint=(
+            "This is cheap to fix: re-run with --redo-step 6_recombine, "
+            "which will cascade forward through this step (and 7_mux) "
+            "automatically -- see pipeline.py's --redo-step --help."
+        ),
+    )
+
     log.info("Step 6b — encode censored audio to match original codec")
 
     stream = _probe_audio_stream(video_path, log)
@@ -207,6 +243,12 @@ def encode(
     run_cmd(cmd, log)
     log.info("  ✓  %s  (%s)", encoded_out.name, fmt_size(encoded_out))
 
+    # Write-time half of the integrity check steps/mux.py runs immediately
+    # before it actually consumes audio_encoded.mka.
+    encoded_hash = verify_and_hash_before_publish(
+        encoded_out, "audio_encoded.mka", total_sec, log,
+    )
+
     # audio_censored.wav: fully consumed now that audio_encoded.mka exists
     # -- nothing downstream needs the raw PCM again.
     if not keep_intermediate(cfg, correction_artifact=False):
@@ -214,10 +256,11 @@ def encode(
 
     state = read_job(job_dir)
     state["encode"] = {
-        "output":           encoded_out.name,
-        "encoder":          encoder,
-        "bitrate":          bitrate,
-        "fallback_reason":  fallback_reason,
+        "output":                encoded_out.name,
+        "encoder":               encoder,
+        "bitrate":               bitrate,
+        "fallback_reason":       fallback_reason,
+        "audio_encoded_sha256":  encoded_hash,
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "6b_encode")

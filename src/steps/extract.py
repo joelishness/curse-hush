@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Optional
 
 from utils import (
-    cfg_get,
     check_duration_matches,
     finalize_output,
     fmt_duration,
@@ -62,7 +61,6 @@ CODEC_EXT: dict[str, str] = {
 def extract_raw(
     video_path: Path,
     job_dir: Path,
-    cfg: dict,
     log: Optional[logging.LoggerAdapter] = None,
 ) -> Path:
     """
@@ -216,7 +214,6 @@ def extract_raw(
 
 def downmix_to_stereo(
     job_dir: Path,
-    cfg: dict,
     log: Optional[logging.LoggerAdapter] = None,
 ) -> Path:
     """

@@ -643,13 +643,13 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
 - **Input:** `audio_stereo_NN.wav` (one segment)
 - **Output:** `dialog_NN.wav`, `score_sfx_NN.wav`
 - **Tool:** `python -m demucs --two-stems=vocals -n {model} --shifts {shifts} -d cpu -o {tmpdir} audio_stereo_NN.wav`
-- `--shifts` averaging defaults to 1 (config `demucs.shifts`); increase to 4 for improved quality at ~4× compute cost
+- `--shifts` averaging defaults to 1 (config `demucs.shifts`); increase to 4 for improved quality — extrapolated at ~4.4× compute cost relative to shifts=1 (unverified linear-scaling assumption; see §12/Open Question #11, which supersedes the ~4×/shift figure this section originally stated)
 - Demucs outputs to a subdirectory named after the model; this module renames/moves to flat expected paths with the segment suffix
 - **Logging (info level):**
   - Segment index and duration
   - Wall-clock time on completion
   - Cumulative progress (e.g. `[2/4 segments separated]`)
-- Logs estimated completion time based on segment duration (rough: ~4× realtime per shift on modern CPU based on observed test data; see §12)
+- Logs estimated completion time based on segment duration (**measured** — not the rough estimate this section originally gave: shifts=1 runs at ~1.09× realtime on modern CPU, confirmed against a real production film; see §12)
 ### `steps/transcribe.py`
 - **Input:** `dialog_NN.wav` (one segment)
 - **Output:** `transcript_NN.json`
@@ -927,6 +927,11 @@ Options:
                        Repeatable. Re-runs Steps 5, 6, 6b, 7 only.
   --redo-review        Correction: re-enter interactive review from scratch
                        on an already-completed job (implies --interactive).
+  --redo-step STEP     Force this step to redo on an existing job, with no
+                       review.json involved. Repeatable. One of: 4b_flag,
+                       4b_review, 5_mute, 6_recombine, 6b_encode, 7_mux.
+                       Cannot combine with --skip-index/--add-interval/
+                       --redo-review. Requires the job to already exist.
   --dry-run            Print the docker command without running it
   -h, --help
  
@@ -937,11 +942,14 @@ Examples:
   hush.sh --skip-index 4856 movie.mkv
   hush.sh --add-interval "missed word" 1203.1 1203.5 movie.mkv
   hush.sh --add-interval "missed word" 0:20:03.1 0:20:03.5 movie.mkv  # same, H:MM:SS.mmm
+  hush.sh --redo-step 7_mux movie.mkv                                 # re-test a muxer change only
 ```
  
 The script resolves absolute paths before mounting — Docker requires absolute paths for `-v`.
  
 The correction flags (`--skip-index`, `--add-interval`, `--redo-review`) are §13.4's correction workflow — see that section for the full design rationale, including why it's cheap (a few minutes, not a full re-run) rather than just a documented manual `review.json` edit.
+
+**`--redo-step STEP`** is a separate, narrower tool, *not* part of the §13.4 correction workflow above — it has nothing to do with fixing a flagged-word mistake, and doesn't touch `review.json` at all. It exists for re-testing a change to a *step's own implementation* (a new muxer, a tuned mute padding value, a fixed encode command) against a job that already exists, without re-running everything before it. It only clears the named step(s) from `steps_completed`; `--skip-index`/`--add-interval`/`--redo-review` clear `5_mute`/`6_recombine`/`6b_encode`/`7_mux` together as an atomic block every time, and `--redo-step` **cascades the same way**: naming an earlier step (e.g. `5_mute`) also clears every step downstream of it through `7_mux`, so a redo always propagates to the delivered file rather than silently reusing stale outputs. `--redo-step 7_mux` alone clears only `7_mux`, since nothing in this pipeline is downstream of it. Steps 1a–3b aren't offered as `--redo-step` targets: they're resumed as one atomic block, and their per-segment intermediates may already be deleted, so redoing one of them alone isn't safe. Requires a job that already exists for this exact input file (same path, same mtime) — refuses outright rather than silently starting a fresh job if none is found.
  
 ---
  
@@ -1169,6 +1177,8 @@ hush.sh --skip-index 4856 --skip-index 412 --add-interval "oops" 88.0 88.4 movie
 Because `compute_job_id()` is path+mtime based, re-running on the unmodified input file naturally lands on the same job — there's no separate `--resume {job_id}` flag to remember. The correction edits `review.json` (additively — repeated correction runs accumulate, and a duplicate `--skip-index` is detected and skipped rather than recorded twice) and invalidates `5_mute`, `6_recombine`, `6b_encode`, and `7_mux` in `steps_completed`, so the normal step machinery redoes exactly those four steps — typically a few minutes, not the hours Steps 1–3b took. Step 4b's `flag()` phase is untouched: `matches.json` doesn't change, only what's layered on top of it.
  
 **`--redo-review`** is the alternative, fuller-pass option: it re-enters Step 4b's interactive Y/N/A/S/Q loop from scratch (implying `--interactive` for that run), re-presenting *every* flagged match, not just the one that was wrong. Useful for a more thorough re-pass; `--skip-index`/`--add-interval` are faster for a single targeted fix and are what the primary workflow above is built around. The two approaches can't be combined in one invocation — `--redo-review` rewrites `review.json` from scratch and would discard direct edits made moments earlier in the same run, so `pipeline.py` rejects the combination outright rather than silently dropping one of them.
+ 
+**`--redo-step STEP` is a separate mechanism, not part of this workflow:** it doesn't touch `review.json` at all, and exists for re-testing a change to a step's own implementation rather than a content mistake — see §9 for the full description. It cannot be combined with `--skip-index`/`--add-interval`/`--redo-review` in the same invocation for the same reason those three can't mix with each other: each rewrites/invalidates overlapping state in a way that would silently discard the others' edits.
  
 **What makes this cheap rather than a full re-run:** `dialog.wav` and `score_sfx.wav` — the two canonical pre-mute audio stems — are kept by default (`output.keep_correction_artifacts: true`), independent of `output.keep_intermediates` (default `false`, which still governs the per-segment files and the more trivially-regenerable `dialog_censored.wav`/`audio_censored.wav`/`audio_encoded.mka`). This is *the* reason correction mode can redo Steps 5, 6, 6b, and 7 in minutes instead of needing Step 2's Demucs separation — often the single most expensive step in the whole pipeline — all over again. If a job was run with `keep_correction_artifacts: false`, or predates this setting, correction mode fails with a clear error (rather than silently falling back to re-separating) explaining that a full re-run from scratch is needed instead.
  

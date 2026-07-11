@@ -175,7 +175,8 @@ audio:
   segment_size_sec: 1800   # 30 min per segment; reduce if OOM
 
 censoring:
-  method: mute         # mute | beep
+  method: mute         # mute | beep (beep is not yet implemented -- selecting
+                       # it fails the run at Step 5 with a clear error)
   padding_ms: 50       # silence added before/after each word (ms)
 
 output:
@@ -290,9 +291,16 @@ This is the expected day-to-day workflow: run unattended, watch the film (maybe 
   "start": 5275.01,
   "start_hms": "1:27:55.010",
   "end": 5275.23,
-  "end_hms": "1:27:55.230"
+  "end_hms": "1:27:55.230",
+  "padded_start": 5274.96,
+  "padded_start_hms": "1:27:54.960",
+  "padded_end": 5275.28,
+  "padded_end_hms": "1:27:55.280",
+  "score": 0.97
 }
 ```
+
+(`padded_start`/`padded_end` above reflect this job's `padding_ms: 50` default — `start`/`end` widened by 0.05s on each side, which is what's actually muted; `score` is WhisperX's word-level confidence for the transcribed word, shown here as a representative value.)
 
 (In this real example, WhisperX had transcribed the line "Ned! Land!" as "What the hell" — a transcription error, not a word-list problem; the word list correctly matched the literal text WhisperX produced.) Then:
 
@@ -361,3 +369,9 @@ RAM size alone doesn't fully protect against this — it depends on what else is
 - **Separation artifacts:** Demucs is excellent but not perfect — some bleed between stems is expected, especially in dense action scenes.
 - **Context-blind matching:** The word list has no understanding of usage context. `=dick` / `Dick` case distinction is the primary mitigation; interactive review handles the rest.
 - **v1 processes only the primary audio track.** Commentary tracks and alternate language tracks in the source container are dropped.
+
+---
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0). In particular, this means that if you run a modified version of this project as a network service that other users interact with, you must make the source of your modified version available to them under the same license — see the full license text for the precise terms.

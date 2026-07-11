@@ -138,10 +138,14 @@ censoring:
 
   # How to replace the flagged audio interval.
   #   mute  — replace with silence (default; clean, unambiguous)
-  #   beep  — overlay a sine-wave tone (TV-style; see beep_frequency_hz)
+  #   beep  — NOT YET IMPLEMENTED. Selecting this fails the run outright
+  #           at Step 5 with a clear error, rather than silently doing
+  #           nothing or falling back to mute -- see design doc §10,
+  #           Phase 4, for the planned implementation.
   method: mute
 
-  # Frequency of the beep tone in Hz.  Only used when method: beep.
+  # Frequency of the beep tone in Hz.  Only used once method: beep is
+  # implemented (see the note above) -- currently unused.
   # 1000 Hz is the classic broadcast censor tone.
   beep_frequency_hz: 1000
 
@@ -228,7 +232,13 @@ storage:
 
   # Mount point for the jobs directory inside the container.
   # Maps to the host path set by --jobs (default: ~/.local/share/profanity-hush/jobs).
-  # Do not change this unless you also update hush.sh / docker-compose.yml.
+  # pipeline.py reads this value directly (cfg_get(cfg, "storage", "jobs_dir")),
+  # so it is a real setting, not just documentation of a fixed convention --
+  # but changing it here alone will not move where hush.sh / docker-compose.yml
+  # actually mount the host directory. All three must agree, or the container
+  # will be looking somewhere other than where the host volume is actually
+  # mounted. Change this only if you're also updating hush.sh / docker-compose.yml
+  # to mount to the same new path.
   jobs_dir: /jobs
 
 
@@ -250,6 +260,20 @@ storage:
 #                                  information about the host environment, not
 #                                  pipeline behaviour. hush.sh sets both
 #                                  automatically; falls back to UTC if absent.
+#   AC_INPUT_HOST_DIR / AC_OUTPUT_HOST_DIR
+#                                  host-side paths corresponding to /input and
+#                                  /output inside the container, for logging
+#                                  host-navigable paths in job.json and the
+#                                  final summary. Same reasoning as AC_TZ_OFFSET
+#                                  above -- not a config.yaml setting, since
+#                                  it's host environment information rather
+#                                  than pipeline behaviour, even though it
+#                                  does end up folded into cfg (under
+#                                  paths.input_host_dir/output_host_dir) rather
+#                                  than read directly from os.environ the way
+#                                  AC_TZ_OFFSET is. hush.sh and docker-compose.yml
+#                                  both set these automatically; there is
+#                                  ordinarily no reason to set them by hand.
 #
 # Examples:
 #   AC_LOG_LEVEL=debug ./hush.sh movie.mkv

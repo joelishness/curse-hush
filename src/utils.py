@@ -264,10 +264,11 @@ def keep_intermediate(cfg: dict, *, correction_artifact: bool = False) -> bool:
 
     Single source of truth for the retention policy described in design
     doc §6: every step that deletes a large intermediate (steps/merge.py,
-    steps/mute.py, steps/recombine.py, steps/mux.py) calls this rather
-    than reading output.keep_intermediates / output.keep_correction_artifacts
-    directly, specifically so the policy can never drift between steps the
-    way it could when each one re-implemented its own condition.
+    steps/mute.py, steps/recombine.py, steps/encode.py, steps/mux.py)
+    calls this rather than reading output.keep_intermediates /
+    output.keep_correction_artifacts directly, specifically so the policy
+    can never drift between steps the way it could when each one
+    re-implemented its own condition.
 
     correction_artifact=False (default): the file is fully superseded once
       consumed downstream, and at best only cheaply regenerable anyway
@@ -352,6 +353,32 @@ def paths_banner(cfg: dict) -> str:
             "job.json will show the container path /output instead)"
         )
     return f"{input_line}\n{output_line}"
+
+
+def censoring_summary(cfg: dict) -> str:
+    """
+    Two-line, human-readable summary of the *resolved* censoring settings
+    -- meant to be logged once, at startup, at INFO level, every run,
+    regardless of resume state. Same motivation as retention_summary() /
+    paths_banner() / timezone_banner() above.
+
+    Without this, method/padding_ms are only ever logged from inside
+    steps/mute.py's own "Step 5 -- mute dialog stem" line, and the word
+    list path only from inside steps/review.py's flag() -- both of which
+    only run their logging branch on a fresh execution of that step. On
+    a resumed job (5_mute / 4b_flag already in steps_completed), neither
+    ever prints, so nothing in the log confirms which word list or
+    padding was actually in effect for *this* invocation -- exactly the
+    kind of "did my setting actually take effect" gap the other three
+    banners exist to close for retention/paths/timezone.
+    """
+    method     = cfg_get(cfg, "censoring", "method", default="mute")
+    padding_ms = cfg_get(cfg, "censoring", "padding_ms", default=50)
+    word_list  = cfg_get(cfg, "censoring", "word_list", default="/config/word_list.txt")
+    return (
+        f"Censoring   : method={method}  padding={padding_ms}ms\n"
+        f"              word_list = {word_list}"
+    )
 
 
 def cfg_get(cfg: dict, *keys: str, default: Any = None) -> Any:
@@ -464,6 +491,9 @@ def unmark_step_done(job_dir: Path, step: str) -> None:
     (--skip-index / --add-interval / --redo-review) to force a step (and,
     by removing several, everything from that point onward) to actually
     re-run instead of hitting its own "already complete" resume-check.
+    Also used by pipeline.py's --redo-step handling, which cascades this
+    call from the named step through 7_mux for the same reason (see
+    pipeline.py's module docstring and its _steps_from() helper).
     Does NOT delete or touch the step's output file on disk; it only
     clears the bookkeeping flag, so the step's normal logic runs fresh
     and naturally overwrites (-y) whatever was there before.
@@ -916,36 +946,47 @@ def verify_stem_before_reuse(
     log: logging.LoggerAdapter,
     *,
     label: str,
+    written_by: str = "Step 3b (merge)",
+    regenerate_hint: Optional[str] = None,
 ) -> None:
     """
-    Re-verify a long-lived stem file (dialog.wav / score_sfx.wav) against
-    the duration and hash steps/merge.py recorded when it finalized them,
-    immediately before steps/mute.py or steps/recombine.py actually
-    consumes it. That may happen much later and in an entirely separate
-    invocation than the one that wrote it, via pipeline.py's
+    Re-verify a long-lived stem file against the duration and hash the
+    step that produced it recorded (via verify_and_hash_before_publish()
+    below), immediately before the step that consumes it next actually
+    does so. That consumption may happen much later and in an entirely
+    separate invocation than the one that wrote it -- originally this
+    was only true of dialog.wav/score_sfx.wav via pipeline.py's
     --skip-index/--add-interval/--redo-review correction workflow (see
-    that module's docstring) -- the whole point of this check is that
-    nothing re-verifies these two files between when Step 3b writes them
-    and whenever a later correction re-run reads them again, which could
-    be a long dwell time for something to go wrong in unnoticed. See
-    steps/merge.py's _verify_and_hash_stem() for the write-time half.
+    that module's docstring), but it is equally true of
+    dialog_censored.wav/audio_censored.wav/audio_encoded.mka whenever
+    --redo-step names a *middle* step (e.g. --redo-step 6_recombine
+    alone, which cascades to 6b_encode/7_mux but leaves 5_mute's
+    dialog_censored.wav exactly as it was) -- so this function is
+    shared by steps/mute.py, steps/recombine.py, steps/encode.py, and
+    steps/mux.py rather than being specific to any one pair of files.
+    See the write-time half, verify_and_hash_before_publish(), below.
+
+    written_by/regenerate_hint let each caller describe *its own*
+    upstream step and remediation accurately in the raised error --
+    defaults describe the original dialog.wav/score_sfx.wav case, where
+    the fix genuinely does require re-running Step 2's Demucs
+    separation from scratch. That's specifically NOT true of the other
+    three files (regenerating any of them is exactly what --redo-step
+    is for), so their callers pass a written_by/regenerate_hint that
+    says so instead of repeating guidance that would be wrong for them.
 
     Deliberately does NOT delete path or unmark any step on a mismatch,
-    unlike every other integrity check in this pipeline. Those all guard
-    cheap-to-regenerate outputs (a fresh Step 1a extraction, a re-split
-    segment, a redone concat) where "delete it, let the next run redo it"
-    is a safe, no-cost default. dialog.wav and score_sfx.wav are the
-    opposite: they're kept specifically *because* regenerating them means
-    re-running Step 2's Demucs separation, often the most expensive step
-    in the whole pipeline -- and there's no supported way to redo just
-    that (see pipeline.py's --redo-step, which explicitly excludes
-    2_separate/3b_merge: "their per-segment intermediates may already be
-    deleted, so redoing one alone isn't safe"). Silently deleting a
-    multi-hour artifact and triggering its own regeneration off the back
-    of one failed check would be a far bigger, more surprising action
-    than anything else this pipeline does on its own -- so this raises
-    with clear, actionable guidance instead, and leaves the job directory
-    exactly as it found it for a person to decide what to do next.
+    unlike every other integrity check in this pipeline (including this
+    function's own write-time counterpart). Silently deleting a
+    multi-hour artifact like dialog.wav and triggering its own
+    regeneration off the back of one failed check would be a far bigger,
+    more surprising action than anything else this pipeline does on its
+    own -- so this raises with clear, actionable guidance instead, and
+    leaves the job directory exactly as it found it for a person to
+    decide what to do next. This holds even for the three cheaper-to-
+    regenerate files: --redo-step is a deliberate, explicit action a
+    person takes, not something this check should trigger on their
+    behalf.
 
     Skips whichever half of the check it doesn't have data for -- no
     recorded duration/hash (a job directory from before this check
@@ -970,23 +1011,68 @@ def verify_stem_before_reuse(
             problems.append(f"sha256 is {actual_hash[:16]}…, expected {expected_sha256[:16]}…")
 
     if problems:
+        if regenerate_hint is None:
+            regenerate_hint = (
+                "dialog.wav and score_sfx.wav are kept specifically to avoid "
+                "re-running Step 2's Demucs separation, so this is deliberately "
+                "not auto-corrected -- redoing that work automatically, "
+                "unasked, over a single failed check is a bigger action than "
+                "this pipeline should take on its own. There is currently no "
+                "supported way to redo just Steps 2/3b (pipeline.py's "
+                "--redo-step explicitly excludes them); if this file is "
+                "genuinely bad, the safe fix is to delete the job directory "
+                "and re-run from scratch."
+            )
         raise RuntimeError(
             f"Integrity check failed for {label} ({path}):\n"
             + "\n".join(f"  - {p}" for p in problems) + "\n"
-            "This file has changed since Step 3b (merge) wrote it -- "
+            f"This file has changed since {written_by} wrote it -- "
             "possibly corruption, possibly something else touched it. "
-            "dialog.wav and score_sfx.wav are kept specifically to avoid "
-            "re-running Step 2's Demucs separation, so this is deliberately "
-            "not auto-corrected -- redoing that work automatically, "
-            "unasked, over a single failed check is a bigger action than "
-            "this pipeline should take on its own. There is currently no "
-            "supported way to redo just Steps 2/3b (pipeline.py's "
-            "--redo-step explicitly excludes them); if this file is "
-            "genuinely bad, the safe fix is to delete the job directory "
-            "and re-run from scratch."
+            + regenerate_hint
         )
 
-    log.debug("  ✓  %s passed integrity check (duration + hash vs. Step 3b's record).", label)
+    log.debug("  ✓  %s passed integrity check (duration + hash vs. %s's record).", label, written_by)
+
+
+def verify_and_hash_before_publish(
+    path: Path,
+    label: str,
+    expected_duration_sec: float,
+    log: logging.LoggerAdapter,
+) -> Optional[str]:
+    """
+    Confirm path matches expected_duration_sec, then return its SHA-256
+    hex digest -- the write-time half of this pipeline's stem-integrity
+    checks; verify_stem_before_reuse() above is the read-time half. Used
+    by steps/merge.py (dialog.wav/score_sfx.wav), steps/mute.py
+    (dialog_censored.wav), steps/recombine.py (audio_censored.wav), and
+    steps/encode.py (audio_encoded.mka) -- each records what "good"
+    looks like for whichever step consumes its output next, which may
+    happen much later and in a separate invocation.
+
+    expected_duration_sec of 0 (state had no recorded total_duration_sec
+    at all -- shouldn't happen in practice, but see steps/extract.py's
+    analogous "skip gracefully rather than block a run" handling) skips
+    the duration half and only hashes.
+
+    On a duration mismatch: deletes path and re-raises, the same
+    delete-then-raise pattern used throughout this pipeline's other
+    integrity checks, so a redo doesn't get stuck re-validating the same
+    bad file. Hashing failures are not fatal at all -- see sha256_file()'s
+    own docstring.
+    """
+    if expected_duration_sec:
+        try:
+            check_duration_matches(
+                probe_duration_sec(path, log), expected_duration_sec, log=log,
+                label=f"{label} vs. recorded total_duration_sec",
+                tolerance_sec=5.0,
+            )
+        except RuntimeError:
+            path.unlink(missing_ok=True)
+            log.error("  Deleted incomplete %s — re-run to produce it fresh.", label)
+            raise
+    return sha256_file(path, log)
 
 
 # ── Wall-clock timestamps (local + UTC) ─────────────────────────────────────────

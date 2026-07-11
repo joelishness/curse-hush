@@ -18,6 +18,18 @@ steps/merge.py recorded at that time before this step actually reads it
 silently regenerating anything, for the same reason: there's no cheap
 fix, since score_sfx.wav's only source is Step 2's Demucs separation.
 
+dialog_censored.wav gets the same treatment against the duration/hash
+steps/mute.py recorded, but for a different reason: --skip-index/
+--add-interval/--redo-review always redo Steps 5 and 6 together, so
+dialog_censored.wav is never stale by the time this step reads it in
+that workflow -- but pipeline.py's --redo-step can name 6_recombine
+(or 6b_encode/7_mux) without also naming 5_mute, in which case this
+step runs fresh while dialog_censored.wav is left over, unverified,
+from however long ago 5_mute last actually ran. Unlike score_sfx.wav, a
+mismatch here is cheap to fix (--redo-step 5_mute cascades forward
+through this step automatically), so its regenerate_hint says that
+instead of pointing at a from-scratch re-run.
+
 Tool (ffmpeg's amix filter):
   ffmpeg -i dialog_censored.wav -i score_sfx.wav \
       -filter_complex amix=inputs=2:duration=first:normalize=0 \
@@ -72,7 +84,17 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from utils import fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, verify_stem_before_reuse, write_job
+from utils import (
+    fmt_size,
+    keep_intermediate,
+    mark_step_done,
+    read_job,
+    run_cmd,
+    step_logger,
+    verify_and_hash_before_publish,
+    verify_stem_before_reuse,
+    write_job,
+)
 
 
 def recombine(
@@ -120,9 +142,25 @@ def recombine(
             "(merge) complete?"
         )
     merge_info = state.get("merge", {})
+    total_sec  = float(state.get("total_duration_sec", 0.0))
+    mute_info  = state.get("mute", {})
+    verify_stem_before_reuse(
+        dialog_censored_path,
+        total_sec,
+        mute_info.get("dialog_censored_sha256"),
+        log,
+        label="dialog_censored.wav",
+        written_by="Step 5 (mute)",
+        regenerate_hint=(
+            "Unlike score_sfx.wav, this is cheap to fix: re-run with "
+            "--redo-step 5_mute, which will cascade forward through this "
+            "step (and 6b_encode/7_mux) automatically -- see pipeline.py's "
+            "--redo-step --help."
+        ),
+    )
     verify_stem_before_reuse(
         score_sfx_path,
-        state.get("total_duration_sec"),
+        total_sec,
         merge_info.get("score_sfx_sha256"),
         log,
         label="score_sfx.wav",
@@ -144,6 +182,12 @@ def recombine(
     )
     log.info("  ✓  audio_censored.wav  (%s)", fmt_size(audio_censored_out))
 
+    # Write-time half of the integrity check steps/encode.py runs
+    # immediately before it actually consumes audio_censored.wav.
+    audio_censored_hash = verify_and_hash_before_publish(
+        audio_censored_out, "audio_censored.wav", total_sec, log,
+    )
+
     # dialog_censored.wav: trivially regenerable from dialog.wav (no
     # Demucs re-run needed) -- governed by keep_intermediates alone.
     if not keep_intermediate(cfg, correction_artifact=False):
@@ -155,7 +199,10 @@ def recombine(
         _unlink_if(score_sfx_path, log)
 
     state = read_job(job_dir)
-    state["recombine"] = {"output": audio_censored_out.name}
+    state["recombine"] = {
+        "output": audio_censored_out.name,
+        "audio_censored_sha256": audio_censored_hash,
+    }
     write_job(job_dir, state)
     mark_step_done(job_dir, "6_recombine")
 

@@ -59,7 +59,7 @@ the mp4 path to begin with.
 
 **mkvmerge command** (mkv path):
 ```
-mkvmerge -o output.mkv.tmp.mkv --no-audio video.mkv audio_encoded.mka
+mkvmerge -o output.part.mkv --no-audio video.mkv audio_encoded.mka
 ```
 mkvmerge's default behaviour, absent any flag saying otherwise, is to
 copy *everything* from each input file — video, every subtitle track,
@@ -98,12 +98,22 @@ natively via a different mechanism than Matroska, but ffmpeg already
 does this by default for a single input — kept explicit here rather than
 relying on that default).
 
-Crash safety: the muxed file is written to a `.tmp` sibling inside
-/output and only renamed to its final name once the muxing tool exits
-with one of ok_exit_codes — matching utils.write_job's write-then-rename
-pattern, applied here because /output, unlike /jobs, is the one place in
-this pipeline a half-written file would be directly user-visible and easy
-to mistake for a finished one.
+Crash safety: the muxed file is written to a temp sibling inside /output
+(utils.tmp_output_path() / finalize_output() — the same write-then-rename
+idiom utils.write_job() uses for job.json) and only published under its
+final name once the muxing tool exits with one of ok_exit_codes.
+Applied here, rather than left to whichever tool's own behavior, because
+/output, unlike /jobs, is the one place in this pipeline a half-written
+file would be directly user-visible and easy to mistake for a finished
+one.
+
+audio_encoded.mka gets the same re-verify-before-consuming treatment
+audio_censored.wav gets in steps/encode.py, against the duration/hash
+steps/encode.py recorded: --skip-index/--add-interval/--redo-review
+always redo Steps 5/6/6b/7 together, so this file is never stale in
+that workflow, but pipeline.py's --redo-step can name 7_mux alone, in
+which case this step runs fresh against whatever audio_encoded.mka
+happened to be left over from a previous run.
 
 Intermediate cleanup (conditional on keep_intermediates):
   audio_encoded.mka is fully consumed once the final muxed video exists —
@@ -121,7 +131,20 @@ from pathlib import Path
 from typing import Optional
 import logging
 
-from utils import cfg_get, fmt_dir, fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
+from utils import (
+    cfg_get,
+    finalize_output,
+    fmt_dir,
+    fmt_size,
+    keep_intermediate,
+    mark_step_done,
+    read_job,
+    run_cmd,
+    step_logger,
+    tmp_output_path,
+    verify_stem_before_reuse,
+    write_job,
+)
 
 
 def mux(
@@ -172,18 +195,26 @@ def mux(
     if not video_path.exists():
         raise RuntimeError(f"Step 7: original video not found at {video_path}.")
 
+    verify_stem_before_reuse(
+        audio_encoded_path,
+        float(state.get("total_duration_sec", 0.0)),
+        state.get("encode", {}).get("audio_encoded_sha256"),
+        log,
+        label="audio_encoded.mka",
+        written_by="Step 6b (encode)",
+        regenerate_hint=(
+            "This is cheap to fix: re-run with --redo-step 6b_encode "
+            "(or 7_mux, if only the mux itself needs redoing) -- see "
+            "pipeline.py's --redo-step --help."
+        ),
+    )
+
     tool = "mkvmerge" if out_format == "mkv" else "ffmpeg"
     log.info("Step 7 — mux encoded audio into video  (format=%s, tool=%s)", out_format, tool)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    # ".tmp" goes *before* the real extension (video_censored.tmp.mkv, not
-    # video_censored.mkv.tmp) -- both muxing tools below auto-detect their
-    # output format from the extension, and a trailing ".tmp" defeats
-    # that ("Unable to choose an output format" from ffmpeg; mkvmerge is
-    # more forgiving here, but there's no reason to rely on the
-    # difference). Keeping a real extension on the temp file is also just
-    # more useful if a crash ever leaves one behind for a human to find.
-    tmp_path = out_path.with_name(f"{out_path.stem}.tmp{out_path.suffix}")
+    tmp_path = tmp_output_path(out_path)
+    tmp_path.unlink(missing_ok=True)  # leftover from a previous interrupted attempt, if any
 
     if out_format == "mkv":
         cmd = [
@@ -207,7 +238,7 @@ def mux(
         ]
         run_cmd(cmd, log)
 
-    tmp_path.replace(out_path)
+    finalize_output(tmp_path, out_path)
     log.info("  ✓  %s  (%s)", out_path.name, fmt_size(out_path))
 
     if not keep_intermediate(cfg, correction_artifact=False):

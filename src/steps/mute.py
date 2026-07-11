@@ -54,7 +54,15 @@ Logic:
      workflow (§13.4).
   7. Persist both filenames to job.json's "mute" block ("files":
      {"dialog_censored", "censor_log"}), alongside the method/padding/
-     candidate stats it already recorded.
+     candidate stats it already recorded, plus dialog_censored.wav's own
+     duration + sha256 (dialog_censored_sha256) -- the write-time half
+     of the same integrity check dialog.wav gets on the way in (see
+     utils.verify_and_hash_before_publish()), so steps/recombine.py can
+     verify dialog_censored.wav wasn't corrupted or replaced if it's
+     consumed much later via --redo-step 6_recombine (which cascades
+     forward to 6b_encode/7_mux but does not itself touch 5_mute, so
+     dialog_censored.wav may be old at that point even though this run
+     is fresh).
 
 If zero intervals remain after overrides (no candidates were flagged, or
 every candidate was rejected), dialog_censored.wav is a plain copy of
@@ -99,6 +107,7 @@ from utils import (
     read_job,
     run_cmd,
     step_logger,
+    verify_and_hash_before_publish,
     verify_stem_before_reuse,
     write_job,
 )
@@ -159,9 +168,10 @@ def mute(
             "(merge) complete?"
         )
     merge_info = state.get("merge", {})
+    total_sec  = float(state.get("total_duration_sec", 0.0))
     verify_stem_before_reuse(
         dialog_path,
-        state.get("total_duration_sec"),
+        total_sec,
         merge_info.get("dialog_sha256"),
         log,
         label="dialog.wav",
@@ -218,6 +228,13 @@ def mute(
 
     censor_log_out.write_text(json.dumps({"entries": log_entries}, indent=2, ensure_ascii=False))
 
+    # Write-time half of the integrity check steps/recombine.py runs
+    # immediately before it actually consumes dialog_censored.wav -- see
+    # this module's docstring (item 7) and utils.verify_stem_before_reuse().
+    censored_hash = verify_and_hash_before_publish(
+        censored_out, "dialog_censored.wav", total_sec, log,
+    )
+
     # dialog.wav (the uncensored stem) is fully consumed at this point --
     # nothing downstream ever needs it again, only dialog_censored.wav.
     # But it's also the one artifact that makes a future correction cheap
@@ -238,6 +255,7 @@ def mute(
             "dialog_censored": censored_out.name,
             "censor_log":      censor_log_out.name,
         },
+        "dialog_censored_sha256": censored_hash,
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "5_mute")
@@ -334,8 +352,12 @@ def _resolve_intervals(
         })
 
     # Stable sort: ties keep their original (matched-before-added) order in
-    # both lists identically, since both are sorted by the same key.
-    intervals.sort(key=lambda iv: iv[0])
+    # both lists identically, since both are sorted by the same key --
+    # rounded to 4 decimals for both, matching log_entries' own
+    # "padded_start" field (which only ever stores the rounded value), so
+    # the two lists can't disagree on ordering over a sub-0.1ms rounding
+    # difference that would otherwise only show up in one of them.
+    intervals.sort(key=lambda iv: round(iv[0], 4))
     log_entries.sort(key=lambda e: e["padded_start"])
 
     return intervals, log_entries, len(skip_indices), len(add_overrides)
