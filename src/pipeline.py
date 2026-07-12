@@ -903,9 +903,11 @@ def main() -> None:
     log.info("  Final output     : %s", output_video)
     log.info("")
     log.info("  Other kept outputs:")
-    # transcript*.json, matches.json, review.json, and censor_log.json are
-    # always kept regardless of keep_intermediates (design doc §6) and are
-    # safe to log unconditionally. So is this run's own log file --
+    # transcript_out (transcript.json — the merged file, not the per-segment
+    # transcript_NN.json it was built from), matches.json, review.json, and
+    # censor_log.json are always kept regardless of keep_intermediates
+    # (design doc §6) and are safe to log unconditionally. So is this run's
+    # own log file --
     # logs/*.log is never deleted by any step, for the same reason
     # censor_log.json isn't (see utils.attach_file_logging). dialog.wav,
     # score_sfx.wav, dialog_censored.wav, audio_censored.wav, and

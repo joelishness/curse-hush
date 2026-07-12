@@ -345,10 +345,14 @@ def keep_intermediate(cfg: dict, *, correction_artifact: bool = False) -> bool:
     re-implemented its own condition.
 
     correction_artifact=False (default): the file is fully superseded once
-      consumed downstream, and at best only cheaply regenerable anyway
-      (per-segment stems, audio_stereo*.wav, dialog_censored.wav,
-      audio_censored.wav, audio_encoded.mka) -- kept only if
-      output.keep_intermediates is true.
+      consumed downstream (per-segment stems, audio_stereo*.wav,
+      dialog_censored.wav, audio_censored.wav, audio_encoded.mka,
+      transcript_NN.json) -- kept only if output.keep_intermediates is
+      true. Most of these are also cheaply regenerable; transcript_NN.json
+      is the one exception (re-transcribing costs real WhisperX time), but
+      it's still fully superseded by transcript.json once Step 3b succeeds,
+      which is what actually governs its deletion here -- see
+      steps/merge.py's module docstring.
 
     correction_artifact=True: the file is one of the two artifacts
       (dialog.wav, score_sfx.wav) that make the --skip-index / --add-interval
@@ -381,11 +385,11 @@ def retention_summary(cfg: dict) -> str:
     kc = bool(cfg_get(cfg, "output", "keep_correction_artifacts"))
     return (
         f"Retention   : keep_intermediates={ki}  keep_correction_artifacts={kc}\n"
-        f"  transcript*.json, matches.json, review.json, censor_log.json : always kept\n"
-        f"  dialog.wav, score_sfx.wav                                    : "
+        f"  transcript.json, matches.json, review.json, censor_log.json : always kept\n"
+        f"  dialog.wav, score_sfx.wav                                   : "
         f"{'kept' if (ki or kc) else 'deleted after use'}\n"
         f"  audio_stereo*.wav, dialog_censored.wav, audio_censored.wav,\n"
-        f"  audio_encoded.mka                                            : "
+        f"  audio_encoded.mka, transcript_NN.json (per-segment)         : "
         f"{'kept' if ki else 'deleted after use'}"
     )
 

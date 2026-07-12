@@ -33,12 +33,25 @@ Intermediate cleanup:
     resume artifact for future per-channel reprocessing, §13.3)
   - dialog_NN.wav, score_sfx_NN.wav — deleted only for multi-segment runs,
     only if not keep_intermediates (canonical versions now exist)
-  - transcript_NN.json files — NEVER deleted regardless of keep_intermediates
-    (small; required for the correction workflow, §13.4)
+  - transcript_NN.json — deleted under the same keep_intermediates
+    condition as the files above (see "Correction" note below)
   See utils.keep_intermediate() — the single source of truth for this
   policy, shared with steps/mute.py, steps/recombine.py, and steps/mux.py
   so it can't drift between steps the way it could when each one
   re-implemented its own condition.
+
+Correction (transcript_NN.json retention): an earlier version of this
+module kept transcript_NN.json unconditionally, regardless of
+keep_intermediates, on the theory that the correction workflow (§13.4)
+needed it. It doesn't: apply_corrections() in steps/review.py edits
+review.json against matches.json only, and never opens a
+transcript_NN.json; the interactive review() phase's word-search only
+ever receives the merged transcript.json (see pipeline.py). Their one
+real purpose is letting Step 3 (transcribe.py) skip already-finished
+segments if it's interrupted partway through a run -- fully served the
+moment this merge succeeds -- so they now follow the same
+keep_intermediates policy as the other per-segment intermediates above,
+rather than being kept forever.
 
 Marks '3b_merge' done.  Writes the three filenames above into job.json's
 "merge" block ("files": {"transcript", "dialog", "score_sfx"}), alongside
@@ -106,49 +119,62 @@ def merge(
     score_sfx_out  = job_dir / "score_sfx.wav"
 
     # ── 1. Merge transcripts ───────────────────────────────────────────────────
-    all_words:    list[dict] = []
-    detected_lang: str       = "en"
-    total_words:   int       = 0
-
-    for i, (t_path, (seg_wav, start_offset)) in enumerate(
-        zip(transcript_paths, segments)
-    ):
-        seg_idx = i + 1
-        data = json.loads(t_path.read_text())
-        detected_lang = data.get("language", detected_lang)
-        seg_words     = data.get("words", [])
-
-        # Apply global offset to each word's timestamps.
-        # Words with null timestamps (alignment failures) are preserved as-is.
-        adjusted: list[dict] = []
-        for w in seg_words:
-            aw = dict(w)
-            if w.get("start") is not None:
-                aw["start"] = round(float(w["start"]) + start_offset, 4)
-            if w.get("end") is not None:
-                aw["end"]   = round(float(w["end"])   + start_offset, 4)
-            adjusted.append(aw)
-
-        seg_end_sec = start_offset + _seg_duration(state, seg_wav.name, i)
+    # Guarded by an existence check for the same reason the audio-concat
+    # branch below already is (see its comment): step 3's cleanup now
+    # deletes transcript_NN.json before mark_step_done() is called, so a
+    # crash in that exact window would otherwise re-enter this branch on
+    # the next run with transcript.json already correct but its
+    # transcript_NN.json sources already gone.
+    if transcript_out.exists():
         log.info(
-            "  [%d/%d] %s  offset=%s  words=%d  (%s → %s)",
-            seg_idx, n, t_path.name,
-            f"{start_offset:.1f}s",
-            len(seg_words),
-            fmt_duration(start_offset),
-            fmt_duration(seg_end_sec),
+            "  ↩  transcript.json already exists — verifying (resumed "
+            "after a prior interrupted run) ..."
         )
-        all_words.extend(adjusted)
-        total_words += len(seg_words)
+        total_words = len(json.loads(transcript_out.read_text()).get("words", []))
+    else:
+        all_words:    list[dict] = []
+        detected_lang: str       = "en"
+        total_words = 0
 
-    transcript_data: dict = {
-        "language": detected_lang,
-        "words":    all_words,
-    }
-    transcript_out.write_text(
-        json.dumps(transcript_data, indent=2, ensure_ascii=False)
-    )
-    log.info("  ✓  transcript.json  words=%d", total_words)
+        for i, (t_path, (seg_wav, start_offset)) in enumerate(
+            zip(transcript_paths, segments)
+        ):
+            seg_idx = i + 1
+            data = json.loads(t_path.read_text())
+            detected_lang = data.get("language", detected_lang)
+            seg_words     = data.get("words", [])
+
+            # Apply global offset to each word's timestamps.
+            # Words with null timestamps (alignment failures) are preserved as-is.
+            adjusted: list[dict] = []
+            for w in seg_words:
+                aw = dict(w)
+                if w.get("start") is not None:
+                    aw["start"] = round(float(w["start"]) + start_offset, 4)
+                if w.get("end") is not None:
+                    aw["end"]   = round(float(w["end"])   + start_offset, 4)
+                adjusted.append(aw)
+
+            seg_end_sec = start_offset + _seg_duration(state, seg_wav.name, i)
+            log.info(
+                "  [%d/%d] %s  offset=%s  words=%d  (%s → %s)",
+                seg_idx, n, t_path.name,
+                f"{start_offset:.1f}s",
+                len(seg_words),
+                fmt_duration(start_offset),
+                fmt_duration(seg_end_sec),
+            )
+            all_words.extend(adjusted)
+            total_words += len(seg_words)
+
+        transcript_data: dict = {
+            "language": detected_lang,
+            "words":    all_words,
+        }
+        transcript_out.write_text(
+            json.dumps(transcript_data, indent=2, ensure_ascii=False)
+        )
+        log.info("  ✓  transcript.json  words=%d", total_words)
 
     # ── 2. Merge audio stems ───────────────────────────────────────────────────
     dialogs    = [d for (d, _) in stem_pairs]
@@ -248,20 +274,20 @@ def merge(
             for d, s in stem_pairs:
                 _unlink_if(d, log)
                 _unlink_if(s, log)
-    # transcript_NN.json files are NEVER deleted (always-keep artifacts) --
-    # said explicitly here, at INFO level, because their presence alongside
-    # deleted WAV intermediates can otherwise look like an inconsistency
-    # (a person checking the job dir sees small JSON files survive while
-    # large WAV files vanish, with no indication that's intentional and
-    # unrelated to whatever keep_intermediates/keep_correction_artifacts
-    # resolved to -- see pipeline.py's startup "Retention" log block).
-    if n == 1:
-        log.info("  (transcript_01.json: always kept, independent of retention settings)")
-    else:
-        log.info(
-            "  (transcript_01.json .. transcript_%02d.json: always kept, independent of retention settings)",
-            n,
-        )
+
+        # Delete per-segment transcript_NN.json now that the canonical,
+        # globally-offset transcript.json exists (built in step 1, above).
+        # Their one real purpose was letting Step 3 (transcribe.py) skip
+        # already-finished segments if it was interrupted partway through --
+        # fully served the moment this merge succeeds. Nothing downstream
+        # (Step 4b's flag/review phases, Step 5, or the correction
+        # workflow's apply_corrections() in steps/review.py, §13.4) ever
+        # reads a transcript_NN.json again; only the merged transcript.json.
+        # Logged per-file at debug level by _unlink_if, same as the WAV
+        # intermediates above -- there's no longer a special case here to
+        # call out separately (see the module docstring's "Correction" note).
+        for t_path in transcript_paths:
+            _unlink_if(t_path, log)
 
     # ── 4. Persist metadata and mark done ─────────────────────────────────────
     state = read_job(job_dir)
