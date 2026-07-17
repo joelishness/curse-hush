@@ -328,8 +328,6 @@ This principle is particularly important for CPU-only deployments where a full p
     │                                   #   see "Job directory naming" below
     ├── job.json                # metadata: input file, config snapshot, step completion status
     ├── audio_raw.{ext}         # bitstream copy of original audio; always kept; ext = source codec
-    ├── transcript_01.json      # per-segment whisperx output; always kept
-    ├── transcript_02.json      # (one file per segment; single-segment jobs have only _01)
     ├── transcript.json         # merged transcript with global timestamps; always kept
     ├── transcript_aligned.json # post-SRT alignment; always kept (if applicable)
     ├── matches.json            # Step 4b flag-phase output — every candidate found against
@@ -349,6 +347,12 @@ This principle is particularly important for CPU-only deployments where a full p
     ├── score_sfx_02.wav
     ├── score_sfx.wav           # concatenated score+SFX stem (large; kept by default — same
     │                           #   keep_correction_artifacts rule as dialog.wav above)
+    ├── transcript_01.json      # per-segment whisperx output (small; keep_intermediates only —
+    │                           #   deleted by Step 3b once transcript.json exists; their only
+    │                           #   purpose is letting Step 3 skip already-finished segments if
+    │                           #   interrupted partway through, not the correction workflow —
+    │                           #   see steps/merge.py's "Correction" note)
+    ├── transcript_02.json      # (one file per segment; single-segment jobs have only _01)
     ├── dialog_censored.wav     # Step 5 output (large; keep_intermediates only — deleted by
     │                           #   Step 6 once audio_censored.wav exists)
     ├── audio_censored.wav      # Step 6 output: dialog_censored.wav + score_sfx.wav recombined
@@ -370,7 +374,7 @@ This principle is particularly important for CPU-only deployments where a full p
                                   #   the log file's own path depends on job_dir already existing.
 ```
  
-`audio_raw.{ext}`, all `transcript*.json`, `matches.json`, `review.json`, `censor_log.json`, and everything under `logs/` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are either the essential resume artifacts or, for `logs/`, the one thing this pipeline produces specifically *because* something might need debugging later. Large decoded WAV/audio intermediates are governed by two independent settings: `keep_intermediates` (default `false`) covers the per-segment stems, `audio_stereo*.wav`, `dialog_censored.wav`, `audio_censored.wav`, and `audio_encoded.mka` — all either fully superseded once consumed or trivially cheap to regenerate. `dialog.wav` and `score_sfx.wav` are governed by `keep_correction_artifacts` (default **`true`**) instead — deleted only if that setting *and* `keep_intermediates` are both false — because they're what makes §13.4's correction workflow (`--skip-index`/`--add-interval`/`--redo-review`) cheap: without them, correcting a mistake noticed after watching the film would require re-running Step 2's Demucs separation from scratch. Each large intermediate is deleted by whichever step first finishes consuming it (Step 3b/merge for the per-segment stems and `audio_stereo*.wav`, Step 5/mute for `dialog.wav`, Step 6/recombine for `score_sfx.wav` and `dialog_censored.wav`, Step 6b/encode for `audio_censored.wav`, Step 7/mux for `audio_encoded.mka`) — never by the step that *produced* it, since the producing step has no way to know yet whether anything downstream still needs it.
+`audio_raw.{ext}`, `transcript.json` (the merged file — not the per-segment `transcript_NN.json` below), `matches.json`, `review.json`, `censor_log.json`, and everything under `logs/` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are either the essential resume artifacts *for the correction workflow specifically* or, for `logs/`, the one thing this pipeline produces specifically *because* something might need debugging later. Large decoded WAV/audio intermediates, and now `transcript_NN.json`, are governed by two independent settings: `keep_intermediates` (default `false`) covers the per-segment stems, `audio_stereo*.wav`, `dialog_censored.wav`, `audio_censored.wav`, `audio_encoded.mka`, and `transcript_NN.json` — all fully superseded once consumed (most are also trivially cheap to regenerate; `transcript_NN.json` is the one exception, since re-transcribing costs real WhisperX time, but that only matters *during* Step 3 itself — see the tree entry above). `dialog.wav` and `score_sfx.wav` are governed by `keep_correction_artifacts` (default **`true`**) instead — deleted only if that setting *and* `keep_intermediates` are both false — because they're what makes §13.4's correction workflow (`--skip-index`/`--add-interval`/`--redo-review`) cheap: without them, correcting a mistake noticed after watching the film would require re-running Step 2's Demucs separation from scratch. `transcript_NN.json` was originally grouped with the always-kept files above on the assumption that the correction workflow needed it too — it doesn't (`apply_corrections()` in `steps/review.py` only ever touches `review.json`/`matches.json`), so it was moved here; see `steps/merge.py`'s module docstring for the fuller correction. Each large intermediate is deleted by whichever step first finishes consuming it (Step 3b/merge for the per-segment stems, `audio_stereo*.wav`, and now `transcript_NN.json`, Step 5/mute for `dialog.wav`, Step 6/recombine for `score_sfx.wav` and `dialog_censored.wav`, Step 6b/encode for `audio_censored.wav`, Step 7/mux for `audio_encoded.mka`) — never by the step that *produced* it, since the producing step has no way to know yet whether anything downstream still needs it.
 
 **Single source of truth:** every one of those deletion decisions goes through `utils.keep_intermediate(cfg, correction_artifact=...)` — no step reads `output.keep_intermediates`/`output.keep_correction_artifacts` directly. This was a deliberate fix, not the original design: each step originally computed its own `bool(cfg_get(...))` locally, which is exactly the kind of duplication that let `hush.sh`'s forwarding bug (below) go unnoticed — the policy was correct in the design doc and in `config.yaml`'s comments the whole time, but nothing checked that the *host* setting actually reached the container. `pipeline.py` now also logs the fully-resolved retention settings once at startup (`utils.retention_summary()`), specifically so a setting that silently failed to arrive is visible in the first few lines of output instead of discoverable only after the run completes and an expected file isn't there.
 
@@ -494,8 +498,9 @@ output:
                                 # naming_style: suffix only
   format: mkv                   # mkv (mkvmerge — see §8 steps/mux.py) | mp4 (ffmpeg,
                                 # no subtitle/attachment passthrough)
-  keep_intermediates: false     # keep large WAV/audio stems after run (transcript JSONs,
-                                # matches.json, review.json, censor_log.json always kept)
+  keep_intermediates: false     # keep large WAV/audio stems + per-segment transcript_NN.json
+                                # after run (transcript.json, matches.json, review.json,
+                                # censor_log.json always kept regardless — see §6)
   keep_correction_artifacts: true # keep dialog.wav/score_sfx.wav specifically, independent
                                  # of keep_intermediates above, so --skip-index/--add-interval/
                                  # --redo-review only redo Steps 5, 6, 6b, 7 — not Step 2's Demucs
@@ -587,12 +592,12 @@ holy crap
 - Writes `job.json` at job start with: `input_path`/`input_filename` as a directory+filename pair (`input_path` host-navigable when `AC_INPUT_HOST_DIR` reached the container, else this container's own view of it — see §6.2), config snapshot, a canonical UTC `started_at` timestamp (plus a `started_at_local` companion — see §6.1), and a `steps_completed: []` list
 - Calls Steps 1a, 1b, and 1c in sequence; receives the segment list (paths + start offsets) from Step 1c
 - Calls Step 2 (separate) across all segments, then Step 3 (transcribe) across all segments; each step marks one `steps_completed` entry (`2_separate`, `3_transcribe`) once *all* its segments are done. Per-segment resume is handled inside each step by checking whether that segment's own output file(s) already exist (see `steps/separate.py`, `steps/transcribe.py`) — not via finer-grained job-state entries.
-- **Once `3b_merge` is in `steps_completed`, Steps 1a-3b are skipped entirely on every subsequent run** — `pipeline.py` derives `transcript.json`/`dialog.wav`/`score_sfx.wav` by their fixed canonical names directly, rather than calling `extract_raw`/`segment`/`separate`/`transcribe`/`merge` again. This isn't just an optimization: `steps/merge.py`'s own cleanup deletes the per-segment intermediates (`dialog_NN.wav`, `score_sfx_NN.wav`, `audio_stereo_NN.wav`) once they're consolidated, and `steps/separate.py`'s "already done" resume path assumes those files are still on disk — calling it again after Step 3b's cleanup has run throws a missing-file error even though nothing is actually wrong. The fix is structural, not a patch to `separate.py`'s resume check: once Step 3b is done, nothing downstream ever needs the per-segment files again, so the orchestrator should never ask for them again either.
+- **Once `3b_merge` is in `steps_completed`, Steps 1a-3b are skipped entirely on every subsequent run** — `pipeline.py` derives `transcript.json`/`dialog.wav`/`score_sfx.wav` by their fixed canonical names directly, rather than calling `extract_raw`/`segment`/`separate`/`transcribe`/`merge` again. This isn't just an optimization: `steps/merge.py`'s own cleanup deletes the per-segment intermediates (`dialog_NN.wav`, `score_sfx_NN.wav`, `audio_stereo_NN.wav`, and `transcript_NN.json`) once they're consolidated, and `steps/separate.py`'s and `steps/transcribe.py`'s own "already done" resume paths assume those files are still on disk — calling either again after Step 3b's cleanup has run throws a missing-file error even though nothing is actually wrong. The fix is structural, not a patch to either step's resume check: once Step 3b is done, nothing downstream ever needs the per-segment files again, so the orchestrator should never ask for them again either.
 - Calls Step 3b (merge) once all segments are complete
 - Calls Steps 4, 4b, 5, 6, 7 in sequence on the merged artifacts, as before
 - Handles step failures: log error with step name and exception, update `job.json` with failure info (`status`, `failed_at`/`failed_at_local`, `failure.step`/`.error`/`.traceback`), exit with non-zero code
 - On success: moves final output to `/output/` (`job.json`'s own record of this, `mux.output_path`/`output_filename`, prefers a host-navigable directory when available — see §6.2), marks job complete in `job.json` (`status`, plus `completed_at`/`completed_at_local`)
-- Always preserves all `transcript_NN.json` and `transcript.json` files; removes large WAV stems unless `keep_intermediates` is set
+- Always preserves `transcript.json`, `matches.json`, `review.json`, and `censor_log.json`; removes large WAV stems and per-segment `transcript_NN.json` unless `keep_intermediates` is set
 
 **Correction workflow (§13.4 — implemented, not just groundwork):** `steps_completed`, combined with the preserved transcript/match/review files above, is what `--skip-index`/`--add-interval`/`--redo-review` build on to invalidate and redo only Steps 5, 6, 6b, and 7 rather than the full pipeline — see §13.4 for the mechanism. (An earlier draft of this doc described this only as future groundwork for a planned `--resume` mode; that mode has since shipped under the flag names above, not as a separate `--resume` flag.)
  
@@ -643,13 +648,13 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
 - **Input:** `audio_stereo_NN.wav` (one segment)
 - **Output:** `dialog_NN.wav`, `score_sfx_NN.wav`
 - **Tool:** `python -m demucs --two-stems=vocals -n {model} --shifts {shifts} -d cpu -o {tmpdir} audio_stereo_NN.wav`
-- `--shifts` averaging defaults to 1 (config `demucs.shifts`); increase to 4 for improved quality at ~4× compute cost
+- `--shifts` averaging defaults to 1 (config `demucs.shifts`); increase to 4 for improved quality — extrapolated at ~4.4× compute cost relative to shifts=1 (unverified linear-scaling assumption; see §12/Open Question #11, which supersedes the ~4×/shift figure this section originally stated)
 - Demucs outputs to a subdirectory named after the model; this module renames/moves to flat expected paths with the segment suffix
 - **Logging (info level):**
   - Segment index and duration
   - Wall-clock time on completion
   - Cumulative progress (e.g. `[2/4 segments separated]`)
-- Logs estimated completion time based on segment duration (rough: ~4× realtime per shift on modern CPU based on observed test data; see §12)
+- Logs estimated completion time based on segment duration (**measured** — not the rough estimate this section originally gave: shifts=1 runs at ~1.09× realtime on modern CPU, confirmed against a real production film; see §12)
 ### `steps/transcribe.py`
 - **Input:** `dialog_NN.wav` (one segment)
 - **Output:** `transcript_NN.json`
@@ -690,6 +695,8 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
 ffmpeg -i "concat:dialog_01.wav|dialog_02.wav|..." -c copy dialog.wav
 ffmpeg -i "concat:score_sfx_01.wav|score_sfx_02.wav|..." -c copy score_sfx.wav
 ```
+
+**Cleanup:** `audio_stereo*.wav`, `dialog_NN.wav`/`score_sfx_NN.wav` (multi-segment only), and `transcript_NN.json` are all deleted once consolidated, unless `keep_intermediates` is set — see §6. `transcript_NN.json`'s inclusion here is a correction: an earlier draft kept it unconditionally, assuming the correction workflow (§13.4) needed it; it doesn't (`apply_corrections()` in `steps/review.py` only touches `review.json`/`matches.json`). Guarded by an existence check on `transcript.json` itself (mirroring the one already used for `dialog.wav`/`score_sfx.wav`), so a crash between this cleanup and `mark_step_done()` can't strand a resume with sources it now expects to still be there.
 
 **Logging (info level):**
 - Per-segment: segment index, start offset, end offset, word count
@@ -927,6 +934,11 @@ Options:
                        Repeatable. Re-runs Steps 5, 6, 6b, 7 only.
   --redo-review        Correction: re-enter interactive review from scratch
                        on an already-completed job (implies --interactive).
+  --redo-step STEP     Force this step to redo on an existing job, with no
+                       review.json involved. Repeatable. One of: 4b_flag,
+                       4b_review, 5_mute, 6_recombine, 6b_encode, 7_mux.
+                       Cannot combine with --skip-index/--add-interval/
+                       --redo-review. Requires the job to already exist.
   --dry-run            Print the docker command without running it
   -h, --help
  
@@ -937,11 +949,14 @@ Examples:
   hush.sh --skip-index 4856 movie.mkv
   hush.sh --add-interval "missed word" 1203.1 1203.5 movie.mkv
   hush.sh --add-interval "missed word" 0:20:03.1 0:20:03.5 movie.mkv  # same, H:MM:SS.mmm
+  hush.sh --redo-step 7_mux movie.mkv                                 # re-test a muxer change only
 ```
  
 The script resolves absolute paths before mounting — Docker requires absolute paths for `-v`.
  
 The correction flags (`--skip-index`, `--add-interval`, `--redo-review`) are §13.4's correction workflow — see that section for the full design rationale, including why it's cheap (a few minutes, not a full re-run) rather than just a documented manual `review.json` edit.
+
+**`--redo-step STEP`** is a separate, narrower tool, *not* part of the §13.4 correction workflow above — it has nothing to do with fixing a flagged-word mistake, and doesn't touch `review.json` at all. It exists for re-testing a change to a *step's own implementation* (a new muxer, a tuned mute padding value, a fixed encode command) against a job that already exists, without re-running everything before it. It only clears the named step(s) from `steps_completed`; `--skip-index`/`--add-interval`/`--redo-review` clear `5_mute`/`6_recombine`/`6b_encode`/`7_mux` together as an atomic block every time, and `--redo-step` **cascades the same way**: naming an earlier step (e.g. `5_mute`) also clears every step downstream of it through `7_mux`, so a redo always propagates to the delivered file rather than silently reusing stale outputs. `--redo-step 7_mux` alone clears only `7_mux`, since nothing in this pipeline is downstream of it. Steps 1a–3b aren't offered as `--redo-step` targets: they're resumed as one atomic block, and their per-segment intermediates may already be deleted, so redoing one of them alone isn't safe. Requires a job that already exists for this exact input file (same path, same mtime) — refuses outright rather than silently starting a fresh job if none is found.
  
 ---
  
@@ -1169,6 +1184,8 @@ hush.sh --skip-index 4856 --skip-index 412 --add-interval "oops" 88.0 88.4 movie
 Because `compute_job_id()` is path+mtime based, re-running on the unmodified input file naturally lands on the same job — there's no separate `--resume {job_id}` flag to remember. The correction edits `review.json` (additively — repeated correction runs accumulate, and a duplicate `--skip-index` is detected and skipped rather than recorded twice) and invalidates `5_mute`, `6_recombine`, `6b_encode`, and `7_mux` in `steps_completed`, so the normal step machinery redoes exactly those four steps — typically a few minutes, not the hours Steps 1–3b took. Step 4b's `flag()` phase is untouched: `matches.json` doesn't change, only what's layered on top of it.
  
 **`--redo-review`** is the alternative, fuller-pass option: it re-enters Step 4b's interactive Y/N/A/S/Q loop from scratch (implying `--interactive` for that run), re-presenting *every* flagged match, not just the one that was wrong. Useful for a more thorough re-pass; `--skip-index`/`--add-interval` are faster for a single targeted fix and are what the primary workflow above is built around. The two approaches can't be combined in one invocation — `--redo-review` rewrites `review.json` from scratch and would discard direct edits made moments earlier in the same run, so `pipeline.py` rejects the combination outright rather than silently dropping one of them.
+ 
+**`--redo-step STEP` is a separate mechanism, not part of this workflow:** it doesn't touch `review.json` at all, and exists for re-testing a change to a step's own implementation rather than a content mistake — see §9 for the full description. It cannot be combined with `--skip-index`/`--add-interval`/`--redo-review` in the same invocation for the same reason those three can't mix with each other: each rewrites/invalidates overlapping state in a way that would silently discard the others' edits.
  
 **What makes this cheap rather than a full re-run:** `dialog.wav` and `score_sfx.wav` — the two canonical pre-mute audio stems — are kept by default (`output.keep_correction_artifacts: true`), independent of `output.keep_intermediates` (default `false`, which still governs the per-segment files and the more trivially-regenerable `dialog_censored.wav`/`audio_censored.wav`/`audio_encoded.mka`). This is *the* reason correction mode can redo Steps 5, 6, 6b, and 7 in minutes instead of needing Step 2's Demucs separation — often the single most expensive step in the whole pipeline — all over again. If a job was run with `keep_correction_artifacts: false`, or predates this setting, correction mode fails with a clear error (rather than silently falling back to re-separating) explaining that a full re-run from scratch is needed instead.
  

@@ -3,6 +3,7 @@ profanity-hush — shared utilities
 
 Imported by pipeline.py and every steps/ module.
 """
+import hashlib
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import traceback as _traceback
+import yaml
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -195,12 +197,75 @@ def step_logger(name: str) -> logging.LoggerAdapter:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
+class ConfigError(RuntimeError):
+    """
+    Raised when the resolved config (built-in config.yaml + optional host
+    override + env vars -- see load_config()) is missing a setting the
+    pipeline needs, or has it set to something that setting doesn't accept
+    (an explicit null on a field that isn't allow_null=True in cfg_get()).
+
+    Deliberately not silently papered over with a hardcoded Python value --
+    that used to be exactly how a config.yaml edit could go unnoticed, with
+    the pipeline quietly running on a stale literal nobody remembered was
+    there. See cfg_get()'s docstring.
+    """
+
+
+# config.yaml baked into the image at build time (see Dockerfile) -- the
+# base layer for every setting, and the only "default" left in the system.
+# To change a default: edit config/config.yaml and rebuild the image.
+# Nothing in src/*.py should ever need a matching edit again.
+DEFAULT_CONFIG_PATH = Path("/app/defaults/config.yaml")
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """
+    Recursively merge `override` onto `base`, returning a new dict.
+
+    A key present in `override` always wins, at whatever nesting level it
+    appears -- including an explicit `null`, which is a real, intentional
+    value for the handful of settings that treat it that way (see
+    cfg_get's allow_null). Only when BOTH sides have a dict at the same
+    key do we recurse and merge key-by-key; anything else (scalar, list,
+    or a type mismatch) is a full replacement of that key, not a merge.
+
+    This is what lets a host-mounted config.yaml override just the one or
+    two settings someone actually wants to change, without needing to be
+    a full copy of the template -- everything it doesn't mention inherits
+    from `base` (the built-in config.yaml).
+    """
+    merged = dict(base)
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def load_config(config_path: "str | Path") -> dict[str, Any]:
     """
     Load config.yaml and apply environment variable overrides.
 
+    config/config.yaml (this repo) is the single source of truth for every
+    tunable default -- there is no parallel set of hardcoded Python
+    literals to keep in sync with it any more. In order:
+
+      1. The built-in config.yaml baked into the image at build time
+         (DEFAULT_CONFIG_PATH, a copy of config/config.yaml as of the last
+         build -- see Dockerfile) is always loaded first, as the base
+         layer. This is the only "default" left in the system.
+      2. If a config.yaml is ALSO found at `config_path` (normally the
+         host's bind-mounted /config/config.yaml -- see hush.sh /
+         docker-compose.yml), it's deep-merged on top of the base layer
+         (see _deep_merge()). A host config.yaml only needs to specify
+         the settings it wants to override; everything else inherits from
+         the built-in one.
+      3. AC_* environment variables are applied last, same as before.
+
     Override precedence (highest wins):
-      environment variables > config.yaml values > pipeline built-in defaults
+      environment variables  >  host-mounted config.yaml (config_path)
+        >  built-in config.yaml baked into the image
 
     Env vars applied:
       AC_LOG_LEVEL                  → output.log_level
@@ -220,20 +285,30 @@ def load_config(config_path: "str | Path") -> dict[str, Any]:
     hush.sh (or docker-compose.yml, or a person invoking `docker run` by
     hand) can know it, at invocation time.
 
-    Returns an empty dict if the config file is absent — the pipeline uses
-    its own defaults in that case (same behaviour as config/config.yaml defaults).
+    Raises ConfigError if even the built-in config.yaml is missing or
+    fails to parse -- that should never happen in a correctly-built image
+    (see Dockerfile); it means the image needs rebuilding from a repo
+    checkout that still has a valid config/config.yaml.
     """
+    def _read(p: Path) -> dict[str, Any]:
+        with p.open() as f:
+            return yaml.safe_load(f) or {}
+
     try:
-        import yaml  # type: ignore
-    except ImportError:
-        yaml = None
+        cfg: dict[str, Any] = _read(DEFAULT_CONFIG_PATH)
+    except (OSError, yaml.YAMLError) as e:
+        raise ConfigError(
+            f"built-in config.yaml ({DEFAULT_CONFIG_PATH}) is missing or "
+            f"invalid -- this should not happen in a correctly-built "
+            f"image: {e}"
+        ) from e
 
     path = Path(config_path)
-    if path.exists() and yaml is not None:
-        with path.open() as f:
-            cfg: dict[str, Any] = yaml.safe_load(f) or {}
-    else:
-        cfg = {}
+    if path.exists():
+        try:
+            cfg = _deep_merge(cfg, _read(path))
+        except (OSError, yaml.YAMLError) as e:
+            raise ConfigError(f"could not read config.yaml at {path}: {e}") from e
 
     # Environment variable overrides
     if v := os.environ.get("AC_LOG_LEVEL"):
@@ -263,16 +338,21 @@ def keep_intermediate(cfg: dict, *, correction_artifact: bool = False) -> bool:
 
     Single source of truth for the retention policy described in design
     doc §6: every step that deletes a large intermediate (steps/merge.py,
-    steps/mute.py, steps/recombine.py, steps/mux.py) calls this rather
-    than reading output.keep_intermediates / output.keep_correction_artifacts
-    directly, specifically so the policy can never drift between steps the
-    way it could when each one re-implemented its own condition.
+    steps/mute.py, steps/recombine.py, steps/encode.py, steps/mux.py)
+    calls this rather than reading output.keep_intermediates /
+    output.keep_correction_artifacts directly, specifically so the policy
+    can never drift between steps the way it could when each one
+    re-implemented its own condition.
 
     correction_artifact=False (default): the file is fully superseded once
-      consumed downstream, and at best only cheaply regenerable anyway
-      (per-segment stems, audio_stereo*.wav, dialog_censored.wav,
-      audio_censored.wav, audio_encoded.mka) -- kept only if
-      output.keep_intermediates is true.
+      consumed downstream (per-segment stems, audio_stereo*.wav,
+      dialog_censored.wav, audio_censored.wav, audio_encoded.mka,
+      transcript_NN.json) -- kept only if output.keep_intermediates is
+      true. Most of these are also cheaply regenerable; transcript_NN.json
+      is the one exception (re-transcribing costs real WhisperX time), but
+      it's still fully superseded by transcript.json once Step 3b succeeds,
+      which is what actually governs its deletion here -- see
+      steps/merge.py's module docstring.
 
     correction_artifact=True: the file is one of the two artifacts
       (dialog.wav, score_sfx.wav) that make the --skip-index / --add-interval
@@ -281,10 +361,10 @@ def keep_intermediate(cfg: dict, *, correction_artifact: bool = False) -> bool:
       output.keep_intermediates OR output.keep_correction_artifacts
       (default true) is true.
     """
-    keep_intermediates = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
+    keep_intermediates = bool(cfg_get(cfg, "output", "keep_intermediates"))
     if not correction_artifact:
         return keep_intermediates
-    keep_correction = bool(cfg_get(cfg, "output", "keep_correction_artifacts", default=True))
+    keep_correction = bool(cfg_get(cfg, "output", "keep_correction_artifacts"))
     return keep_intermediates or keep_correction
 
 
@@ -301,15 +381,15 @@ def retention_summary(cfg: dict) -> str:
     resolved -- not what the user thinks they asked for on the host --
     makes that mismatch visible immediately instead.
     """
-    ki = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
-    kc = bool(cfg_get(cfg, "output", "keep_correction_artifacts", default=True))
+    ki = bool(cfg_get(cfg, "output", "keep_intermediates"))
+    kc = bool(cfg_get(cfg, "output", "keep_correction_artifacts"))
     return (
         f"Retention   : keep_intermediates={ki}  keep_correction_artifacts={kc}\n"
-        f"  transcript*.json, matches.json, review.json, censor_log.json : always kept\n"
-        f"  dialog.wav, score_sfx.wav                                    : "
+        f"  transcript.json, matches.json, review.json, censor_log.json : always kept\n"
+        f"  dialog.wav, score_sfx.wav                                   : "
         f"{'kept' if (ki or kc) else 'deleted after use'}\n"
         f"  audio_stereo*.wav, dialog_censored.wav, audio_censored.wav,\n"
-        f"  audio_encoded.mka                                            : "
+        f"  audio_encoded.mka, transcript_NN.json (per-segment)         : "
         f"{'kept' if ki else 'deleted after use'}"
     )
 
@@ -353,22 +433,147 @@ def paths_banner(cfg: dict) -> str:
     return f"{input_line}\n{output_line}"
 
 
-def cfg_get(cfg: dict, *keys: str, default: Any = None) -> Any:
+def censoring_summary(cfg: dict) -> str:
+    """
+    Two-line, human-readable summary of the *resolved* censoring settings
+    -- meant to be logged once, at startup, at INFO level, every run,
+    regardless of resume state. Same motivation as retention_summary() /
+    paths_banner() / timezone_banner() above.
+
+    Without this, method/padding_ms are only ever logged from inside
+    steps/mute.py's own "Step 5 -- mute dialog stem" line, and the word
+    list path only from inside steps/review.py's flag() -- both of which
+    only run their logging branch on a fresh execution of that step. On
+    a resumed job (5_mute / 4b_flag already in steps_completed), neither
+    ever prints, so nothing in the log confirms which word list or
+    padding was actually in effect for *this* invocation -- exactly the
+    kind of "did my setting actually take effect" gap the other three
+    banners exist to close for retention/paths/timezone.
+    """
+    method     = cfg_get(cfg, "censoring", "method")
+    padding_ms = cfg_get(cfg, "censoring", "padding_ms")
+    word_list  = cfg_get(cfg, "censoring", "word_list")
+    return (
+        f"Censoring   : method={method}  padding={padding_ms}ms\n"
+        f"              word_list = {word_list}"
+    )
+
+
+_UNSET = object()  # sentinel: distinguishes "no default given" from "default=None"
+
+
+def cfg_get(cfg: dict, *keys: str, default: Any = _UNSET, allow_null: bool = False) -> Any:
     """
     Safely navigate nested config keys.
-    Returns default if any key is missing or the value is None.
 
-    Example:
-      cfg_get(cfg, "demucs", "shifts", default=1)
+    If `default` is omitted, a missing key -- or, unless allow_null=True,
+    an explicit `null` -- raises ConfigError rather than silently
+    returning some Python-side value. config.yaml (built-in + optional
+    host override, see load_config()) is expected to define every setting
+    the pipeline actually reads; a key that's truly missing means
+    config.yaml itself is incomplete or has a typo, which is worth
+    surfacing immediately and clearly (see validate_config(), which does
+    this once at startup rather than however far into a run the first
+    reader of that key happens to be) rather than papering over with a
+    hardcoded fallback that can silently drift out of sync with
+    config.yaml over time -- which is exactly the failure mode this
+    function used to have, and the reason it no longer does.
+
+    Pass an explicit `default=` only for settings that are legitimately
+    optional and have no entry in config.yaml's schema at all -- e.g.
+    paths.input_host_dir / paths.output_host_dir, which are populated
+    solely from AC_INPUT_HOST_DIR / AC_OUTPUT_HOST_DIR and were never
+    meant to be config.yaml keys (see load_config()'s docstring). That's
+    a genuinely different situation from "this config.yaml setting has a
+    fallback value" -- there's no config.yaml value to fall back to.
+
+    allow_null=True: treat an explicit `null` as a real, meaningful value
+    rather than "missing" -- e.g. whisperx.language: null means
+    "auto-detect", distinct from the key being absent (an error, same as
+    any other required setting) or set to a real language code. Only the
+    final key in the path gets this treatment; a missing or null
+    *intermediate* section still raises/returns default regardless, since
+    the isinstance(node, dict) check on the next iteration catches that
+    before allow_null ever comes into play.
+
+    Examples:
+      cfg_get(cfg, "demucs", "shifts")                          # required
+      cfg_get(cfg, "whisperx", "language", allow_null=True)     # required, null is meaningful
+      cfg_get(cfg, "paths", "input_host_dir", default=None)     # genuinely optional
     """
+    def _missing() -> Any:
+        if default is _UNSET:
+            raise ConfigError(
+                f"config.yaml is missing required setting "
+                f"'{'.'.join(keys)}' -- check it against the shipped "
+                f"template at config/config.yaml."
+            )
+        return default
+
     node: Any = cfg
     for k in keys:
-        if not isinstance(node, dict):
-            return default
-        node = node.get(k)
-        if node is None:
-            return default
+        if not isinstance(node, dict) or k not in node:
+            return _missing()
+        node = node[k]
+    if node is None and not allow_null:
+        return _missing()
     return node
+
+
+# The one setting where an explicit `null` is a real value rather than
+# "missing" -- kept in sync with the one actual allow_null=True call site
+# (steps/transcribe.py), so validate_config() below checks each leaf the
+# same way its real reader will.
+_ALLOW_NULL_KEYS = {("whisperx", "language")}
+
+
+def validate_config(cfg: dict) -> None:
+    """
+    Confirm the resolved config has a usable value everywhere the built-in
+    config.yaml (the always-complete base layer -- see load_config())
+    defines one, raising a single ConfigError listing everything missing
+    at once if not.
+
+    Deliberately self-maintaining: it walks whatever config/config.yaml's
+    own structure currently is (via DEFAULT_CONFIG_PATH) rather than
+    checking against a separate hand-written list of "required keys" --
+    there's nothing to remember to update when a setting is added,
+    renamed, or removed from config.yaml. The shipped config.yaml file
+    *is* the schema.
+
+    Called once, at startup, by pipeline.py's main() -- right after
+    load_config() and before anything else runs -- specifically so a
+    config.yaml edit that drops or misspells a key fails in the first
+    second of a run instead of hours in, at whichever step happens to be
+    the first reader of that key. This pipeline is explicitly designed
+    for unattended overnight runs; finding out about a bad config.yaml at
+    Step 5 after Steps 1-4 already burned CPU-hours is a far worse
+    experience than finding out before Step 1 starts.
+    """
+    with DEFAULT_CONFIG_PATH.open() as f:
+        base = yaml.safe_load(f) or {}
+
+    missing: list[str] = []
+
+    def _walk(section: dict, path: tuple) -> None:
+        for key, value in section.items():
+            full_path = path + (key,)
+            if isinstance(value, dict):
+                _walk(value, full_path)
+            else:
+                try:
+                    cfg_get(cfg, *full_path, allow_null=full_path in _ALLOW_NULL_KEYS)
+                except ConfigError:
+                    missing.append(".".join(full_path))
+
+    _walk(base, ())
+
+    if missing:
+        raise ConfigError(
+            f"config.yaml is missing {len(missing)} required setting(s):\n  "
+            + "\n  ".join(missing)
+            + "\ncheck it against the shipped template at config/config.yaml."
+        )
 
 
 # ── Job state ─────────────────────────────────────────────────────────────────
@@ -463,6 +668,9 @@ def unmark_step_done(job_dir: Path, step: str) -> None:
     (--skip-index / --add-interval / --redo-review) to force a step (and,
     by removing several, everything from that point onward) to actually
     re-run instead of hitting its own "already complete" resume-check.
+    Also used by pipeline.py's --redo-step handling, which cascades this
+    call from the named step through 7_mux for the same reason (see
+    pipeline.py's module docstring and its _steps_from() helper).
     Does NOT delete or touch the step's output file on disk; it only
     clears the bookkeeping flag, so the step's normal logic runs fresh
     and naturally overwrites (-y) whatever was there before.
@@ -486,6 +694,37 @@ def mark_job_failed(job_dir: Path, step: str, exc: Exception) -> None:
         "error": str(exc),
         "traceback": _traceback.format_exc(),
     }
+    write_job(job_dir, state)
+
+
+def mark_job_interrupted(job_dir: Path, step: str) -> None:
+    """
+    Record that the job was deliberately stopped (Ctrl-C / SIGINT) while
+    `step` was in progress -- pipeline.py's counterpart to
+    mark_job_failed() above, for a stop that wasn't an error.
+
+    Distinguishing this from a plain 'running' status matters: without
+    it, a job sitting mid-Ctrl-C looks identical in job.json to one still
+    genuinely executing in another terminal or tmux pane -- nothing
+    tells "safe to resume this" apart from "don't, something else
+    already has it." It's kept separate from 'failed' too: an
+    interruption is an expected, intentional stop, not something to
+    investigate, so it gets its own status and its own small metadata
+    block rather than overloading 'failure' -- pipeline.py's "Resuming"
+    branch clears a stale record of either kind on the next attempt (the
+    same way it already cleared a stale 'failure' block).
+
+    `step` is deliberately never added to steps_completed here -- it was,
+    by definition, still in progress when the interrupt landed, so the
+    next run's resume logic redoes it from scratch, exactly as if it had
+    never started.
+    """
+    state = read_job(job_dir)
+    state["status"] = "interrupted"
+    now = time.time()
+    state["interrupted_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+    state["interrupted_at_local"], _ = fmt_wall_clock(now)
+    state["interruption"] = {"step": step}
     write_job(job_dir, state)
 
 
@@ -613,20 +852,39 @@ def run_cmd(
 
     # Poll for exit so we can interleave heartbeat emission without
     # blocking on the reader threads (which run independently above).
-    while proc.poll() is None:
-        if next_beat is not None and time.monotonic() >= next_beat:
-            elapsed = time.monotonic() - start
-            if heartbeat_msg is not None:
-                try:
-                    msg = heartbeat_msg(elapsed)
-                except Exception as exc:
-                    log.debug("  heartbeat_msg callback raised %r", exc)
+    try:
+        while proc.poll() is None:
+            if next_beat is not None and time.monotonic() >= next_beat:
+                elapsed = time.monotonic() - start
+                if heartbeat_msg is not None:
+                    try:
+                        msg = heartbeat_msg(elapsed)
+                    except Exception as exc:
+                        log.debug("  heartbeat_msg callback raised %r", exc)
+                        msg = f"... still running ({fmt_duration(elapsed)} elapsed)"
+                else:
                     msg = f"... still running ({fmt_duration(elapsed)} elapsed)"
-            else:
-                msg = f"... still running ({fmt_duration(elapsed)} elapsed)"
-            log.info("  %s", msg)
-            next_beat += heartbeat_sec
-        time.sleep(0.5)
+                log.info("  %s", msg)
+                next_beat += heartbeat_sec
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        # Ctrl-C at an attached terminal delivers SIGINT to this whole
+        # process group, so proc has very likely already received it
+        # directly and is on its way out. But this call site doesn't get
+        # to assume that: if it's ever reached somewhere that signal
+        # isn't forwarded to children, terminate proc explicitly rather
+        # than abandoning it to finish (or fail to) unsupervised after
+        # this function has already unwound -- best-effort, a short grace
+        # period for a clean exit, then an unconditional kill.
+        log.warning("  Interrupted — terminating subprocess (pid %d) ...", proc.pid)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log.warning("  Subprocess did not exit within 5s — killing (pid %d).", proc.pid)
+            proc.kill()
+            proc.wait()
+        raise
 
     t_out.join()
     t_err.join()
@@ -647,6 +905,351 @@ def run_cmd(
         )
 
     return result
+
+
+# ── Resumable-output helpers ──────────────────────────────────────────────────
+#
+# Every subprocess invocation in this pipeline whose output is later trusted
+# via `<path>.exists()` on resume needs two things: the write itself must be
+# atomic (so a process killed mid-write can never leave a truncated file
+# sitting under the name resume logic looks for), and the result should be
+# validated against what it was expected to contain (so resume logic doesn't
+# have to take "it exists" on faith even when the write *was* atomic --
+# e.g. a job directory populated before this pair of functions existed).
+#
+# tmp_output_path()/finalize_output() below are the first half of that;
+# probe_duration_sec()/check_duration_matches() are the second. Together they
+# would have caught job 1d55099e2bb7's audio_raw.mp3: Step 1a's
+# `ffmpeg -c:a copy` was interrupted 7:51 into a source whose own audio stream
+# reports roughly 100 minutes, and the truncated result was later treated as
+# a finished extraction purely because it existed at all under the expected
+# filename (see steps/extract.py, which was the one caller not yet using
+# either mechanism).
+
+def tmp_output_path(final_path: Path) -> Path:
+    """
+    Temp sibling path a subprocess should write to before being published
+    under final_path via finalize_output().
+
+    Inserts '.part' before the real extension (audio_raw.mp3 becomes
+    audio_raw.part.mp3) rather than appending it (audio_raw.mp3.part).
+    ffmpeg -- and most other media tools -- infer their output container
+    format from the filename's own extension, so a temp path needs to
+    keep a recognizable one as its actual suffix, or the write fails
+    outright before there's anything to even worry about renaming
+    ("Unable to choose an output format for '...audio_raw.mp3.part'").
+
+    Always placed alongside final_path -- same directory, so
+    finalize_output()'s rename is guaranteed same-filesystem -- with a
+    name that can't collide with any real pipeline filename and sorts
+    visibly next to its target in a directory listing. Callers should
+    remove any leftover file at this path (from a previous interrupted
+    attempt) before starting a fresh one, e.g.:
+
+        tmp = tmp_output_path(out_path)
+        tmp.unlink(missing_ok=True)
+        run_cmd([..., str(tmp)], log)
+        finalize_output(tmp, out_path)
+    """
+    return final_path.with_name(final_path.stem + ".part" + final_path.suffix)
+
+
+def finalize_output(tmp_path: Path, final_path: Path) -> None:
+    """
+    Atomically publish a subprocess's completed output under its final
+    name -- the write-then-rename counterpart to tmp_output_path() above,
+    the same idiom write_job() already uses for job.json.
+
+    os.replace() rather than Path.rename(): both are atomic on POSIX when
+    source and destination share a filesystem (guaranteed here --
+    tmp_output_path() always places the temp file next to its target),
+    but os.replace() also overwrites atomically on Windows, where
+    Path.rename() raises FileExistsError instead of replacing. Not
+    load-bearing for this project's Linux-only container today, but free
+    to get right.
+    """
+    os.replace(tmp_path, final_path)
+
+
+def probe_duration_sec(path: Path, log: logging.LoggerAdapter) -> float:
+    """
+    Return the duration of path's first audio stream in seconds, measured
+    by actually reading the bitstream through to its end -- stream-copied
+    into the null muxer, so this costs a fast demux pass, not a real
+    decode -- rather than trusting the container's own self-reported
+    duration metadata.
+
+    That distinction is not theoretical: some formats embed a header
+    that declares a duration up front, specifically to let a player seek
+    without scanning the whole file first (MP3's Xing/LAME VBR header
+    and FLAC's STREAMINFO block both do this), and a demuxer that trusts
+    it outright keeps reporting the *original* duration even after the
+    file's tail has been chopped off by an interrupted write. Confirmed
+    by testing against this exact fix: an MP3 and a FLAC file, each
+    truncated to a fifth of their size, both still reported their full,
+    pre-truncation duration from a plain `ffprobe -show_entries
+    format=duration` -- silently defeating the entire integrity check
+    this function exists to support. (AAC and AC3 happened not to
+    exhibit this in the same test, but nothing about that generalizes to
+    every codec steps/extract.py might encounter, so the robust method
+    is used unconditionally rather than per-codec.) WAV -- Steps
+    1b/1c/3b's format throughout the rest of the pipeline -- computes
+    duration from actual data-chunk bytes present and reflected
+    truncation correctly in the same test, but is measured the same way
+    here regardless, both for consistency and because actually reading
+    the file through is a fast demux either way.
+
+    Raises RuntimeError if ffmpeg can't read the file at all (rather
+    than returning 0.0), so a caller comparing against an expected value
+    never mistakes "unreadable" for "empty."
+    """
+    try:
+        result = run_cmd(
+            [
+                "ffmpeg", "-v", "error",
+                "-i", str(path),
+                "-map", "0:a:0",
+                "-c", "copy",
+                "-f", "null",
+                "-progress", "pipe:1",
+                "-nostats",
+                "-",
+            ],
+            log,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"Could not read {path} to determine its duration: {exc}") from None
+
+    out_time_us = None
+    for line in result.stdout.splitlines():
+        if line.startswith("out_time_us="):
+            value = line.split("=", 1)[1].strip()
+            if value not in ("", "N/A"):
+                out_time_us = int(value)
+
+    if out_time_us is None:
+        raise RuntimeError(
+            f"ffmpeg could not determine a duration for {path} -- it may "
+            "be empty, corrupt, or an unsupported format."
+        )
+    return out_time_us / 1_000_000
+
+
+def check_duration_matches(
+    actual_sec: float,
+    expected_sec: float,
+    *,
+    label: str,
+    tolerance_sec: float = 5.0,
+    log: Optional[logging.LoggerAdapter] = None,
+) -> None:
+    """
+    Raise RuntimeError if actual_sec doesn't match expected_sec within
+    tolerance_sec -- the shared compare-and-raise half of this pipeline's
+    duration integrity checks. Takes already-measured durations rather
+    than probing internally, so each caller is free to choose whichever
+    ffprobe strategy suits its own file type (probe_duration_sec() above
+    for most things; steps/segment.py's own _probe_duration() for WAV)
+    and to log around the call however fits its own step's style.
+
+    tolerance_sec is a flat, absolute value rather than a percentage of
+    expected_sec: a lossless bitstream copy, PCM downmix, split, or
+    concat should reproduce its source's duration to within a small,
+    constant margin (container-level timestamp rounding, slightly
+    different stream start references) regardless of how long the
+    source itself is -- there's no mechanism by which that margin would
+    legitimately grow proportionally with duration the way, say,
+    frame-rate drift over a long recording might. A truncation caused by
+    an interrupted run is typically tens of seconds to hours short, so
+    even a fairly tight flat tolerance has enormous margin against a
+    real corruption while comfortably tolerating benign container
+    quirks in a genuinely intact file.
+
+    label identifies what's being compared, purely for the error message
+    (e.g. "audio_raw.mp3 vs. source video") -- this function has no
+    other use for it.
+    """
+    delta = abs(actual_sec - expected_sec)
+    if delta > tolerance_sec:
+        raise RuntimeError(
+            f"Integrity check failed for {label}:\n"
+            f"  measured   : {fmt_duration(actual_sec)}  ({actual_sec:.1f}s)\n"
+            f"  expected   : {fmt_duration(expected_sec)}  ({expected_sec:.1f}s)\n"
+            f"  difference : {fmt_duration(delta)}  ({delta:.1f}s, tolerance {tolerance_sec:.0f}s)\n"
+            "This usually means the file was left truncated by a previous "
+            "run interrupted mid-write (Ctrl-C, OOM-kill, host shutdown, "
+            "etc.)."
+        )
+    if log is not None:
+        log.debug(
+            "  ✓  duration check passed for %s (%.1fs vs expected %.1fs, "
+            "Δ%.1fs ≤ tolerance %.1fs)",
+            label, actual_sec, expected_sec, delta, tolerance_sec,
+        )
+
+
+def sha256_file(
+    path: Path,
+    log: Optional[logging.LoggerAdapter] = None,
+    chunk_size: int = 1024 * 1024,
+) -> Optional[str]:
+    """
+    Return path's SHA-256 hex digest, reading it in fixed-size chunks so
+    this works for large files without loading them fully into memory.
+
+    Best-effort and provenance-only: returns None (and logs a warning, if
+    a logger is given) rather than raising on an I/O error, since this is
+    an audit aid for confirming "is this exactly the file we started
+    from" later, not a correctness gate the way check_duration_matches()
+    is -- a hash that fails to compute shouldn't be able to fail a step
+    on its own.
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError as exc:
+        if log is not None:
+            log.warning("  Could not hash %s: %s", path, exc)
+        return None
+
+
+def verify_stem_before_reuse(
+    path: Path,
+    expected_duration_sec: Optional[float],
+    expected_sha256: Optional[str],
+    log: logging.LoggerAdapter,
+    *,
+    label: str,
+    written_by: str = "Step 3b (merge)",
+    regenerate_hint: Optional[str] = None,
+) -> None:
+    """
+    Re-verify a long-lived stem file against the duration and hash the
+    step that produced it recorded (via verify_and_hash_before_publish()
+    below), immediately before the step that consumes it next actually
+    does so. That consumption may happen much later and in an entirely
+    separate invocation than the one that wrote it -- originally this
+    was only true of dialog.wav/score_sfx.wav via pipeline.py's
+    --skip-index/--add-interval/--redo-review correction workflow (see
+    that module's docstring), but it is equally true of
+    dialog_censored.wav/audio_censored.wav/audio_encoded.mka whenever
+    --redo-step names a *middle* step (e.g. --redo-step 6_recombine
+    alone, which cascades to 6b_encode/7_mux but leaves 5_mute's
+    dialog_censored.wav exactly as it was) -- so this function is
+    shared by steps/mute.py, steps/recombine.py, steps/encode.py, and
+    steps/mux.py rather than being specific to any one pair of files.
+    See the write-time half, verify_and_hash_before_publish(), below.
+
+    written_by/regenerate_hint let each caller describe *its own*
+    upstream step and remediation accurately in the raised error --
+    defaults describe the original dialog.wav/score_sfx.wav case, where
+    the fix genuinely does require re-running Step 2's Demucs
+    separation from scratch. That's specifically NOT true of the other
+    three files (regenerating any of them is exactly what --redo-step
+    is for), so their callers pass a written_by/regenerate_hint that
+    says so instead of repeating guidance that would be wrong for them.
+
+    Deliberately does NOT delete path or unmark any step on a mismatch,
+    unlike every other integrity check in this pipeline (including this
+    function's own write-time counterpart). Silently deleting a
+    multi-hour artifact like dialog.wav and triggering its own
+    regeneration off the back of one failed check would be a far bigger,
+    more surprising action than anything else this pipeline does on its
+    own -- so this raises with clear, actionable guidance instead, and
+    leaves the job directory exactly as it found it for a person to
+    decide what to do next. This holds even for the three cheaper-to-
+    regenerate files: --redo-step is a deliberate, explicit action a
+    person takes, not something this check should trigger on their
+    behalf.
+
+    Skips whichever half of the check it doesn't have data for -- no
+    recorded duration/hash (a job directory from before this check
+    existed) just means less confidence, not a hard block over data that
+    predates the feature that would have produced it.
+    """
+    problems: list[str] = []
+
+    if expected_duration_sec:
+        actual_duration = probe_duration_sec(path, log)
+        delta = abs(actual_duration - expected_duration_sec)
+        if delta > 5.0:
+            problems.append(
+                f"duration is {fmt_duration(actual_duration)} ({actual_duration:.1f}s), "
+                f"expected {fmt_duration(expected_duration_sec)} ({expected_duration_sec:.1f}s) "
+                f"— Δ{delta:.1f}s"
+            )
+
+    if expected_sha256:
+        actual_hash = sha256_file(path, log)
+        if actual_hash is not None and actual_hash != expected_sha256:
+            problems.append(f"sha256 is {actual_hash[:16]}…, expected {expected_sha256[:16]}…")
+
+    if problems:
+        if regenerate_hint is None:
+            regenerate_hint = (
+                "dialog.wav and score_sfx.wav are kept specifically to avoid "
+                "re-running Step 2's Demucs separation, so this is deliberately "
+                "not auto-corrected -- redoing that work automatically, "
+                "unasked, over a single failed check is a bigger action than "
+                "this pipeline should take on its own. There is currently no "
+                "supported way to redo just Steps 2/3b (pipeline.py's "
+                "--redo-step explicitly excludes them); if this file is "
+                "genuinely bad, the safe fix is to delete the job directory "
+                "and re-run from scratch."
+            )
+        raise RuntimeError(
+            f"Integrity check failed for {label} ({path}):\n"
+            + "\n".join(f"  - {p}" for p in problems) + "\n"
+            f"This file has changed since {written_by} wrote it -- "
+            "possibly corruption, possibly something else touched it. "
+            + regenerate_hint
+        )
+
+    log.debug("  ✓  %s passed integrity check (duration + hash vs. %s's record).", label, written_by)
+
+
+def verify_and_hash_before_publish(
+    path: Path,
+    label: str,
+    expected_duration_sec: float,
+    log: logging.LoggerAdapter,
+) -> Optional[str]:
+    """
+    Confirm path matches expected_duration_sec, then return its SHA-256
+    hex digest -- the write-time half of this pipeline's stem-integrity
+    checks; verify_stem_before_reuse() above is the read-time half. Used
+    by steps/merge.py (dialog.wav/score_sfx.wav), steps/mute.py
+    (dialog_censored.wav), steps/recombine.py (audio_censored.wav), and
+    steps/encode.py (audio_encoded.mka) -- each records what "good"
+    looks like for whichever step consumes its output next, which may
+    happen much later and in a separate invocation.
+
+    expected_duration_sec of 0 (state had no recorded total_duration_sec
+    at all -- shouldn't happen in practice, but see steps/extract.py's
+    analogous "skip gracefully rather than block a run" handling) skips
+    the duration half and only hashes.
+
+    On a duration mismatch: deletes path and re-raises, the same
+    delete-then-raise pattern used throughout this pipeline's other
+    integrity checks, so a redo doesn't get stuck re-validating the same
+    bad file. Hashing failures are not fatal at all -- see sha256_file()'s
+    own docstring.
+    """
+    if expected_duration_sec:
+        try:
+            check_duration_matches(
+                probe_duration_sec(path, log), expected_duration_sec, log=log,
+                label=f"{label} vs. recorded total_duration_sec",
+                tolerance_sec=5.0,
+            )
+        except RuntimeError:
+            path.unlink(missing_ok=True)
+            log.error("  Deleted incomplete %s — re-run to produce it fresh.", label)
+            raise
+    return sha256_file(path, log)
 
 
 # ── Wall-clock timestamps (local + UTC) ─────────────────────────────────────────

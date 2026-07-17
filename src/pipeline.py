@@ -26,8 +26,8 @@ still being on disk (output.keep_correction_artifacts, default true — see
 steps/mute.py and steps/recombine.py); without them, a correction would
 require re-running Step 2's Demucs separation from scratch.
 
---redo-step STEP is a separate, narrower tool: it forces exactly the
-named step(s) (one of 4b_flag, 4b_review, 5_mute, 6_recombine, 6b_encode,
+--redo-step STEP is a separate, narrower tool: it forces the named
+step(s) (one of 4b_flag, 4b_review, 5_mute, 6_recombine, 6b_encode,
 7_mux) to redo on an existing job, with no review.json involved at all.
 For testing a change to a step's own implementation (e.g. switching
 Step 7 from ffmpeg to mkvmerge) against a job that's already sitting on
@@ -41,6 +41,13 @@ match against job_id -- silently turning "resume this job" into "start a
 fresh one," with hours of needless Steps 1a-3b work the only symptom.
 --redo-step refuses outright if no existing job is found, rather than
 falling through to a fresh run, and never writes job.json by hand.
+
+Naming an earlier step cascades to every step after it through 7_mux
+(see _cascade_steps() below) -- redoing 5_mute alone also clears
+6_recombine/6b_encode/7_mux, so a change always propagates to the file
+actually delivered to /output rather than those steps silently reusing
+stale files left over from before the change. --redo-step 7_mux alone
+clears only 7_mux, since nothing in this pipeline is downstream of it.
 """
 import argparse
 import hashlib
@@ -57,6 +64,7 @@ from utils import (
     fmt_dir,
     fmt_duration,
     mark_job_failed,
+    mark_job_interrupted,
     paths_banner,
     read_job,
     retention_summary,
@@ -83,7 +91,6 @@ from steps.mux        import mux       as run_mux
 from steps.matching   import resolve_word_list_path
 
 # ── Fixed container paths ─────────────────────────────────────────────────────
-JOBS_DIR    = Path("/jobs")
 OUTPUT_DIR  = Path("/output")
 CONFIG_PATH = Path("/config/config.yaml")
 
@@ -140,6 +147,51 @@ def make_job_dir_name(video: Path, job_id: str) -> str:
         # Trim at the last hyphen before the 32-char mark to avoid mid-word cuts
         slug = slug[:33].rsplit("-", 1)[0].rstrip("-")
     return f"{ts}_{slug}_{job_id[:8]}"
+
+
+# ── --redo-step cascading ─────────────────────────────────────────────────────
+
+# Canonical order of the steps --redo-step can target. Steps 1a-3b are
+# deliberately not included -- they're resumed as one atomic block (see
+# the "3b_merge in done" branch below) and are never valid --redo-step
+# targets (enforced by argparse's choices= on --redo-step itself).
+STEP_ORDER = ["4b_flag", "4b_review", "5_mute", "6_recombine", "6b_encode", "7_mux"]
+
+
+def _cascade_steps(named_steps) -> "list[str]":
+    """
+    Expand the step names passed to --redo-step into the full set that
+    must actually be cleared from steps_completed: each named step,
+    plus everything after it in STEP_ORDER, in canonical order.
+
+    This matters because every step's own resume-check only asks "is my
+    own name in steps_completed?" -- it never checks whether the file
+    it's about to reuse is newer than, or was built from, whatever it's
+    being handed this run. Clearing only the literal name(s) passed on
+    the command line (an earlier version of this did exactly that)
+    meant redoing an early step alone -- e.g. --redo-step 5_mute to test
+    a new padding value, the exact scenario --redo-step's own --help
+    text uses as an example -- would regenerate dialog_censored.wav,
+    then immediately hit steps/recombine.py's "already complete"
+    branch, which returns the *old* audio_censored.wav without even
+    looking at the freshly-passed dialog_censored_path argument. The
+    run would report success, and job.json's "mute" block would even
+    show the new padding value, but the file actually delivered to
+    /output would be byte-for-byte the one from before the change.
+
+    Cascading through every step after the named one mirrors exactly
+    what the --skip-index/--add-interval/--redo-review path already
+    does for 5_mute/6_recombine/6b_encode/7_mux as a fixed group (see
+    the `correcting` branch below) -- it just needs to work from
+    whichever point --redo-step names, rather than always starting at
+    5_mute. Naming --redo-step 7_mux alone still clears only 7_mux,
+    since nothing in this pipeline is downstream of it.
+    """
+    to_clear = set()
+    for step in named_steps:
+        idx = STEP_ORDER.index(step)
+        to_clear.update(STEP_ORDER[idx:])
+    return [s for s in STEP_ORDER if s in to_clear]
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -234,11 +286,15 @@ def main() -> None:
             "everything before it. Repeatable. Unlike "
             "--skip-index/--add-interval/--redo-review (which edit "
             "review.json to fix a *content* mistake and always redo Steps "
-            "5, 6, 6b, and 7 together), this only clears the named step(s) "
-            "from steps_completed -- nothing else is touched, and only the "
-            "step(s) named are redone. Steps 1a-3b aren't offered here: "
-            "they're resumed as one atomic block (see the 'Steps 1a-3b "
-            "already complete' check below) and their per-segment "
+            "5, 6, 6b, and 7 together), this clears only the named "
+            "step(s) plus everything after them through 7_mux -- e.g. "
+            "naming 5_mute also clears 6_recombine/6b_encode/7_mux, so the "
+            "change actually reaches the file delivered to /output instead "
+            "of those steps silently reusing files left over from before "
+            "the change. Naming 7_mux by itself clears only 7_mux, since "
+            "nothing here is downstream of it. Steps 1a-3b aren't offered "
+            "here: they're resumed as one atomic block (see the 'Steps "
+            "1a-3b already complete' check below) and their per-segment "
             "intermediates may already be deleted, so redoing one alone "
             "isn't safe. Requires a job that already exists for this exact "
             "input file (same path, same mtime) -- this is a targeted "
@@ -254,10 +310,23 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Config + logging ──────────────────────────────────────────────────────
-    cfg       = utils.load_config(args.config)
-    log_level = cfg_get(cfg, "output", "log_level", default="info")
+    cfg = utils.load_config(args.config)
+    # Validate the WHOLE config upfront, before reading any individual
+    # setting below -- see utils.validate_config()'s docstring for why
+    # this matters for a pipeline meant to run unattended for hours.
+    utils.validate_config(cfg)
+    log_level = cfg_get(cfg, "output", "log_level")
     setup_logging(log_level)
     log = step_logger("pipeline")
+
+    # storage.jobs_dir documents /jobs as "do not change unless you also
+    # update hush.sh / docker-compose.yml" -- both of those hardcode the
+    # host-side mount target to /jobs, so this must match that unless
+    # the person changed all three together, exactly as the comment says.
+    # Reading it from config here (rather than a hardcoded constant)
+    # means the setting is no longer inert -- previously nothing in this
+    # file consulted it at all.
+    jobs_dir = Path(cfg_get(cfg, "storage", "jobs_dir"))
 
     log.info("==" * 30)
     log.info("profanity-hush  (Phase 2 — core pipeline)")
@@ -306,7 +375,7 @@ def main() -> None:
     elif args.no_interactive:
         interactive = False
     else:
-        interactive = cfg_get(cfg, "interactive", "enabled", default=False)
+        interactive = cfg_get(cfg, "interactive", "enabled")
 
     if args.redo_review:
         interactive = True  # correction mode forces this, regardless of config/other flags
@@ -335,18 +404,18 @@ def main() -> None:
     # the word list, not just for config.yaml's scalar settings. Step 5
     # (mute) no longer touches the word list at all — it only consumes
     # Step 4b's already-resolved matches.json.
-    word_list_path = Path(cfg_get(cfg, "censoring", "word_list", default="/config/word_list.txt"))
+    word_list_path = Path(cfg_get(cfg, "censoring", "word_list"))
     word_list_path = resolve_word_list_path(word_list_path, log)
     cfg.setdefault("censoring", {})["word_list"] = str(word_list_path)
 
     # ── Job store ─────────────────────────────────────────────────────────────
     job_id   = compute_job_id(video)
-    job_dir  = find_job_dir(JOBS_DIR, job_id, log)
+    job_dir  = find_job_dir(jobs_dir, job_id, log)
     resuming = job_dir is not None
 
     if not resuming:
         dir_name = make_job_dir_name(video, job_id)
-        job_dir  = JOBS_DIR / dir_name
+        job_dir  = jobs_dir / dir_name
         job_dir.mkdir(parents=True, exist_ok=True)
 
     # From here on, every line also lands in job_dir/logs/{timestamp}.log --
@@ -366,6 +435,8 @@ def main() -> None:
     for line in retention_summary(cfg).splitlines():
         log.info("%s", line)
     for line in paths_banner(cfg).splitlines():
+        log.info("%s", line)
+    for line in utils.censoring_summary(cfg).splitlines():
         log.info("%s", line)
 
     state = read_job(job_dir)
@@ -411,6 +482,16 @@ def main() -> None:
                 cleared_failure = True
         if cleared_failure:
             log.info("  Cleared stale failure record from a prior attempt.")
+        # Same idea, for a job that was Ctrl-C'd (see mark_job_interrupted())
+        # rather than failed outright -- otherwise a resumed-and-now-running
+        # job would sit there still claiming 'interrupted' from whichever
+        # step got Ctrl-C'd last time.
+        cleared_interruption = False
+        for key in ("interruption", "interrupted_at", "interrupted_at_local"):
+            if state.pop(key, None) is not None:
+                cleared_interruption = True
+        if cleared_interruption:
+            log.info("  Cleared stale interruption record from a prior attempt.")
         # Backfill for job.json files written before started_at_local
         # existed -- a display convenience only (started_at, above, is
         # and remains the canonical UTC field), so it's fine for this to
@@ -462,6 +543,10 @@ def main() -> None:
                     add_intervals=args.add_interval or [],
                     log=cx_log,
                 )
+            except KeyboardInterrupt:
+                cx_log.error("Interrupted (Ctrl-C) while applying corrections.")
+                mark_job_interrupted(job_dir, "correct")
+                sys.exit(130)
             except Exception as exc:
                 cx_log.error("Applying corrections failed: %s", exc)
                 sys.exit(1)
@@ -509,9 +594,23 @@ def main() -> None:
             sys.exit(1)
 
         rs_log = step_logger("redo-step")
-        for step in args.redo_steps:
-            unmark_step_done(job_dir, step)
-        rs_log.info("Forcing redo of: %s", ", ".join(args.redo_steps))
+        try:
+            steps_to_clear = _cascade_steps(args.redo_steps)
+            for step in steps_to_clear:
+                unmark_step_done(job_dir, step)
+        except KeyboardInterrupt:
+            rs_log.error("Interrupted (Ctrl-C) while processing --redo-step.")
+            mark_job_interrupted(job_dir, "redo-step")
+            sys.exit(130)
+        extra = [s for s in steps_to_clear if s not in args.redo_steps]
+        if extra:
+            rs_log.info(
+                "Forcing redo of: %s  (cascaded from %s so the change "
+                "actually reaches /output -- see --redo-step --help)",
+                ", ".join(steps_to_clear), ", ".join(args.redo_steps),
+            )
+        else:
+            rs_log.info("Forcing redo of: %s", ", ".join(steps_to_clear))
         done = read_job(job_dir).get("steps_completed", [])
 
     if "3b_merge" in done:
@@ -578,7 +677,11 @@ def main() -> None:
         # ── Step 1a: extract raw audio ────────────────────────────────────────
         ext_log = step_logger("extract")
         try:
-            extract_raw(video, job_dir, cfg, ext_log)
+            extract_raw(video, job_dir, ext_log)
+        except KeyboardInterrupt:
+            ext_log.error("Step 1a interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "1a_extract_raw")
+            sys.exit(130)
         except Exception as exc:
             ext_log.error("Step 1a failed: %s", exc)
             mark_job_failed(job_dir, "1a_extract_raw", exc)
@@ -586,7 +689,11 @@ def main() -> None:
 
         # ── Step 1b: downmix to stereo ─────────────────────────────────────────
         try:
-            downmix_to_stereo(job_dir, cfg, ext_log)
+            downmix_to_stereo(job_dir, ext_log)
+        except KeyboardInterrupt:
+            ext_log.error("Step 1b interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "1b_downmix")
+            sys.exit(130)
         except Exception as exc:
             ext_log.error("Step 1b failed: %s", exc)
             mark_job_failed(job_dir, "1b_downmix", exc)
@@ -596,6 +703,10 @@ def main() -> None:
         seg_log = step_logger("segment")
         try:
             segments = run_segment(job_dir, cfg, seg_log)
+        except KeyboardInterrupt:
+            seg_log.error("Step 1c interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "1c_segment")
+            sys.exit(130)
         except Exception as exc:
             seg_log.error("Step 1c failed: %s", exc)
             mark_job_failed(job_dir, "1c_segment", exc)
@@ -605,6 +716,10 @@ def main() -> None:
         sep_log = step_logger("separate")
         try:
             stem_pairs = run_separate(job_dir, segments, cfg, sep_log)
+        except KeyboardInterrupt:
+            sep_log.error("Step 2 interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "2_separate")
+            sys.exit(130)
         except Exception as exc:
             sep_log.error("Step 2 failed: %s", exc)
             mark_job_failed(job_dir, "2_separate", exc)
@@ -614,6 +729,10 @@ def main() -> None:
         tr_log = step_logger("transcribe")
         try:
             transcript_paths = run_transcribe(job_dir, segments, stem_pairs, cfg, tr_log)
+        except KeyboardInterrupt:
+            tr_log.error("Step 3 interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "3_transcribe")
+            sys.exit(130)
         except Exception as exc:
             tr_log.error("Step 3 failed: %s", exc)
             mark_job_failed(job_dir, "3_transcribe", exc)
@@ -625,6 +744,10 @@ def main() -> None:
             transcript_out, dialog_out, score_sfx_out = run_merge(
                 job_dir, segments, stem_pairs, transcript_paths, cfg, mg_log,
             )
+        except KeyboardInterrupt:
+            mg_log.error("Step 3b interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "3b_merge")
+            sys.exit(130)
         except Exception as exc:
             mg_log.error("Step 3b failed: %s", exc)
             mark_job_failed(job_dir, "3b_merge", exc)
@@ -642,6 +765,10 @@ def main() -> None:
     fl_log = step_logger("flag")
     try:
         matches_out = run_flag(job_dir, transcript_out, cfg, fl_log)
+    except KeyboardInterrupt:
+        fl_log.error("Step 4b (flag) interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "4b_flag")
+        sys.exit(130)
     except Exception as exc:
         fl_log.error("Step 4b (flag) failed: %s", exc)
         mark_job_failed(job_dir, "4b_flag", exc)
@@ -656,6 +783,10 @@ def main() -> None:
         except ReviewAborted:
             rv_log.info("Step 4b (review) aborted by user — no changes written. Re-run to try again.")
             sys.exit(0)
+        except KeyboardInterrupt:
+            rv_log.error("Step 4b (review) interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "4b_review")
+            sys.exit(130)
         except Exception as exc:
             rv_log.error("Step 4b (review) failed: %s", exc)
             mark_job_failed(job_dir, "4b_review", exc)
@@ -666,6 +797,10 @@ def main() -> None:
     mu_log = step_logger("mute")
     try:
         dialog_censored_out = run_mute(job_dir, dialog_out, cfg, mu_log)
+    except KeyboardInterrupt:
+        mu_log.error("Step 5 interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "5_mute")
+        sys.exit(130)
     except Exception as exc:
         mu_log.error("Step 5 failed: %s", exc)
         mark_job_failed(job_dir, "5_mute", exc)
@@ -675,6 +810,10 @@ def main() -> None:
     rc_log = step_logger("recombine")
     try:
         audio_censored_out = run_recombine(job_dir, dialog_censored_out, score_sfx_out, cfg, rc_log)
+    except KeyboardInterrupt:
+        rc_log.error("Step 6 interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "6_recombine")
+        sys.exit(130)
     except Exception as exc:
         rc_log.error("Step 6 failed: %s", exc)
         mark_job_failed(job_dir, "6_recombine", exc)
@@ -684,6 +823,10 @@ def main() -> None:
     en_log = step_logger("encode")
     try:
         audio_encoded_out = run_encode(job_dir, video, audio_censored_out, cfg, en_log)
+    except KeyboardInterrupt:
+        en_log.error("Step 6b interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "6b_encode")
+        sys.exit(130)
     except Exception as exc:
         en_log.error("Step 6b failed: %s", exc)
         mark_job_failed(job_dir, "6b_encode", exc)
@@ -693,6 +836,10 @@ def main() -> None:
     mx_log = step_logger("mux")
     try:
         output_video = run_mux(job_dir, video, audio_encoded_out, OUTPUT_DIR, cfg, mx_log)
+    except KeyboardInterrupt:
+        mx_log.error("Step 7 interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "7_mux")
+        sys.exit(130)
     except Exception as exc:
         mx_log.error("Step 7 failed: %s", exc)
         mark_job_failed(job_dir, "7_mux", exc)
@@ -756,9 +903,11 @@ def main() -> None:
     log.info("  Final output     : %s", output_video)
     log.info("")
     log.info("  Other kept outputs:")
-    # transcript*.json, matches.json, review.json, and censor_log.json are
-    # always kept regardless of keep_intermediates (design doc §6) and are
-    # safe to log unconditionally. So is this run's own log file --
+    # transcript_out (transcript.json — the merged file, not the per-segment
+    # transcript_NN.json it was built from), matches.json, review.json, and
+    # censor_log.json are always kept regardless of keep_intermediates
+    # (design doc §6) and are safe to log unconditionally. So is this run's
+    # own log file --
     # logs/*.log is never deleted by any step, for the same reason
     # censor_log.json isn't (see utils.attach_file_logging). dialog.wav,
     # score_sfx.wav, dialog_censored.wav, audio_censored.wav, and

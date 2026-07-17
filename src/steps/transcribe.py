@@ -89,15 +89,21 @@ def transcribe(
         return _transcripts_from_state(job_dir, state)
 
     # ── Config ────────────────────────────────────────────────────────────────
-    model_name   = cfg_get(cfg, "whisperx", "model",        default="large-v2")
-    language     = cfg_get(cfg, "whisperx", "language",     default="en") or None
-    batch_size   = int(cfg_get(cfg, "whisperx", "batch_size",   default=4))
-    beam_size    = int(cfg_get(cfg, "whisperx", "beam_size",    default=5))
-    device       = cfg_get(cfg, "whisperx", "device",       default="cpu")
-    # compute_type: int8 for CPU (faster inference, lower RAM); float16 for GPU.
-    # Derived from device unless overridden in config.
-    compute_type = cfg_get(cfg, "whisperx", "compute_type",
-                           default="int8" if device == "cpu" else "float16")
+    model_name   = cfg_get(cfg, "whisperx", "model")
+    # allow_null=True: config.yaml documents `language: null` as meaning
+    # "auto-detect" (distinct from the key being absent entirely, which is
+    # a ConfigError like any other missing required setting). See
+    # utils.cfg_get()'s docstring.
+    language     = cfg_get(cfg, "whisperx", "language", allow_null=True)
+    batch_size   = int(cfg_get(cfg, "whisperx", "batch_size"))
+    beam_size    = int(cfg_get(cfg, "whisperx", "beam_size"))
+    device       = cfg_get(cfg, "whisperx", "device")
+    # compute_type: int8 for CPU (faster inference, lower RAM); float16 for
+    # GPU -- see config.yaml's own comment for the full tradeoff. Read
+    # directly from config.yaml rather than derived from `device`: if you
+    # change device, remember to set compute_type to match (config.yaml
+    # ships with int8 + cpu, its matching pair, out of the box).
+    compute_type = cfg_get(cfg, "whisperx", "compute_type")
 
     n = len(stem_pairs)
     log.info("Step 3 — WhisperX transcription")

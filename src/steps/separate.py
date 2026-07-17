@@ -135,9 +135,9 @@ def separate(
         log.info("Step 2 — ↩  already complete, loading stems from job.json.")
         return _stems_from_state(job_dir, state)
 
-    model  = cfg_get(cfg, "demucs", "model",  default="htdemucs_ft")
-    shifts = int(cfg_get(cfg, "demucs", "shifts", default=1))
-    device = cfg_get(cfg, "demucs", "device", default="cpu")
+    model  = cfg_get(cfg, "demucs", "model")
+    shifts = int(cfg_get(cfg, "demucs", "shifts"))
+    device = cfg_get(cfg, "demucs", "device")
     n      = len(segments)
 
     log.info("Step 2 — Demucs source separation")

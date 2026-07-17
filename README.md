@@ -175,7 +175,8 @@ audio:
   segment_size_sec: 1800   # 30 min per segment; reduce if OOM
 
 censoring:
-  method: mute         # mute | beep
+  method: mute         # mute | beep (beep is not yet implemented -- selecting
+                       # it fails the run at Step 5 with a clear error)
   padding_ms: 50       # silence added before/after each word (ms)
 
 output:
@@ -235,7 +236,7 @@ Console timestamps automatically match this machine's local clock: `hush.sh` det
 
 ## Job History
 
-Every run creates a job record under `~/.local/share/profanity-hush/jobs/`, in a folder named `YYYYMMDD_HHMMSS_<movie-slug>_<hex8>` (the timestamp is your local time — see [Logging](#logging) above — and the slug makes it easy to spot the right job by filename without opening anything). Transcript JSON files and the censor log are always preserved, along with `dialog.wav` and `score_sfx.wav` (the pre-mute audio stems) — together these are what makes [correcting a mistake](#correcting-mistakes) after watching the film fast, without repeating the expensive separation and transcription steps.
+Every run creates a job record under `~/.local/share/profanity-hush/jobs/`, in a folder named `YYYYMMDD_HHMMSS_<movie-slug>_<hex8>` (the timestamp is your local time — see [Logging](#logging) above — and the slug makes it easy to spot the right job by filename without opening anything). The merged `transcript.json` and the censor log are always preserved, along with `dialog.wav` and `score_sfx.wav` (the pre-mute audio stems) — together these are what makes [correcting a mistake](#correcting-mistakes) after watching the film fast, without repeating the expensive separation and transcription steps. (The per-segment `transcript_NN.json` files WhisperX writes on the way to `transcript.json` are cleaned up once merged, same as the other per-segment intermediates — pass `--keep-tmp` if you want to inspect them.)
 
 Large intermediate WAV files are deleted by default once each is no longer needed. Pass `--keep-tmp` to retain all of them (including ones not needed for corrections); see `output.keep_correction_artifacts` in `config.yaml` to control just the two needed for corrections independently.
 
@@ -290,9 +291,16 @@ This is the expected day-to-day workflow: run unattended, watch the film (maybe 
   "start": 5275.01,
   "start_hms": "1:27:55.010",
   "end": 5275.23,
-  "end_hms": "1:27:55.230"
+  "end_hms": "1:27:55.230",
+  "padded_start": 5274.96,
+  "padded_start_hms": "1:27:54.960",
+  "padded_end": 5275.28,
+  "padded_end_hms": "1:27:55.280",
+  "score": 0.97
 }
 ```
+
+(`padded_start`/`padded_end` above reflect this job's `padding_ms: 50` default — `start`/`end` widened by 0.05s on each side, which is what's actually muted; `score` is WhisperX's word-level confidence for the transcribed word, shown here as a representative value.)
 
 (In this real example, WhisperX had transcribed the line "Ned! Land!" as "What the hell" — a transcription error, not a word-list problem; the word list correctly matched the literal text WhisperX produced.) Then:
 
@@ -361,3 +369,9 @@ RAM size alone doesn't fully protect against this — it depends on what else is
 - **Separation artifacts:** Demucs is excellent but not perfect — some bleed between stems is expected, especially in dense action scenes.
 - **Context-blind matching:** The word list has no understanding of usage context. `=dick` / `Dick` case distinction is the primary mitigation; interactive review handles the rest.
 - **v1 processes only the primary audio track.** Commentary tracks and alternate language tracks in the source container are dropped.
+
+---
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0). In particular, this means that if you run a modified version of this project as a network service that other users interact with, you must make the source of your modified version available to them under the same license — see the full license text for the precise terms.
