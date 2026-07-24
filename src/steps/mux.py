@@ -271,21 +271,82 @@ def mux(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _split_trailing_tech_tags(stem: str) -> "tuple[str, str]":
+    """
+    Split a filename stem into (title_part, tech_part).
+
+    tech_part is the maximal run of *trailing* dot-separated segments
+    that are each non-empty and contain no whitespace -- the shape a real
+    technical-tag chain always has ("sd.hevc", "1080p.hevc", ...).
+    title_part is everything before that run, dots and all.
+
+    This deliberately is not just "split on the first '.'": an episode
+    title can itself contain literal dots, e.g. an ellipsis --
+    "Lights, Camera... Homicidio" -- and the first "." in the full stem
+    would land in the middle of "Camera...", not at the actual
+    title/tech-tags boundary. Scanning from the *end* instead, a segment
+    that's empty (consecutive dots, i.e. the inside of "...") or that
+    contains a space immediately stops the scan and is left on the title
+    side, since neither shape is ever a real technical tag:
+
+        "Psych (2006) - s02e13 - Lights, Camera... Homicidio.sd.hevc"
+        -> ("Psych (2006) - s02e13 - Lights, Camera... Homicidio", "sd.hevc")
+
+    Returns (stem, "") unchanged if no trailing technical-tag run is
+    found at all (e.g. no dots in the stem, or the segment right before
+    the last dot still has a space in it -- there's nothing purely
+    technical to split off).
+    """
+    parts = stem.split(".")
+    k = len(parts)
+    while k > 0 and parts[k - 1] != "" and not re.search(r"\s", parts[k - 1]):
+        k -= 1
+    if k == len(parts):
+        return stem, ""
+    return ".".join(parts[:k]), ".".join(parts[k:])
+
+
 def _output_path(video_path: Path, output_dir: Path, cfg: dict, out_format: str) -> Path:
     """
     Build the final output filename, per output.naming_style:
 
     plex_edition (default) -- a Plex-friendly {edition-Name} tag (see
-      https://support.plex.tv/articles/multiple-editions/), inserted right
-      after the "(YYYY)" release-year portion of the filename if one is
-      present, so Plex shows the censored file as a selectable Edition of
-      the same movie instead of an unrelated second item:
-        "Movie (1986).sd.hevc.mkv" -> "Movie (1986) {edition-Hushed}.sd.hevc.mkv"
-      Plex's own docs note tag order doesn't matter to its parser, but
-      placing it right after the year (rather than at the very end) is
-      the clearer convention when other dot-separated tags follow. Falls
-      back to appending the tag at the very end -- still valid Plex
-      syntax -- if no "(YYYY)" pattern is found at all.
+      https://support.plex.tv/articles/multiple-editions/). Movies and TV
+      episodes use different insertion points, since the two naming
+      conventions put the year in different places relative to the part
+      Plex actually expects the edition tag to follow:
+
+      Movies -- inserted right after the "(YYYY)" release-year portion of
+        the filename if one is present, so Plex shows the censored file
+        as a selectable Edition of the same movie instead of an unrelated
+        second item:
+          "Movie (1986).sd.hevc.mkv" -> "Movie (1986) {edition-Hushed}.sd.hevc.mkv"
+        Falls back to appending the tag at the very end -- still valid
+        Plex syntax -- if no "(YYYY)" pattern is found at all.
+
+      TV episodes -- detected via a "sNNeNN"-style season/episode marker
+        (e.g. "s02e01"), which the "(YYYY)" test alone can't distinguish
+        from a movie: a TV episode's "(YYYY)" belongs to the *series*,
+        right at the front of the filename, nowhere near the episode
+        title -- inserting there would land the tag in the middle of the
+        filename instead of at the end of the title, e.g. the wrong
+        "Psych (2006) {edition-Hushed} - s02e01 - American Duos.sd.hevc.mkv"
+        rather than the correct
+        "Psych (2006) - s02e01 - American Duos {edition-Hushed}.sd.hevc.mkv".
+        For these, the tag is inserted at the end of the episode title
+        instead -- i.e. right before any dot-separated technical tags
+        (resolution, codec, etc.) that follow it. Falls back to
+        appending at the very end if there are no technical tags after
+        the title at all.
+
+        The boundary isn't simply "the first '.' in the stem" -- an
+        episode title can itself contain literal dots (an ellipsis, e.g.
+        "Lights, Camera... Homicidio"), and splitting on the first one
+        would cut the tag into the middle of the title instead of after
+        it. See _split_trailing_tech_tags() for how the real boundary is
+        found:
+          "Psych (2006) - s02e13 - Lights, Camera... Homicidio.sd.hevc.mkv"
+          -> "Psych (2006) - s02e13 - Lights, Camera... Homicidio {edition-Hushed}.sd.hevc.mkv"
 
     suffix -- the original v1 behaviour: a plain suffix appended before
       the extension, no Plex Edition semantics.
@@ -301,11 +362,24 @@ def _output_path(video_path: Path, output_dir: Path, cfg: dict, out_format: str)
     if naming_style == "plex_edition":
         edition_name = str(cfg_get(cfg, "output", "edition_name"))
         tag = f"{{edition-{edition_name}}}"
-        year_match = re.search(r"\(\d{4}\)", stem)
-        if year_match:
-            new_stem = f"{stem[:year_match.end()]} {tag}{stem[year_match.end():]}"
+
+        episode_match = re.search(r"(?i)\bs\d{1,2}e\d{1,3}\b", stem)
+        if episode_match:
+            # TV episode: the "(YYYY)" (if any) belongs to the series
+            # name up front, not the episode title, so anchor on the
+            # trailing technical-tag chain instead -- whatever precedes
+            # it is the full "Series (Year) - sNNeNN - Title" portion,
+            # and the tag belongs right after that, not after the year
+            # alone. Not just "the first '.' in the stem" -- the title
+            # itself may contain dots (see _split_trailing_tech_tags).
+            title_part, tech_part = _split_trailing_tech_tags(stem)
+            new_stem = f"{title_part} {tag}" + (f".{tech_part}" if tech_part else "")
         else:
-            new_stem = f"{stem} {tag}"
+            year_match = re.search(r"\(\d{4}\)", stem)
+            if year_match:
+                new_stem = f"{stem[:year_match.end()]} {tag}{stem[year_match.end():]}"
+            else:
+                new_stem = f"{stem} {tag}"
     elif naming_style == "suffix":
         suffix = str(cfg_get(cfg, "output", "suffix"))
         new_stem = f"{stem}{suffix}"
