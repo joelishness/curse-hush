@@ -20,7 +20,7 @@ Optionally: cross-reference an SRT subtitle file (Phase 3) or pause for interact
 ## Requirements
 
 - **Docker** — tested on Linux (Manjaro/Arch and Ubuntu). Docker Desktop on macOS and Windows should work but is untested.
-- **~3 GB of free disk** for model weights (downloaded on first run, cached afterward)
+- **~4-5 GB of free disk** for model weights (downloaded on first run, cached afterward) — includes MFA's pretrained models now that it's the default alignment backend
 - **16 GB RAM** recommended — Demucs is memory-hungry. See [Expected Runtimes](#expected-runtimes).
 - No GPU needed.
 
@@ -36,7 +36,7 @@ cd profanity-hush
 docker build -t profanity-hush .
 ```
 
-Image size is approximately 1.1 GB. Model weights (~2–3 GB) are downloaded on the first run and cached — always use a persistent cache directory (see below).
+Image size is approximately 1.5 GB (includes the conda environment for MFA, the default alignment backend). Model weights (~4-5 GB total, including MFA's own) are downloaded on the first run and cached — always use a persistent cache directory (see below).
 
 Using `docker compose`:
 
@@ -170,6 +170,12 @@ demucs:
 whisperx:
   model: large-v2      # large-v2 (recommended) | medium | small
   language: en         # ISO 639-1; null for auto-detect
+
+alignment:
+  backend: mfa         # mfa (default, validated) | whisperx (fallback / opt-out).
+                       # Fixes word *timing* for words already recognized; does not
+                       # change what gets recognized -- see docs/timestamp-drift-investigation.md
+                       # for the validated before/after numbers and what's still open.
 
 audio:
   segment_size_sec: 1800   # 30 min per segment; reduce if OOM
@@ -369,6 +375,7 @@ RAM size alone doesn't fully protect against this — it depends on what else is
 - **Separation artifacts:** Demucs is excellent but not perfect — some bleed between stems is expected, especially in dense action scenes.
 - **Context-blind matching:** The word list has no understanding of usage context. `=dick` / `Dick` case distinction is the primary mitigation; interactive review handles the rest.
 - **v1 processes only the primary audio track.** Commentary tracks and alternate language tracks in the source container are dropped.
+- **Densely repetitive dialogue can still slip through, regardless of alignment backend.** A line repeated verbatim multiple times in a row (confirmed on one real film) can cause WhisperX's own recognition to drop it entirely — no alignment backend can place a word that was never recognized as text in the first place. See `docs/timestamp-drift-investigation.md` for the one specific case this was traced down to, and why it's now understood to be a recognition gap rather than a timing one.
 
 ---
 

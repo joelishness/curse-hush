@@ -81,11 +81,111 @@ RUN pip install --no-cache-dir \
 # rapidfuzz : fuzzy string matching for SRT cross-reference
 # tqdm      : progress bars for long CPU runs
 # pyyaml    : config.yaml parsing
+# praatio   : reads MFA's .TextGrid output (steps/align_mfa.py) -- pure
+#             Python, pip-installable, no conda/kalpy dependency itself
 RUN pip install --no-cache-dir \
         pysrt \
         rapidfuzz \
         tqdm \
-        pyyaml
+        pyyaml \
+        praatio
+
+# ── Montreal Forced Aligner (default alignment.backend, see config.yaml) ───
+# Used in place of whisperx.align() to fix a real, confirmed failure mode:
+# whisperx's wav2vec2/CTC aligner faithfully aligns words *within whatever
+# segment boundaries WhisperX's own transcribe() already committed to* --
+# so if that upstream segment timing is wrong (observed directly: a skipped
+# stretch of real dialogue can leave WhisperX several seconds off for
+# everything after it), whisperx.align() reproduces the error rather than
+# catching it. MFA instead runs a whole-file HMM-GMM search against known
+# text, independent of WhisperX's ~30s decode-chunk boundaries entirely --
+# see docs/timestamp-drift-investigation.md and steps/align_mfa.py's module
+# docstring for the full case this was built against and the validated
+# before/after numbers, not just the original finding.
+#
+# MFA depends on kalpy (Kaldi Python bindings): a compiled extension only
+# distributed via conda-forge. Confirmed directly -- `pip install
+# montreal-forced-aligner` installs and its pure-Python dependencies
+# resolve fine, but importing it fails at runtime with "ModuleNotFoundError:
+# No module named '_kalpy'". conda-forge is the only real path.
+#
+# Installed into its own conda env (not merged into the pip/torch stack
+# above) specifically so MFA's own pinned dependency versions can never
+# collide with whisperx/demucs/torch's -- these are two isolated Python
+# environments on the same image, bridged only by steps/align_mfa.py
+# invoking `conda run -n mfa mfa ...` for each call (see that file's
+# _mfa_cmd()), never by merging them onto one shared PATH -- an earlier
+# version of this tried that and it broke Step 2's own demucs invocation.
+#
+# This block is required for the default config (alignment.backend: mfa).
+# Only skip it (comment this block out and rebuild) if you're setting
+# alignment.backend: whisperx everywhere and deliberately accepting the
+# drift behavior documented above -- nothing else in this image depends on
+# it either way. Adds roughly 300-500MB for the conda env + MFA software
+# itself; the larger pretrained-model download (~1-2GB) happens lazily on
+# first real use, into /cache, not here -- see the MFA_ROOT_DIR comment
+# below for why baking it into the image wouldn't actually help anyway.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bzip2 \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+        -O /tmp/miniforge.sh \
+    && bash /tmp/miniforge.sh -b -p /opt/conda \
+    && rm /tmp/miniforge.sh
+
+RUN /opt/conda/bin/conda create -y -n mfa -c conda-forge montreal-forced-aligner \
+    && /opt/conda/bin/conda clean -afy
+
+# MFA_ROOT_DIR: where MFA stores its downloaded models, its alignment
+# database, and per-run working state.
+#
+# Pointed at /cache (the same bind-mounted, host-persistent volume
+# TORCH_HOME/HF_HOME/NLTK_DATA already use below), NOT baked into the image
+# under a path like /opt/mfa_root the way an earlier version of this change
+# tried. Two separate problems with that earlier approach, not one:
+#
+#   1. Model downloads and server/database init were originally RUN here,
+#      at build time -- which runs as root. MFA's database backend calls
+#      PostgreSQL's initdb, which unconditionally refuses to run as root
+#      (confirmed directly: this is exactly the "cannot be run as root"
+#      error that approach produced). Building as some other *fixed*
+#      non-root user wouldn't actually fix it either -- hush.sh's
+#      containers run as an arbitrary, host-determined UID chosen at
+#      `docker run` time (`--user "$(id -u):$(id -g)"`, see "Support
+#      running as an arbitrary host UID" below), essentially never the
+#      same as whatever UID a Dockerfile RUN step used. PostgreSQL data
+#      directories are tied to the UID that initialized them, so this
+#      needs to happen at actual container-run time, as whatever UID the
+#      container really is -- which isn't knowable at build time at all.
+#      steps/align_mfa.py's _ensure_mfa_ready() does this lazily, once,
+#      the first time a job actually needs MFA, as the correct UID by
+#      construction, and is idempotent via its own marker file.
+#   2. A path baked into the image doesn't persist across `docker run`
+#      invocations the way a bind-mounted volume does -- so even with the
+#      UID problem solved, baking downloads in at build time would still
+#      mean every single job re-downloads and re-initializes from
+#      scratch, since each container gets a fresh copy of the image's own
+#      filesystem layer. Pointing at /cache instead means this cost is
+#      paid once, ever (whenever the first job that uses alignment.backend:
+#      mfa happens to run), exactly matching how whisperx's own models
+#      already behave via TORCH_HOME/HF_HOME below -- not a new pattern,
+#      the same one.
+ENV MFA_ROOT_DIR=/cache/mfa
+
+# Deliberately NOT adding /opt/conda/envs/mfa/bin to PATH here. A conda env's
+# bin/ contains a full, separate Python installation -- doing that doesn't
+# just make `mfa` discoverable, it shadows `python`/`pip` for every other
+# subprocess call anywhere in this image that invokes them by bare name,
+# since PATH is searched in order. Confirmed directly: an earlier version of
+# this change did exactly that and broke Step 2's own demucs invocation,
+# which resolved "python" to the MFA env's interpreter instead of the main
+# pip-installed one. steps/align_mfa.py instead calls `conda run -n mfa
+# mfa ...` for every invocation, using these two coordinates -- see that
+# file's _mfa_cmd() for the full reasoning.
+ENV MFA_CONDA_EXE=/opt/conda/bin/conda
+ENV MFA_CONDA_ENV=mfa
 
 # ── Redirect all ML cache dirs to /cache (bind-mounted from host) ───────────
 # This ensures model weights survive container restarts and aren't
@@ -104,7 +204,7 @@ ENV XDG_CACHE_HOME=/cache
 # hush.sh runs the container with `--user "$(id -u):$(id -g)"` so that files
 # written into the bind-mounted /jobs, /cache, and /output volumes land on
 # the host already owned by the invoking user instead of root.  That UID/GID
-# has no /etc/passwd entry inside the image, so three things need handling:
+# has no /etc/passwd entry inside the image, so four things need handling:
 #   1. $HOME must point somewhere writable regardless of UID — anything that
 #      isn't already redirected above (matplotlib font cache, stray configs)
 #      falls back to $HOME.  World-writable + sticky bit, same pattern as
@@ -116,7 +216,19 @@ ENV XDG_CACHE_HOME=/cache
 #   3. Every file under /app must actually be *readable*, and every
 #      directory under it *traversable*, by an arbitrary non-root UID/GID —
 #      see the chmod after the COPY instructions below.
-RUN mkdir -p /home/hush && chmod 1777 /home/hush
+#   4. PostgreSQL's initdb (alignment.backend: mfa's database server) does
+#      its own getpwuid()-style lookup on startup and refuses outright if it
+#      can't resolve the current UID to a name — confirmed directly against
+#      a real run: "initdb: could not look up effective user ID N: user
+#      does not exist". Nothing else in this pipeline needs a real /etc/passwd
+#      entry (which is exactly why this wasn't already a solved problem when
+#      MFA was added), but this one thing does, unconditionally, with no
+#      config flag to turn it off. entrypoint.sh patches one in dynamically
+#      at container start, for whatever UID this run actually turns out to
+#      be — the only UID that could possibly be right, since it isn't known
+#      until then. Only possible because /etc/passwd is made writable by
+#      anyone below, same reasoning as /home/hush being 1777.
+RUN mkdir -p /home/hush && chmod 1777 /home/hush && chmod 666 /etc/passwd
 ENV HOME=/home/hush
 ENV PYTHONDONTWRITEBYTECODE=1
 
@@ -160,7 +272,19 @@ COPY config/word_list.txt  /app/defaults/word_list.txt
 #            so plain .py files don't spuriously become "executable".
 RUN chmod -R a+rX /app
 
+COPY entrypoint.sh /app/entrypoint.sh
+# 755, not +x: chmod +x is additive -- it only ever adds the execute bit,
+# never touches read. If entrypoint.sh's permissions on the host (wherever
+# it was saved/created before COPY) didn't already include read access for
+# "other", +x alone produces a file that's executable but not *readable* by
+# the non-root UID the container actually runs as -- which fails with
+# "cannot open ... Permission denied" (confirmed directly against a real
+# run), since the shell interpreting the script needs read access to it,
+# not just permission to start executing it. An absolute mode doesn't
+# depend on whatever the source file's permissions happened to be.
+RUN chmod 755 /app/entrypoint.sh
+
 # Declare mount points (documentation only — actual bind mounts are in hush.sh)
 VOLUME ["/input", "/output", "/config", "/cache", "/jobs"]
 
-ENTRYPOINT ["python", "/app/pipeline.py"]
+ENTRYPOINT ["/app/entrypoint.sh"]

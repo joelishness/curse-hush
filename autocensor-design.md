@@ -54,7 +54,7 @@ Automate the end-to-end process of censoring profanity from a video file, replac
 | Extract audio | `ffmpeg` | system package in container; downmixes multi-channel to stereo |
 | Segment audio | `ffmpeg` | splits stereo WAV into fixed-size segments if duration exceeds threshold; passthrough if not |
 | Separate dialog from score/SFX | `demucs` (`htdemucs_ft` model) | pip inside container; MIT licensed; runs per-segment |
-| Transcribe + word timestamps | `whisperx` | pip inside container; wraps faster-whisper + wav2vec2 |
+| Transcribe + word timestamps | `whisperx` + MFA | whisperx (pip) wraps faster-whisper for recognition; word-level timing then comes from Montreal Forced Aligner (conda, default) or whisperx's own wav2vec2 alignment (fallback) — see §13.8 |
 | SRT cross-reference | custom Python module | uses `pysrt` + fuzzy matching |
 | Interactive review | custom Python module | terminal UI; present flagged words for approval before muting |
 | Mute profanity in dialog stem | `ffmpeg` volume filter | generated filter string from approved transcript entries |
@@ -70,6 +70,8 @@ Demucs is the initial implementation chosen for v1. The pipeline architecture in
 WhisperX provides **word-level timestamps** (not just segment-level), which is essential for precise muting. It uses `faster-whisper` under the hood for speed, plus a `wav2vec2` phoneme alignment pass for accurate per-word start/end times. Plain Whisper only provides segment-level timestamps, which would require muting entire phrases.
  
 WhisperX is the initial transcription backend selected for v1. Future implementations may replace it provided they can produce equivalent word-level timestamp data.
+
+**Word-level *alignment* is its own swappable sub-stage as of a later revision**, distinct from recognition itself — see §13.8. WhisperX's own `faster-whisper` call still handles recognition (turning audio into text) in both configurations; what changed is which engine turns that recognized text into word-level timestamps. `alignment.backend: mfa` (Montreal Forced Aligner, default) or `whisperx` (the original wav2vec2/CTC pass, kept as a fallback) — found necessary after whisperx's own alignment turned out to silently inherit multi-second timing errors from its own upstream segment boundaries in a way MFA's whole-file alignment approach doesn't. Exactly the kind of backend substitution §3.5 anticipated, just one layer more granular than "swap WhisperX for something else entirely."
  
 ### 3.5 Backend Abstraction
  
@@ -80,7 +82,8 @@ The pipeline is designed around stable interfaces between stages:
 | Function | Interface Requirement | V1 Implementation |
 |----------|----------------------|-------------------|
 | Audio Separation | Produce dialog stem and background stem from source audio | Demucs |
-| Speech Recognition | Produce transcript with word-level timestamps and confidence scores | WhisperX |
+| Speech Recognition | Produce recognized text, roughly time-scoped | WhisperX (`faster-whisper`) |
+| Word-Level Alignment | Turn recognized text into precise per-word start/end timestamps | Montreal Forced Aligner (default) / whisperx.align() (fallback) — §13.8 |
 | Subtitle Alignment | Produce corrected transcript timing data | Custom Python module |
  
 Future versions may substitute alternative implementations provided they satisfy the same interface contracts.
@@ -274,10 +277,16 @@ profanity-hush/
 ├── Dockerfile
 ├── docker-compose.yml          # convenience wrapper (workstation use)
 ├── hush.sh                     # host-side entry point
+├── entrypoint.sh                # container entrypoint; patches /etc/passwd for hush.sh's
+│                                #   arbitrary --user UID before exec-ing pipeline.py — see §13.8
 │
 ├── config/
 │   ├── config.yaml             # pipeline settings (see §7)
 │   └── word_list.txt           # word/phrase match list; see §7.2 for format notation
+│
+├── docs/
+│   └── timestamp-drift-investigation.md   # alignment.backend rationale + validated
+│                                #   results — see §13.8
 │
 ├── src/
 │   ├── pipeline.py             # orchestrator; runs steps 1a–7 in order; manages job state
@@ -285,7 +294,11 @@ profanity-hush/
 │   │   ├── extract.py          # step 1a+1b: bitstream copy + stereo downmix
 │   │   ├── segment.py          # step 1c: split audio_stereo.wav into segments
 │   │   ├── separate.py         # step 2: demucs wrapper (per-segment)
-│   │   ├── transcribe.py       # step 3: whisperx wrapper (per-segment)
+│   │   ├── transcribe.py       # step 3: whisperx wrapper (per-segment); recognition always via
+│   │   │                       #   whisperx, word-level alignment via align_mfa.py (default) or
+│   │   │                       #   whisperx.align() (fallback) — see §13.8
+│   │   ├── align_mfa.py        # Montreal Forced Aligner backend for step 3's alignment
+│   │   │                       #   sub-stage — not a numbered pipeline step of its own; see §13.8
 │   │   ├── merge.py            # step 3b: apply global offsets; concatenate stems + transcripts
 │   │   ├── align_srt.py        # step 4: optional SRT cross-reference — Phase 3 (§1, §10),
 │   │   │                       #   NOT YET IMPLEMENTED / not present in this repo yet;
@@ -311,7 +324,7 @@ profanity-hush/
 └── README.md
 ```
  
-`align_srt.py` and `tests/` above are not in the current tree — the repo contains no `tests/` directory and no test suite of any kind yet. Everything else in this listing exists in the repo as shown, including `steps/encode.py` (Step 6b), which earlier revisions of this tree omitted despite being implemented — see the module's own spec in §8.
+`align_srt.py` and `tests/` above are not in the current tree — the repo contains no `tests/` directory and no test suite of any kind yet. Everything else in this listing exists in the repo as shown, including `steps/encode.py` (Step 6b) and `steps/align_mfa.py`/`entrypoint.sh`/`docs/` (added together — see §13.8), all of which earlier revisions of this tree omitted despite being implemented.
  
 ### Job Store Design Principle
  
@@ -670,17 +683,27 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
 }
 ```
 - **Field notes:**
-  - `score` is WhisperX's per-word confidence (0–1). This is the field used by `min_confidence_for_prompt` in interactive review. It is **not** renamed to `confidence` — use the field name as WhisperX produces it.
+  - `score` is WhisperX's per-word confidence (0–1) when `alignment.backend: whisperx`. This is the field used by `min_confidence_for_prompt` in interactive review. It is **not** renamed to `confidence` — use the field name as WhisperX produces it. **With `alignment.backend: mfa` (default)**, MFA's own alignment doesn't produce a per-word confidence value the same way — `score` is instead WhisperX's *segment-level* confidence, applied to every word MFA places within that segment (coarser than the whisperx path's true per-word granularity; see `steps/align_mfa.py`). `min_confidence_for_prompt` still works against this value either way, just at a different resolution depending on backend.
   - `segment_start_offset` records the segment's global start position in seconds; used by Step 3b to compute global timestamps.
   - `word` values preserve WhisperX's original casing and include attached punctuation (e.g. `"shit,"`, `"warning."`). **Do not lowercase.** Punctuation is stripped at match time in `steps/matching.py` (called once, from `steps/review.py`'s flag phase — see §4), not at write time here.
-- **Tool:** whisperx Python API
-- Uses `align()` for word-level timestamps after initial transcription pass
-- Preserves WhisperX's original word casing in the JSON output. **Do not lowercase words before writing.** Original casing is required for case-sensitive word list entries (see §7.2). WhisperX naturally capitalizes proper nouns and sentence-initial words, which is the signal used by `=`-prefixed entries in the word list to distinguish proper nouns from profanity (e.g. `Dick` vs `dick`).
+- **Tool:** whisperx Python API for recognition, always. Word-level alignment then comes from **either** Montreal Forced Aligner (`steps/align_mfa.py`, default) **or** whisperx's own `align()` (fallback, or if `alignment.backend: whisperx` is set directly) — see §13.8 for the full rationale, engineering history, and validated results. Falls back to whisperx per-segment on MFA failure if `alignment.mfa.fallback_to_whisperx` is true (default).
+- Preserves WhisperX's original word casing in the JSON output. **Do not lowercase words before writing.** Original casing is required for case-sensitive word list entries (see §7.2). WhisperX naturally capitalizes proper nouns and sentence-initial words, which is the signal used by `=`-prefixed entries in the word list to distinguish proper nouns from profanity (e.g. `Dick` vs `dick`). MFA's word tier preserves whatever casing its input text (WhisperX's own recognized text) already had, so this holds regardless of alignment backend.
 - **Logging (info level):**
   - Segment index and duration
   - Wall-clock time on completion
   - Word count in segment
   - Cumulative progress (e.g. `[2/4 segments transcribed]`)
+
+### `steps/align_mfa.py`
+Not a numbered pipeline step of its own — a backend for Step 3's word-level alignment sub-stage, invoked from `steps/transcribe.py` when `alignment.backend: mfa` (default). Full rationale, the six-problem engineering path to getting it actually working, and validated results (14 of 17 originally-confirmed drift cases fixed; 90→11 fully-missed SRT lines on the same test film) are in §13.8 and `docs/timestamp-drift-investigation.md` — this entry is the module-level reference, not the narrative.
+- **Input:** one `dialog_NN.wav` segment + that segment's WhisperX-recognized text (already in memory in `steps/transcribe.py`, not read from a file)
+- **Output:** `list[dict]` in the same `{"word", "start", "end", "score"}` shape `steps/transcribe.py` already writes to `transcript_NN.json` — this module has no on-disk output format of its own; it's a drop-in alternative to whisperx's own `align()` call, not a new pipeline artifact.
+- **Tool:** `mfa align_one`, invoked via `conda run -n mfa mfa ...` (never via a shared `PATH` — see the Dockerfile's own comment on why that specifically broke Step 2's demucs invocation the first time this was tried) in a separate conda environment from the rest of this pipeline's pip/torch stack.
+- **First-use setup** (`_ensure_mfa_ready()`): downloads MFA's pretrained acoustic/dictionary/G2P models and initializes its database, lazily, on first real use per container lifetime — deliberately not at Docker build time; PostgreSQL's `initdb` (which MFA's database backend calls) refuses to run as root, and the only UID that could possibly be correct here is whatever the container's real runtime UID turns out to be, which isn't known until then. Idempotent via its own marker file under `MFA_ROOT_DIR` (`/cache/mfa` — the same persistent, bind-mounted volume `TORCH_HOME`/`HF_HOME` already use, so this cost is paid once ever, not once per job).
+- **Requires `entrypoint.sh`** (see repository structure above): PostgreSQL also does its own `getpwuid()`-style lookup on the running UID and refuses outright if it can't resolve one to a name — which an arbitrary `--user UID:GID` with no `/etc/passwd` entry (hush.sh's normal runtime model, and fine for everything else in this pipeline) never can. `entrypoint.sh` patches one in dynamically before `pipeline.py` ever runs.
+- **Falls back to whisperx.align() per-segment** on any MFA failure (subprocess error, no output TextGrid found, alignment search failure) if `alignment.mfa.fallback_to_whisperx` is true (default) — logged as a `WARN`-level message naming the segment and reason, not silent.
+- **`beam`/`retry_beam`** (config.yaml, default 400/1000): MFA's own defaults (100/400) target utterances under 30 seconds; every call this module makes hands `align_one` an entire ~30-*minute* segment as one utterance. Confirmed directly, not assumed — a real run failed at the default with `Could not align the file with the current beam size (100)`, and 400/1000 (MFA's own documented example for "much longer sequences") resolved it.
+
 ### `steps/merge.py` *(Step 3b)*
 - **Input:** list of `transcript_NN.json` files and their segment offsets; `dialog_NN.wav` files; `score_sfx_NN.wav` files
 - **Output:** `transcript.json` (global timestamps), `dialog.wav`, `score_sfx.wav`
@@ -1250,3 +1273,14 @@ hush.sh --analyze movie.mkv
 >  WhisperX: 45m
  
 This would allow users to review likely results before committing to a full render.
+
+### 13.8 Alignment Backend (MFA) — **Implemented**
+
+Step 3's word-level timing came from `whisperx.align()` (wav2vec2/CTC) exclusively through earlier revisions of this pipeline. Found, via a real case on a real film rather than by inspection, to have a genuine failure mode: it aligns *within* whatever segment boundary WhisperX's own `transcribe()` pass already committed to, so an upstream segment-timing error — confirmed directly: a stretch of real dialogue producing zero recognized text, followed by WhisperX's own internal clock understating how much real time that untranscribed stretch actually took — propagates straight through the alignment step rather than being caught by it. The result: a transcript word can be correctly matched against the word list and still get muted several real seconds away from where it's actually spoken, because the mute lands wherever the (wrong) timestamp says to.
+
+**Fix:** `alignment.backend` (`config.yaml`) selects between `mfa` (Montreal Forced Aligner, default) and `whisperx` (the original path, kept as an automatic per-segment fallback and as a direct option if the conda/MFA install is undesired). MFA aligns the *entire* audio handed to it against the *entire* recognized text in one pass, with no dependency on WhisperX's internal ~30-second decode-chunk boundaries at all — there's no "which chunk does this word belong to" question for it to get wrong, because there's no chunking at this layer in the first place. See `steps/align_mfa.py`'s module docstring and spec (§8, above) for the mechanism, and `docs/timestamp-drift-investigation.md` for the full worked example, the complete list of infrastructure problems found and fixed getting this actually running (not one problem — six, each looking like the blocker at the time: root/PostgreSQL, a PATH collision that broke Step 2's own demucs call, a missing `/etc/passwd` entry for hush.sh's arbitrary runtime UID, a permissions bug in the fix for that, a wrong assumption about `align_one`'s own output path, and a Kaldi-internal token leaking through as if it were a real word), and the validated before/after numbers.
+
+**Validated, not just implemented:** re-running the original investigation's methodology after all of the above was resolved and the beam width tuned (see `steps/align_mfa.py`'s spec above) found 14 of the 17 originally-confirmed drift cases now land correctly, individually confirmed by name rather than only in aggregate, and SRT-line coverage on the same test film went from 90 fully-missed lines (whisperx) to 11 (mfa).
+
+**What this doesn't fix, and why that's now well-understood rather than an open question:** MFA can only place words WhisperX's own `transcribe()` pass already recognized as text somewhere — if that recognition step drops a stretch of dialogue entirely, there's nothing for any alignment backend to work with. One such case (a densely, genuinely repetitive line, repeated three times in the actual performance) remains unresolved in the validated test film; widening MFA's beam search 4x fixed a different, genuine alignment-search failure elsewhere in the same film but left this one completely unchanged, word for word, which rules out alignment difficulty as the explanation and points specifically at WhisperX's own recognition step instead. Documented as a lead for whoever picks up the still-untried `chunk_size`/`vad_onset`/`vad_offset` tuning discussed earlier in this document's history and never acted on, now that alignment backend is correctly isolated as a separate variable from recognition recall. Also flagged as a reasonable case for manual review via the terminal review tool design (separate doc) — since a word that's never recognized at all simply doesn't appear in `matches.json`/`censor_log.json`, rather than being silently mis-muted the way the original whisperx drift did, a human spot-check of known-hard passages is a safety net this specific failure mode actually allows for.
+

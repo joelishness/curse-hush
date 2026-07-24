@@ -77,6 +77,83 @@ whisperx:
   compute_type: int8
 
 
+# ── Word-level alignment (Step 3, after WhisperX's own transcription pass) ──
+alignment:
+
+  # Which forced-alignment engine turns WhisperX's recognized text into
+  # word-level start/end timestamps.
+  #   mfa      — Montreal Forced Aligner (GMM-HMM via Kaldi). Default as of
+  #              this version, after whisperx.align() was found to silently
+  #              drift several seconds following a segment WhisperX's own
+  #              transcribe() pass mis-timed internally (full case history
+  #              in docs/timestamp-drift-investigation.md). MFA aligns the
+  #              *entire* audio handed to it against the *entire* recognized
+  #              text in one pass — it isn't scoped to WhisperX's internal
+  #              ~30s decode chunks at all, so it can't inherit a
+  #              chunk-boundary timing error the way whisperx.align() can.
+  #              Validated directly against Independence Day (1996), not
+  #              just reasoned about: of the 17 individually-confirmed
+  #              drift cases from the original investigation, 14 landed
+  #              correctly once MFA actually ran end-to-end; SRT-line
+  #              coverage went from 90 fully-missed lines (whisperx) to 11
+  #              (mfa) on the same film. See that doc for what's still
+  #              unresolved — it's a WhisperX *recognition* gap on densely
+  #              repetitive dialogue, not an alignment problem, and no
+  #              alignment backend fixes it on its own.
+  #              Requires the `montreal-forced-aligner` conda package (see
+  #              Dockerfile) — NOT pip-installable; it depends on `kalpy`
+  #              (compiled Kaldi bindings), which conda-forge ships as a
+  #              prebuilt binary and PyPI does not carry at all.
+  #   whisperx — wav2vec2 / CTC alignment via whisperx.align(). Falls back
+  #              to this automatically per-segment if MFA fails and
+  #              mfa.fallback_to_whisperx is true (default) — see below.
+  #              Set backend to this directly only if you don't want the
+  #              conda/MFA install at all and are fine with the drift
+  #              behavior documented above.
+  backend: mfa
+
+  mfa:
+    # Pretrained acoustic model + pronunciation dictionary name (as known to
+    # `mfa model download`). english_mfa is trained on North American
+    # English and is the model to reach for first for English-language film
+    # dialogue.
+    acoustic_model: english_mfa
+    dictionary: english_mfa
+
+    # G2P (grapheme-to-phoneme) model used to generate a pronunciation on
+    # the fly for words the dictionary doesn't have an entry for, instead of
+    # silently dropping them. Film dialogue leans heavily on contractions
+    # and dropped-g colloquialisms ("sayin'", "outta", "gonna") that a
+    # standard dictionary won't have every variant of — leave this set
+    # rather than relying on the dictionary alone.
+    g2p_model: english_us_mfa
+
+    # Kaldi beam widths. 100/400 are MFA's own basic_align.yaml defaults --
+    # not something picked arbitrarily here -- but its docs are explicit
+    # that those defaults target utterances under 30 seconds, and that
+    # longer sequences need both raised, giving 400/1000 as its own
+    # example figure for "much longer sequences." Every segment this
+    # pipeline hands to `align_one` is an entire ~30-*minute* dialog
+    # segment treated as one utterance -- far past what 100/400 is tuned
+    # for, and confirmed directly against a real run: segment 5 of
+    # Independence Day failed with "Could not align the file with the
+    # current beam size (100), please try increasing the beam size."
+    # Widening trades alignment time for success rate (MFA's own
+    # documentation: "the higher the beam value, the slower alignment
+    # will be") -- if this value ever needs raising further, the error
+    # message reports whatever beam size actually failed, so retry_beam
+    # a few times that number is a reasonable next step, not a guess.
+    beam: 400
+    retry_beam: 1000
+
+    # If MFA fails outright on a segment (model/dictionary missing, the
+    # `mfa` binary not on PATH, a segment it can't align at all), fall back
+    # to the whisperx.align() path for that segment rather than failing the
+    # whole job. Logged clearly either way so a silent fallback is never
+    # actually silent in the logs.
+    fallback_to_whisperx: true
+
+
 # ── Audio handling (Steps 1a / 1b) ──────────────────────────────────────────
 audio:
   # v1: all source audio is downmixed to stereo (44.1 kHz, PCM 16-bit) for

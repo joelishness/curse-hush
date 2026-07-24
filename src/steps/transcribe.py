@@ -6,12 +6,36 @@ files (transcript_01.json, transcript_02.json, …) with segment-local
 (0-based) word timestamps.  Steps/merge.py consumes these and produces the
 canonical transcript.json with global timestamps.
 
-WhisperX pipeline (run in sequence, per-segment):
-  1. model.transcribe() — batched Whisper inference → segment-level timestamps
-  2. whisperx.align()  — wav2vec2 forced alignment  → word-level timestamps
+Pipeline (run in sequence, per-segment):
+  1. model.transcribe() — batched Whisper inference → recognized text +
+     rough (WhisperX-internal) segment-level timestamps.
+  2. Word-level alignment, backend selected by config.yaml's
+     alignment.backend:
+       - "mfa" (default) — Montreal Forced Aligner (steps/align_mfa.py), a
+         GMM-HMM aligner that searches the *whole* segment's audio against
+         the recognized text in one pass, independent of WhisperX's own
+         ~30s decode-chunk boundaries. Default as of this version, after
+         whisperx.align() was found to silently inherit a several-second
+         timing error from step 1 when WhisperX's own segment timing is
+         wrong -- see docs/timestamp-drift-investigation.md, which also
+         has the validated before/after numbers, not just the original
+         case. Falls back to whisperx.align() per-segment on MFA failure
+         if alignment.mfa.fallback_to_whisperx is true (default); raises
+         otherwise.
+       - "whisperx" — wav2vec2/CTC alignment within the segment boundaries
+         step 1 already committed to. Set this directly only to avoid the
+         conda/MFA install entirely and accept the drift risk above.
+       MFA fixes *timing* of words WhisperX already recognized. It does
+       not fix WhisperX failing to recognize a stretch of dialogue as
+       text at all in the first place -- that's a separate, still-open
+       recall problem, not an alignment problem (see the same doc for the
+       one specific case this traces down: dense phrase repetition
+       confusing WhisperX's own decoder, independent of alignment
+       backend or beam width).
 
-Both the Whisper model and the alignment model are loaded once for the whole
-job (not per segment) to avoid repeated multi-minute load times.
+The Whisper model (and the whisperx align model, if that backend is ever
+used this run) are loaded once for the whole job, not per segment, to
+avoid repeated multi-minute load times.
 
 Casing policy:
   Word casing is preserved exactly as WhisperX produces it.  Do NOT
@@ -59,6 +83,13 @@ from utils import (
     step_logger,
     write_job,
 )
+from steps.align_mfa import align_with_mfa, MFAError
+
+# align_mfa's own top-level imports are stdlib + utils only (praatio is
+# imported lazily inside the function that needs it) -- so this import is
+# safe and cheap even when alignment.backend == "whisperx" and MFA is never
+# actually invoked. Matches this codebase's existing convention of
+# unconditional top-level `from steps.X import ...` (see pipeline.py).
 
 
 def transcribe(
@@ -105,13 +136,20 @@ def transcribe(
     # ships with int8 + cpu, its matching pair, out of the box).
     compute_type = cfg_get(cfg, "whisperx", "compute_type")
 
+    align_backend        = cfg_get(cfg, "alignment", "backend")
+    mfa_fallback_allowed = bool(cfg_get(cfg, "alignment", "mfa", "fallback_to_whisperx"))
+    if align_backend not in ("whisperx", "mfa"):
+        raise ValueError(
+            f"alignment.backend must be 'whisperx' or 'mfa', got {align_backend!r}"
+        )
+
     n = len(stem_pairs)
     log.info("Step 3 — WhisperX transcription")
     log.info(
         "  model=%s  language=%s  batch_size=%d  beam_size=%d"
-        "  device=%s  compute_type=%s  segments=%d",
+        "  device=%s  compute_type=%s  segments=%d  align_backend=%s",
         model_name, language or "auto",
-        batch_size, beam_size, device, compute_type, n,
+        batch_size, beam_size, device, compute_type, n, align_backend,
     )
 
     # ── Import whisperx ───────────────────────────────────────────────────────
@@ -213,50 +251,80 @@ def transcribe(
             )
             words: list[dict] = []
         else:
-            # Lazy-load or reload alignment model when language changes.
-            if align_model is None or loaded_lang != detected_lang:
-                if align_model is not None:
+            # use_whisperx_align starts true only for the default backend;
+            # an MFA failure can also flip it on mid-loop (fallback), which
+            # is why this is a mutable flag rather than a one-shot branch.
+            use_whisperx_align = (align_backend == "whisperx")
+
+            if align_backend == "mfa":
+                try:
+                    t_mfa = time.monotonic()
+                    words = align_with_mfa(dialog, segs_out, cfg, log)
                     log.debug(
-                        "    Language changed %s→%s; reloading alignment model.",
-                        loaded_lang, detected_lang,
+                        "    MFA alignment: %d words in %.1fs for %s.",
+                        len(words), time.monotonic() - t_mfa, dialog.name,
                     )
-                    del align_model, align_metadata
-                    gc.collect()
-                log.debug(
-                    "    Loading alignment model for language '%s' ...", detected_lang
-                )
-                align_model, align_metadata = whisperx.load_align_model(
-                    language_code=detected_lang,
-                    device=device,
-                )
-                loaded_lang = detected_lang
+                except MFAError as exc:
+                    if not mfa_fallback_allowed:
+                        raise RuntimeError(
+                            f"MFA alignment failed for {dialog.name} and "
+                            "alignment.mfa.fallback_to_whisperx is false "
+                            "(config.yaml) -- not falling back."
+                        ) from exc
+                    log.warning(
+                        "  [%d/%d] MFA alignment failed for %s -- falling back "
+                        "to whisperx.align() for this segment.  Reason: %s",
+                        seg_idx, n, dialog.name, exc,
+                    )
+                    use_whisperx_align = True
 
-            aligned = whisperx.align(
-                segs_out,
-                align_model,
-                align_metadata,
-                audio,
-                device,
-                return_char_alignments=False,
-            )
+            if use_whisperx_align:
+                # Lazy-load or reload alignment model when language changes.
+                if align_model is None or loaded_lang != detected_lang:
+                    if align_model is not None:
+                        log.debug(
+                            "    Language changed %s→%s; reloading alignment model.",
+                            loaded_lang, detected_lang,
+                        )
+                        del align_model, align_metadata
+                        gc.collect()
+                    log.debug(
+                        "    Loading alignment model for language '%s' ...", detected_lang
+                    )
+                    align_model, align_metadata = whisperx.load_align_model(
+                        language_code=detected_lang,
+                        device=device,
+                    )
+                    loaded_lang = detected_lang
 
-            # ── Collect words ─────────────────────────────────────────────────
-            # Timestamps are segment-local (0-based).  Step 3b applies the
-            # global start_offset to produce film-absolute timestamps.
-            # Words that couldn't be aligned have start/end/score = None;
-            # include them so the full word count is preserved in the JSON.
-            words = []
-            for seg in aligned.get("segments", []):
-                for w in seg.get("words", []):
-                    word_text = w.get("word", "")
-                    if not word_text:
-                        continue   # skip empty tokens (defensive)
-                    words.append({
-                        "word":  word_text,          # original casing + punctuation
-                        "start": w.get("start"),     # None if alignment failed
-                        "end":   w.get("end"),
-                        "score": w.get("score"),
-                    })
+                aligned = whisperx.align(
+                    segs_out,
+                    align_model,
+                    align_metadata,
+                    audio,
+                    device,
+                    return_char_alignments=False,
+                )
+
+                # ── Collect words ─────────────────────────────────────────────
+                # Timestamps are segment-local (0-based).  Step 3b applies the
+                # global start_offset to produce film-absolute timestamps.
+                # Words that couldn't be aligned have start/end/score = None;
+                # include them so the full word count is preserved in the JSON.
+                words = []
+                for seg in aligned.get("segments", []):
+                    for w in seg.get("words", []):
+                        word_text = w.get("word", "")
+                        if not word_text:
+                            continue   # skip empty tokens (defensive)
+                        words.append({
+                            "word":  word_text,          # original casing + punctuation
+                            "start": w.get("start"),     # None if alignment failed
+                            "end":   w.get("end"),
+                            "score": w.get("score"),
+                        })
+            # else: words was already populated by align_with_mfa() above,
+            # in the same {"word","start","end","score"} shape.
 
         # Release the numpy audio array before the next segment loads its own.
         del audio
