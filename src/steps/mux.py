@@ -308,6 +308,15 @@ def _split_trailing_tech_tags(stem: str) -> "tuple[str, str]":
 
 def _output_path(video_path: Path, output_dir: Path, cfg: dict, out_format: str) -> Path:
     """
+    Imported directly by batch_plan.py, not just called from mux() below --
+    the leading underscore here is a "not part of steps.mux's own public
+    step-function API" marker (that's mux() alone), not "nothing outside
+    this file may import it." batch_plan.py needs the exact same naming
+    decision Step 7 will actually make, to predict whether a given input's
+    output already exists, without a second, drift-prone implementation of
+    the TV/movie tag-placement and dot-boundary logic below. Treat this
+    signature as a two-caller contract when changing it.
+
     Build the final output filename, per output.naming_style:
 
     plex_edition (default) -- a Plex-friendly {edition-Name} tag (see

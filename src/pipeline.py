@@ -50,7 +50,6 @@ stale files left over from before the change. --redo-step 7_mux alone
 clears only 7_mux, since nothing in this pipeline is downstream of it.
 """
 import argparse
-import hashlib
 import re
 import sys
 import time
@@ -60,6 +59,7 @@ from pathlib import Path
 import utils
 from utils import (
     cfg_get,
+    compute_job_id,
     find_job_dir,
     fmt_dir,
     fmt_duration,
@@ -96,18 +96,6 @@ CONFIG_PATH = Path("/config/config.yaml")
 
 
 # ── Job ID / directory ────────────────────────────────────────────────────────
-
-def compute_job_id(video_path: Path) -> str:
-    """
-    Stable, content-independent job identifier: sha256[:12] of
-    (absolute_path + ':' + mtime).
-
-    Same path + mtime → same job_id → existing artifacts can be reused.
-    File changes (new mtime) → new job_id → fresh job directory.
-    """
-    key = f"{video_path.resolve()}:{video_path.stat().st_mtime}"
-    return hashlib.sha256(key.encode()).hexdigest()[:12]
-
 
 def make_job_dir_name(video: Path, job_id: str) -> str:
     """
@@ -858,6 +846,7 @@ def main() -> None:
     flag_st  = state.get("flag", {})
     mute_st  = state.get("mute", {})
     encode_st = state.get("encode", {})
+    transcribe_st = state.get("transcription", {})
 
     steps_label = "1a / 1b / 1c / 2 / 3 / 3b / 4b (flag)"
     if review_path:
@@ -889,6 +878,13 @@ def main() -> None:
         "  Muted intervals  : %d  (method=%s, padding=%sms)",
         mute_st.get("muted_intervals", 0), mute_st.get("method", "?"), mute_st.get("padding_ms", "?"),
     )
+    mfa_fallback_segments = transcribe_st.get("mfa_fallback_segments", 0)
+    if mfa_fallback_segments:
+        log.info(
+            "  Alignment        : MFA, with whisperx.align() fallback for %d segment(s) "
+            "-- see the per-segment WARN lines above for which, and why.",
+            mfa_fallback_segments,
+        )
     if encode_st.get("fallback_reason"):
         log.info(
             "  Audio track      : %s @ %s bps  (FALLBACK — %s; verify sync/quality)",
@@ -934,6 +930,36 @@ def main() -> None:
     log.info("  Steps done : %s", state.get("steps_completed", []))
     log.info("  Job store  : %s", job_dir)
     log.info("=" * 60)
+
+    # ── Compact, machine-readable result line -- stdout, not stderr ────────────
+    #
+    # Every other line this pipeline ever logs (via `log`, throughout every
+    # step) goes to stderr -- this is the one and only thing written to
+    # stdout, anywhere in this program. That's deliberate: hush.sh's
+    # --batch loop redirects and reads *only* stdout for each per-file run
+    # (see build_docker_cmd()/the batch loop), specifically so it can fold
+    # one short line per file into its own high-level batch log without
+    # capturing this whole run's full step-by-step transcript along with
+    # it -- that already lives in this job's own logs/*.log, and pulling
+    # all of it into the batch log too would make that file just as long
+    # as reading through every job individually, defeating the point of a
+    # quick, scannable overview across 100+ files (see hush.sh's own
+    # comments on this). A single-file (non-batch) run prints this too,
+    # since nothing else was ever on stdout to begin with -- it's just one
+    # extra terminal line, easy to ignore.
+    #
+    # "Notable" here means the same two fallback paths already surfaced
+    # above in the human-readable summary: an MFA alignment falling back
+    # to whisperx.align() (steps/transcribe.py), and an unsupported audio
+    # codec falling back to ac3 (steps/encode.py) -- not a general-purpose
+    # event log. Extending it to cover more cases later means adding to
+    # `notable` here, the same way these two already do.
+    notable: list[str] = []
+    if mfa_fallback_segments:
+        notable.append(f"MFA fallback: {mfa_fallback_segments} segment(s)")
+    if encode_st.get("fallback_reason"):
+        notable.append(f"audio fallback: {encode_st['fallback_reason']}")
+    print("AC_RESULT ok" if not notable else f"AC_RESULT warnings :: {' | '.join(notable)}", flush=True)
 
 
 if __name__ == "__main__":

@@ -251,16 +251,19 @@ censoring:
 output:
 
   # How to build the output filename.
-  #   plex_edition — Plex-friendly {edition-Name} tag (default), inserted
-  #                  right after the "(YYYY)" release-year portion of the
-  #                  filename if present, so Plex shows the censored file
-  #                  as a selectable Edition of the same movie instead of
-  #                  a separate, unrelated item. See edition_name below.
+  #   plex_edition — Plex-friendly {edition-Name} tag (default). See
+  #                  edition_name below. Movies and TV episodes are
+  #                  tagged at different points in the filename — see
+  #                  steps/mux.py's _output_path() for the full reasoning
+  #                  and the ellipsis-safe title/tech-tag boundary logic
+  #                  it depends on:
   #                    "Movie (1986).sd.hevc.mkv" ->
   #                    "Movie (1986) {edition-Hushed}.sd.hevc.mkv"
+  #                    "Psych (2006) - s02e01 - American Duos.sd.hevc.mkv" ->
+  #                    "Psych (2006) - s02e01 - American Duos {edition-Hushed}.sd.hevc.mkv"
   #                  Falls back to appending the tag at the very end
   #                  (still valid Plex syntax — tag order doesn't matter
-  #                  to Plex's parser) if no "(YYYY)" pattern is found.
+  #                  to Plex's parser) if neither pattern applies.
   #   suffix       — plain suffix appended before the extension; no Plex
   #                  Edition semantics, just a renamed file. See suffix
   #                  below.

@@ -18,6 +18,7 @@
 #
 # Usage:
 #   hush.sh [OPTIONS] <input_video> [subtitle_file]
+#   hush.sh --batch [--recursive] [OPTIONS] <input_dir>
 #
 # Options:
 #   -o, --output DIR      Output directory (default: same directory as input)
@@ -27,6 +28,38 @@
 #       --interactive     Pause for review of flagged words before muting
 #       --no-interactive  Force unattended mode (overrides config.yaml)
 #       --keep-tmp        Retain large intermediate WAV stems after the run
+#   -b, --batch           Process every video file directly inside <input_dir>,
+#                         one after another. Skips any file that already has a
+#                         censored output sitting next to it (judged by output
+#                         filename, e.g. the "{edition-Hushed}" tag -- not by
+#                         local job history alone, since a file may have been
+#                         censored on a different machine). Ctrl-C stops the
+#                         batch after the file in progress finishes its
+#                         current step; re-running the same command resumes --
+#                         already-done files are skipped automatically, and a
+#                         part-finished file resumes from its last completed
+#                         step (see pipeline.py's existing job resume logic).
+#                         Cannot combine with --skip-index/--add-interval/
+#                         --redo-review/--redo-step (those target one already-
+#                         completed job, not a directory). --interactive works,
+#                         but pauses for review on every file in the queue,
+#                         one after another. Writes a high-level overview to
+#                         <jobs_dir>/batch-logs/ -- plan-phase results, each
+#                         file's start/end/duration, and a short note if
+#                         pipeline.py flagged anything (e.g. an MFA alignment
+#                         falling back to whisperx.align() for one segment).
+#                         Deliberately NOT each file's own full step-by-step
+#                         transcript -- that already lives in that job's own
+#                         job_dir/logs/*.log, so this stays a quick, scannable
+#                         summary across 100+ files instead of growing as long
+#                         as reading through every job individually.
+#                         AC_LOG_LEVEL=debug also names the specific files the
+#                         planning pass skipped or queued, not just counts.
+#   -r, --recursive       With --batch, also descend into subdirectories (e.g.
+#                         Season 01/, Season 02/, Specials/). Off by default --
+#                         a bare --batch only processes files directly inside
+#                         <input_dir>. Output mirrors each file's subdirectory
+#                         under --output (or <input_dir> itself, by default).
 #       --skip-index N    Correction: un-mute the flagged match at this word_index
 #                         (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
 #       --add-interval TEXT START END
@@ -54,6 +87,8 @@
 #   hush.sh --add-interval "missed word" 1203.1 1203.5 movie.mkv
 #   hush.sh --add-interval "missed word" 0:20:03.1 0:20:03.5 movie.mkv  # same, H:MM:SS.mmm
 #   hush.sh --redo-step 7_mux movie.mkv                      # re-test a muxer change only
+#   hush.sh --batch "Psych (2006)/Season 02"                 # one season, top-level files only
+#   hush.sh --batch --recursive "Psych (2006)"               # whole show, every season + Specials
 # =============================================================================
 set -euo pipefail
 
@@ -64,6 +99,7 @@ SCRIPT_NAME="$(basename "$0")"
 usage() {
     cat <<EOF
 Usage: ${SCRIPT_NAME} [OPTIONS] <input_video> [subtitle_file]
+       ${SCRIPT_NAME} --batch [--recursive] [OPTIONS] <input_dir>
 
 Options:
   -o, --output DIR      Output directory (default: same directory as input)
@@ -73,6 +109,35 @@ Options:
       --interactive     Pause for review of flagged words before muting
       --no-interactive  Force unattended mode (overrides config.yaml)
       --keep-tmp        Retain large intermediate WAV stems after the run
+  -b, --batch           Process every video file directly inside <input_dir>,
+                        one after another. Skips any file that already has a
+                        censored output sitting next to it (judged by output
+                        filename, e.g. the "{edition-Hushed}" tag -- not by
+                        local job history alone, since a file may have been
+                        censored on a different machine). Ctrl-C stops the
+                        batch after the file in progress finishes its current
+                        step; re-running the same command resumes -- already-
+                        done files are skipped automatically, and a part-
+                        finished file resumes from its last completed step.
+                        Cannot combine with --skip-index/--add-interval/
+                        --redo-review/--redo-step (those target one already-
+                        completed job, not a directory). --interactive works,
+                        but pauses for review on every file in the queue, one
+                        after another. Writes a high-level overview to
+                        <jobs_dir>/batch-logs/ -- plan-phase results, each
+                        file's start/end/duration, and a short note if
+                        pipeline.py flagged anything notable (e.g. an MFA
+                        alignment falling back to whisperx.align()) -- not
+                        each file's own full transcript (already in that
+                        job's own job_dir/logs/*.log), so this stays a quick
+                        summary across 100+ files. AC_LOG_LEVEL=debug also
+                        names the specific files the planning pass skipped
+                        or queued.
+  -r, --recursive       With --batch, also descend into subdirectories (e.g.
+                        Season 01/, Season 02/, Specials/). Off by default --
+                        a bare --batch only processes files directly inside
+                        <input_dir>. Output mirrors each file's subdirectory
+                        under --output (or <input_dir> itself, by default).
       --skip-index N    Correction: un-mute the flagged match at this word_index
                         (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
       --add-interval TEXT START END
@@ -100,6 +165,8 @@ Examples:
   ${SCRIPT_NAME} --add-interval "missed word" 1203.1 1203.5 movie.mkv
   ${SCRIPT_NAME} --add-interval "missed word" 0:20:03.1 0:20:03.5 movie.mkv  # same, H:MM:SS.mmm
   ${SCRIPT_NAME} --redo-step 7_mux movie.mkv                # re-test a muxer change only
+  ${SCRIPT_NAME} --batch "Psych (2006)/Season 02"           # one season, top-level files only
+  ${SCRIPT_NAME} --batch --recursive "Psych (2006)"         # whole show, every season + Specials
 EOF
 }
 
@@ -152,6 +219,47 @@ resolve_path() {
     echo "$p"
 }
 
+# Turns an arbitrary directory name into a short, filesystem-friendly slug
+# for the batch log filename -- mirrors pipeline.py's make_job_dir_name()
+# slug closely enough to read as "the same kind of name" next to job
+# directories, without needing bash to match it byte-for-byte.
+#   "Season 02"     -> "season-02"
+#   "Psych (2006)"  -> "psych-2006"
+slugify() {
+    local s="${1,,}"                       # lowercase
+    s="$(echo "$s" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+    echo "${s:0:32}"
+}
+
+# Only used by --batch (see below) -- emits a line shaped like utils.py's
+# own _StepFormatter ("2026-06-25 16:25:41 -0700 [INFO ] [hush.sh  ] ...")
+# so hush.sh's own batch-loop lines read as part of the same continuous
+# log as pipeline.py's own output, and writes that same line to both the
+# terminal and $BATCH_LOG_FILE directly -- a high-level overview only,
+# deliberately: this is the only thing that goes into the batch log,
+# never a per-file docker run's own stderr (see "Batch log" below for
+# why). DEBUG lines are gated on AC_LOG_LEVEL, same contract as the
+# container's own logging -- set once, respected on both sides.
+BATCH_LOG_LEVEL="${AC_LOG_LEVEL:-info}"
+batch_log() {
+    local level="$1"; shift
+    if [[ "$level" == "DEBUG" ]]; then
+        [[ "${BATCH_LOG_LEVEL,,}" == "debug" ]] || return 0
+    fi
+    local line
+    line="$(printf '%s [%-5s] [%-9s] %s' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$level" "hush.sh" "$*")"
+    echo "$line" >&2
+    [[ -n "${BATCH_LOG_FILE:-}" ]] && echo "$line" >> "$BATCH_LOG_FILE"
+}
+
+# HH:MM:SS from a whole-seconds count -- matches utils.fmt_duration()'s own
+# format closely enough for a person reading both in the same log, without
+# needing to shell out to Python just to format an integer.
+fmt_hms() {
+    local total="$1"
+    printf '%02d:%02d:%02d' $((total/3600)) $((total%3600/60)) $((total%60))
+}
+
 # ── Argument defaults ─────────────────────────────────────────────────────────
 
 OUTPUT_DIR=""
@@ -169,6 +277,13 @@ SKIP_INDICES=()
 ADD_INTERVALS=()   # flattened in groups of 3: TEXT START END, TEXT START END, ...
 REDO_REVIEW=""
 REDO_STEPS=()
+BATCH=""
+RECURSIVE=""
+
+# Saved before the parsing loop below shifts through it -- used only for the
+# batch log header (see --batch), so the log file is self-contained: what
+# ran, not just what happened. Not otherwise re-parsed or re-used.
+ORIGINAL_ARGS=("$@")
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -204,6 +319,10 @@ while [[ $# -gt 0 ]]; do
         --redo-step)
             [[ -n "${2:-}" ]] || die "--redo-step requires a step name argument"
             REDO_STEPS+=("$2"); shift 2 ;;
+        -b|--batch)
+            BATCH=1; shift ;;
+        -r|--recursive)
+            RECURSIVE=1; shift ;;
         --dry-run)
             DRY_RUN=1; shift ;;
         -h|--help)
@@ -229,13 +348,27 @@ done
 
 [[ -n "$INPUT_VIDEO" ]] || { usage >&2; echo; die "input_video is required"; }
 
-[[ -f "$INPUT_VIDEO" ]] || die "input file not found: ${INPUT_VIDEO}"
+if [[ -n "$BATCH" ]]; then
+    [[ -d "$INPUT_VIDEO" ]] || die "--batch requires a directory: ${INPUT_VIDEO}"
+    [[ -z "$SUBTITLE_FILE" ]] \
+        || die "a trailing subtitle_file argument isn't supported with --batch (${SUBTITLE_FILE}) -- SRT cross-reference isn't implemented yet regardless (Phase 3)."
+else
+    [[ -f "$INPUT_VIDEO" ]] || die "input file not found: ${INPUT_VIDEO}"
+fi
 
 # ── Resolve all paths to absolute (Docker requires absolute paths for -v) ─────
 
-INPUT_VIDEO_ABS="$(resolve_path "$INPUT_VIDEO")"
-INPUT_DIR="$(dirname "$INPUT_VIDEO_ABS")"
-VIDEO_BASENAME="$(basename "$INPUT_VIDEO_ABS")"
+if [[ -n "$BATCH" ]]; then
+    # The directory itself is what gets mounted at /input -- batch_plan.py
+    # (and, per file, the same per-file mount the single-file path already
+    # uses) walks it from there. No VIDEO_BASENAME/dirname split needed --
+    # there's no single file yet, that's the whole point of planning first.
+    INPUT_DIR="$(resolve_path "$INPUT_VIDEO")"
+else
+    INPUT_VIDEO_ABS="$(resolve_path "$INPUT_VIDEO")"
+    INPUT_DIR="$(dirname "$INPUT_VIDEO_ABS")"
+    VIDEO_BASENAME="$(basename "$INPUT_VIDEO_ABS")"
+fi
 
 # Output defaults to the same directory as the input
 OUTPUT_DIR="${OUTPUT_DIR:-$INPUT_DIR}"
@@ -281,6 +414,16 @@ if [[ ${#REDO_STEPS[@]} -gt 0 && ( -n "$REDO_REVIEW" || ${#SKIP_INDICES[@]} -gt 
   --redo-step only forces the step(s) named. Run them in separate invocations instead."
 fi
 
+if [[ -n "$RECURSIVE" && -z "$BATCH" ]]; then
+    die "--recursive only applies with --batch"
+fi
+
+if [[ -n "$BATCH" && ( -n "$REDO_REVIEW" || ${#SKIP_INDICES[@]} -gt 0 || ${#ADD_INTERVALS[@]} -gt 0 || ${#REDO_STEPS[@]} -gt 0 ) ]]; then
+    die "--batch cannot be combined with --skip-index/--add-interval/--redo-review/--redo-step
+  Those target one already-completed job, not a directory of files. Run the correction
+  against that one file directly instead, without --batch."
+fi
+
 # ── Create host-side directories if they don't exist ─────────────────────────
 
 for dir in "$OUTPUT_DIR" "$CONFIG_DIR" "$CACHE_DIR" "$JOBS_DIR"; do
@@ -309,7 +452,7 @@ if [[ -z "$DRY_RUN" ]]; then
         || die "Docker daemon is not running (or current user lacks permission)"
 fi
 
-# ── Build docker command ──────────────────────────────────────────────────────
+# ── Shared docker-invocation pieces (same for every file, single or batch) ────
 
 # TTY: allocate only for interactive review so the terminal works correctly.
 # In unattended mode, no TTY is needed and --detach would be valid, but we
@@ -327,15 +470,6 @@ elif [[ -z "$NO_INTERACTIVE" && -n "${AC_INTERACTIVE:-}" ]]; then
     TTY_ARGS=(-it)
 fi
 
-# Volume mounts
-VOLUME_ARGS=(
-    -v "${INPUT_DIR}:/input:ro"
-    -v "${OUTPUT_DIR}:/output"
-    -v "${CONFIG_DIR}:/config:ro"
-    -v "${CACHE_DIR}:/cache"
-    -v "${JOBS_DIR}:/jobs"
-)
-
 # Run as the invoking host user, not root.  Without this, every file the
 # container writes into /jobs, /cache, and /output (bind mounts onto real
 # host directories) ends up owned by root, which then needs sudo to delete,
@@ -343,25 +477,29 @@ VOLUME_ARGS=(
 # UID/GID — it doesn't need one; see the Dockerfile's HOME/bytecode notes.
 USER_ARGS=(--user "$(id -u):$(id -g)")
 
-# Environment variables passed to the container
-ENV_ARGS=()
+# Environment variables that don't vary per file -- AC_INPUT_HOST_DIR /
+# AC_OUTPUT_HOST_DIR are the only two that do (a batch run mounts a
+# different /input //output pair per file when --recursive spans multiple
+# subdirectories), so those are added inside build_docker_cmd() below
+# instead of here.
+BASE_ENV_ARGS=()
 # --keep-tmp (CLI flag) takes priority; AC_KEEP_INTERMEDIATES from the host
 # env is the fallback when --keep-tmp wasn't passed. Both forward the same
 # variable into the container -- there's no separate flag for "off" since
 # this one defaults to false already.
 if [[ -n "$KEEP_TMP" ]]; then
-    ENV_ARGS+=(-e "AC_KEEP_INTERMEDIATES=1")
+    BASE_ENV_ARGS+=(-e "AC_KEEP_INTERMEDIATES=1")
 elif [[ -n "${AC_KEEP_INTERMEDIATES:-}" ]]; then
-    ENV_ARGS+=(-e "AC_KEEP_INTERMEDIATES=${AC_KEEP_INTERMEDIATES}")
+    BASE_ENV_ARGS+=(-e "AC_KEEP_INTERMEDIATES=${AC_KEEP_INTERMEDIATES}")
 fi
 # AC_KEEP_CORRECTION_ARTIFACTS defaults to true inside the container (see
 # utils.load_config), so unlike the other AC_ vars here, passing it through
 # only matters when someone wants to turn it *off* (=0) -- but forwarding
 # unconditionally whenever it's set on the host (1 or 0) is simplest and
 # correct either way; load_config() handles both values explicitly.
-[[ -n "${AC_KEEP_CORRECTION_ARTIFACTS:-}" ]] && ENV_ARGS+=(-e "AC_KEEP_CORRECTION_ARTIFACTS=${AC_KEEP_CORRECTION_ARTIFACTS}")
-[[ -n "${AC_LOG_LEVEL:-}" ]]    && ENV_ARGS+=(-e "AC_LOG_LEVEL=${AC_LOG_LEVEL}")
-[[ -n "${AC_SEGMENT_SIZE:-}" ]] && ENV_ARGS+=(-e "AC_SEGMENT_SIZE=${AC_SEGMENT_SIZE}")
+[[ -n "${AC_KEEP_CORRECTION_ARTIFACTS:-}" ]] && BASE_ENV_ARGS+=(-e "AC_KEEP_CORRECTION_ARTIFACTS=${AC_KEEP_CORRECTION_ARTIFACTS}")
+[[ -n "${AC_LOG_LEVEL:-}" ]]    && BASE_ENV_ARGS+=(-e "AC_LOG_LEVEL=${AC_LOG_LEVEL}")
+[[ -n "${AC_SEGMENT_SIZE:-}" ]] && BASE_ENV_ARGS+=(-e "AC_SEGMENT_SIZE=${AC_SEGMENT_SIZE}")
 
 # Containers default to UTC with no idea what the host's wall clock says.
 # Capture the host's current UTC offset (respects an exported TZ in this
@@ -373,54 +511,281 @@ fi
 # no timezone database inside the image and no agreement between host and
 # container about one; see utils.py's "Timezone resolution" section for
 # the Python side of this. AC_TZ_NAME is the abbreviation, cosmetic only.
-ENV_ARGS+=(-e "AC_TZ_OFFSET=$(date +%z)")
+BASE_ENV_ARGS+=(-e "AC_TZ_OFFSET=$(date +%z)")
 HOST_TZ_NAME="$(date +%Z)"
-[[ -n "$HOST_TZ_NAME" ]] && ENV_ARGS+=(-e "AC_TZ_NAME=${HOST_TZ_NAME}")
-# job.json logs input_path/mux.output_path as *directories* a human could
-# actually navigate to (see utils.paths_banner()) rather than this
-# container's own /input //output mount points, which mean nothing
-# outside it. INPUT_DIR/OUTPUT_DIR are already resolved, absolute host
-# paths above (used for the -v mounts themselves) -- forwarding them
-# under these names is what pipeline.py/steps/mux.py read.
-ENV_ARGS+=(-e "AC_INPUT_HOST_DIR=${INPUT_DIR}")
-ENV_ARGS+=(-e "AC_OUTPUT_HOST_DIR=${OUTPUT_DIR}")
+[[ -n "$HOST_TZ_NAME" ]] && BASE_ENV_ARGS+=(-e "AC_TZ_NAME=${HOST_TZ_NAME}")
 # AC_INTERACTIVE from the host env is only honoured when --interactive /
 # --no-interactive were not already set on the command line (those flags
 # translate directly into --interactive / --no-interactive pipeline args).
 if [[ -z "$INTERACTIVE" && -z "$NO_INTERACTIVE" && -n "${AC_INTERACTIVE:-}" ]]; then
-    ENV_ARGS+=(-e "AC_INTERACTIVE=${AC_INTERACTIVE}")
+    BASE_ENV_ARGS+=(-e "AC_INTERACTIVE=${AC_INTERACTIVE}")
 fi
 
-# Arguments forwarded to pipeline.py inside the container
-PIPELINE_ARGS=("/input/${VIDEO_BASENAME}")
-[[ -n "$SRT_BASENAME" ]]   && PIPELINE_ARGS+=("/input/${SRT_BASENAME}")
-[[ -n "$INTERACTIVE" ]]    && PIPELINE_ARGS+=("--interactive")
-[[ -n "$NO_INTERACTIVE" ]] && PIPELINE_ARGS+=("--no-interactive")
-[[ -n "$REDO_REVIEW" ]]    && PIPELINE_ARGS+=("--redo-review")
-for idx in "${SKIP_INDICES[@]+"${SKIP_INDICES[@]}"}"; do
-    PIPELINE_ARGS+=("--skip-index" "$idx")
-done
-if [[ ${#ADD_INTERVALS[@]} -gt 0 ]]; then
-    for ((i = 0; i < ${#ADD_INTERVALS[@]}; i += 3)); do
-        PIPELINE_ARGS+=("--add-interval" "${ADD_INTERVALS[$i]}" "${ADD_INTERVALS[$i+1]}" "${ADD_INTERVALS[$i+2]}")
+# Builds DOCKER_CMD (global array) for one file. Only the four arguments
+# below ever differ between a plain single-file run and one iteration of
+# a --batch run -- everything else these read is one of the shared
+# pieces resolved once, above (TTY_ARGS/USER_ARGS/BASE_ENV_ARGS/
+# CONFIG_DIR/CACHE_DIR/JOBS_DIR/IMAGE_NAME) or a flag that applies
+# uniformly across the whole invocation, batch or not
+# (INTERACTIVE/NO_INTERACTIVE/REDO_REVIEW/SKIP_INDICES/ADD_INTERVALS/
+# REDO_STEPS -- the last four are already validated above to never
+# coexist with --batch, but are harmless to include unconditionally here
+# since the single-file path is what actually uses them).
+build_docker_cmd() {
+    local file_input_dir="$1" file_video_basename="$2" file_srt_basename="$3" file_output_dir="$4"
+
+    local volume_args=(
+        -v "${file_input_dir}:/input:ro"
+        -v "${file_output_dir}:/output"
+        -v "${CONFIG_DIR}:/config:ro"
+        -v "${CACHE_DIR}:/cache"
+        -v "${JOBS_DIR}:/jobs"
+    )
+
+    # job.json logs input_path/mux.output_path as *directories* a human
+    # could actually navigate to (see utils.paths_banner()) rather than
+    # this container's own /input //output mount points, which mean
+    # nothing outside it.
+    local env_args=("${BASE_ENV_ARGS[@]+"${BASE_ENV_ARGS[@]}"}")
+    env_args+=(-e "AC_INPUT_HOST_DIR=${file_input_dir}")
+    env_args+=(-e "AC_OUTPUT_HOST_DIR=${file_output_dir}")
+
+    local pipeline_args=("/input/${file_video_basename}")
+    [[ -n "$file_srt_basename" ]] && pipeline_args+=("/input/${file_srt_basename}")
+    [[ -n "$INTERACTIVE" ]]       && pipeline_args+=("--interactive")
+    [[ -n "$NO_INTERACTIVE" ]]    && pipeline_args+=("--no-interactive")
+    [[ -n "$REDO_REVIEW" ]]       && pipeline_args+=("--redo-review")
+    local idx
+    for idx in "${SKIP_INDICES[@]+"${SKIP_INDICES[@]}"}"; do
+        pipeline_args+=("--skip-index" "$idx")
     done
+    if [[ ${#ADD_INTERVALS[@]} -gt 0 ]]; then
+        local i
+        for ((i = 0; i < ${#ADD_INTERVALS[@]}; i += 3)); do
+            pipeline_args+=("--add-interval" "${ADD_INTERVALS[$i]}" "${ADD_INTERVALS[$i+1]}" "${ADD_INTERVALS[$i+2]}")
+        done
+    fi
+    local step
+    for step in "${REDO_STEPS[@]+"${REDO_STEPS[@]}"}"; do
+        pipeline_args+=("--redo-step" "$step")
+    done
+
+    DOCKER_CMD=(
+        docker run --rm
+        "${TTY_ARGS[@]+"${TTY_ARGS[@]}"}"
+        "${USER_ARGS[@]}"
+        "${volume_args[@]}"
+        "${env_args[@]+"${env_args[@]}"}"
+        "${IMAGE_NAME}"
+        "${pipeline_args[@]}"
+    )
+}
+
+# ── Batch mode ─────────────────────────────────────────────────────────────────
+
+if [[ -n "$BATCH" ]]; then
+    PLAN_ARGS=(/app/batch_plan.py /input --config /config/config.yaml)
+    [[ -n "$RECURSIVE" ]] && PLAN_ARGS+=(--recursive)
+
+    # Read-only across the board -- the planning pass only ever looks,
+    # never writes; --entrypoint bypasses entrypoint.sh's UID/passwd
+    # patching (see Dockerfile), which nothing here needs (that exists
+    # solely for PostgreSQL's initdb, on the alignment.backend: mfa path).
+    # BASE_ENV_ARGS is forwarded here too -- easy to miss, since this isn't
+    # a build_docker_cmd() call, but without it AC_LOG_LEVEL=debug would
+    # silently never reach batch_plan.py, regardless of what the person
+    # actually set on the host.
+    PLAN_CMD=(
+        docker run --rm
+        --entrypoint python
+        "${USER_ARGS[@]}"
+        "${BASE_ENV_ARGS[@]+"${BASE_ENV_ARGS[@]}"}"
+        -v "${INPUT_DIR}:/input:ro"
+        -v "${OUTPUT_DIR}:/output:ro"
+        -v "${CONFIG_DIR}:/config:ro"
+        -v "${JOBS_DIR}:/jobs:ro"
+        "${IMAGE_NAME}"
+        "${PLAN_ARGS[@]}"
+    )
+
+    if [[ -n "$DRY_RUN" ]]; then
+        echo "# profanity-hush dry run (--batch) — planning command that runs first:"
+        printf '%q \\\n' "${PLAN_CMD[@]}" | sed '$ s/ \\$//'
+        echo
+        echo "# It prints which files under ${INPUT_DIR} still need processing (already-"
+        echo "# censored ones are skipped -- see hush.sh --help). Each one is then run"
+        echo "# exactly like a plain, non-batch --dry-run invocation against that single"
+        echo "# file would be -- same volume/env/pipeline-arg shape, just looped, with"
+        echo "# /input and /output mounted to that file's own directory."
+        echo "#"
+        echo "# A real run also writes a batch log under \${JOBS_DIR}/batch-logs/ --"
+        echo "# nothing is written for --dry-run itself."
+        exit 0
+    fi
+
+    # ── Batch log ──────────────────────────────────────────────────────────
+    #
+    # One plain-text file per --batch invocation, under the existing jobs
+    # directory (no new flag/host directory needed -- --jobs already exists
+    # and is already mounted). A high-level overview only, on purpose: the
+    # plan phase's own summary, plus one line per file (start, outcome,
+    # duration, and -- see the loop below -- a short "notable" note if
+    # pipeline.py flagged one, e.g. an MFA alignment falling back to
+    # whisperx.align()) from batch_log(). A per-file docker run's full
+    # stderr is deliberately NOT captured here -- it goes only to the
+    # terminal, same as any single-file run -- since that full step-by-
+    # step transcript already lives in that job's own job_dir/logs/*.log,
+    # and duplicating it here on top would make this file just as long as
+    # reading through every job individually, defeating the point of a
+    # quick, scannable overview across 100+ files. The "notable" note
+    # comes from stdout instead (see build_docker_cmd()/the loop below) --
+    # pipeline.py writes exactly one compact line there, specifically for
+    # this, completely separate from its normal stderr logging.
+    PLAN_OUT=""
+    PLAN_ERR=""
+    FILE_STDOUT=""
+    trap 'rm -f "${PLAN_OUT:-}" "${PLAN_ERR:-}" "${FILE_STDOUT:-}"' EXIT
+
+    BATCH_LOG_DIR="${JOBS_DIR}/batch-logs"
+    mkdir -p "$BATCH_LOG_DIR" || die "could not create directory: ${BATCH_LOG_DIR}"
+    BATCH_LOG_FILE="${BATCH_LOG_DIR}/$(date +%Y%m%d_%H%M%S)_$(slugify "$(basename "$INPUT_DIR")").log"
+
+    {
+        echo "=== profanity-hush batch run ==="
+        echo "Started : $(date '+%Y-%m-%d %H:%M:%S %z')"
+        echo "Input   : ${INPUT_DIR}$( [[ -n "$RECURSIVE" ]] && echo " (recursive)" )"
+        echo "Output  : ${OUTPUT_DIR}"
+        echo "Command : ${SCRIPT_NAME} ${ORIGINAL_ARGS[*]+"${ORIGINAL_ARGS[*]}"}"
+        echo "================================="
+    } > "$BATCH_LOG_FILE"
+
+    echo "${SCRIPT_NAME}: batch log: ${BATCH_LOG_FILE}" >&2
+    batch_log INFO "planning batch run over ${INPUT_DIR}$( [[ -n "$RECURSIVE" ]] && echo " (recursive)" )..."
+
+    # A real temp file, not command substitution -- bash strings can't
+    # hold embedded NUL bytes, so `$(...)` would silently corrupt the
+    # NUL-delimited list batch_plan.py prints (needed because filenames
+    # in a real media library routinely contain everything else: spaces,
+    # commas, apostrophes, colons, "..."). Reading from a file (rather
+    # than `< <(...)` process substitution) also means the plan command's
+    # own exit code is checked explicitly below, instead of `set -e`
+    # silently not noticing a failed planning pass because nothing
+    # downstream of a process substitution propagates its exit status.
+    #
+    # batch_plan.py's own stderr (its INFO summary, and at debug the
+    # per-file filenames -- still just as concise as before, this isn't
+    # what "duplication" meant above) goes to a second temp file, then
+    # gets replayed to both the terminal and the log file right after the
+    # command finishes, rather than streamed live through a tee. Planning
+    # is a quick, one-shot, read-only pass, so that's indistinguishable
+    # from live in practice, and it avoids a second background `tee` (and
+    # the explicit wait its flush timing would need) just for this one
+    # command.
+    PLAN_OUT="$(mktemp)"
+    PLAN_ERR="$(mktemp)"
+
+    PLAN_RC=0
+    "${PLAN_CMD[@]}" > "$PLAN_OUT" 2> "$PLAN_ERR" || PLAN_RC=$?
+    cat "$PLAN_ERR" >&2
+    cat "$PLAN_ERR" >> "$BATCH_LOG_FILE"
+
+    if [[ "$PLAN_RC" -ne 0 ]]; then
+        die "batch planning failed (see the error above)."
+    fi
+
+    FILES=()
+    while IFS= read -r -d '' f; do
+        FILES+=("$f")
+    done < "$PLAN_OUT"
+
+    TOTAL=${#FILES[@]}
+    if [[ "$TOTAL" -eq 0 ]]; then
+        batch_log INFO "nothing to do — see the counts above."
+        exit 0
+    fi
+
+    SUCCEEDED=0
+    FAILED_FILES=()
+    INTERRUPTED=0
+    # A plain variable assignment, not `exit` -- lets the docker run for
+    # the file currently in progress finish (Ctrl-C is forwarded to it by
+    # docker same as any foreground container; pipeline.py's own
+    # KeyboardInterrupt handling marks that job "interrupted" and exits
+    # 130) rather than killing it mid-step. Checked right after each
+    # per-file run, below, to stop the loop before starting the next one.
+    trap 'INTERRUPTED=1' INT
+
+    FILE_STDOUT="$(mktemp)"
+
+    N=0
+    for CONTAINER_PATH in "${FILES[@]}"; do
+        N=$((N + 1))
+        REL="${CONTAINER_PATH#/input/}"
+        FILE_BASENAME="$(basename "$REL")"
+        REL_DIR="$(dirname "$REL")"
+        if [[ "$REL_DIR" == "." ]]; then
+            FILE_INPUT_DIR="$INPUT_DIR"
+            FILE_OUTPUT_DIR="$OUTPUT_DIR"
+        else
+            FILE_INPUT_DIR="${INPUT_DIR}/${REL_DIR}"
+            FILE_OUTPUT_DIR="${OUTPUT_DIR}/${REL_DIR}"
+        fi
+        mkdir -p "$FILE_OUTPUT_DIR" || die "could not create directory: ${FILE_OUTPUT_DIR}"
+
+        batch_log INFO "[${N}/${TOTAL}] START  ${REL}"
+        FILE_STARTED=$(date +%s)
+
+        # Only stdout is redirected -- stderr (all of pipeline.py's normal
+        # step-by-step logging) is left completely alone, going only to
+        # the terminal same as any single-file run, same as always. stdout
+        # is where pipeline.py prints exactly one line, right at the end
+        # of a run that reaches that point: "AC_RESULT ok" or "AC_RESULT
+        # warnings :: ...". That's the only thing captured here.
+        : > "$FILE_STDOUT"
+        build_docker_cmd "$FILE_INPUT_DIR" "$FILE_BASENAME" "" "$FILE_OUTPUT_DIR"
+        RC=0
+        "${DOCKER_CMD[@]}" > "$FILE_STDOUT" || RC=$?
+
+        FILE_ELAPSED=$(( $(date +%s) - FILE_STARTED ))
+
+        if [[ "$INTERRUPTED" -eq 1 || "$RC" -eq 130 ]]; then
+            batch_log WARN "[${N}/${TOTAL}] INTERRUPTED after $(fmt_hms "$FILE_ELAPSED")  ${REL}"
+            batch_log WARN "batch interrupted (Ctrl-C) after ${N}/${TOTAL} files."
+            batch_log WARN "  ${SUCCEEDED} succeeded, ${#FAILED_FILES[@]} failed before the interrupt."
+            batch_log WARN "  Re-run the same command to resume -- already-done files are skipped"
+            batch_log WARN "  automatically, and a part-finished file resumes from its last completed step."
+            exit 130
+        elif [[ "$RC" -ne 0 ]]; then
+            batch_log WARN "[${N}/${TOTAL}] FAILED (exit ${RC}) after $(fmt_hms "$FILE_ELAPSED")  ${REL}"
+            FAILED_FILES+=("$REL")
+        else
+            AC_RESULT_LINE="$(grep -m1 '^AC_RESULT ' "$FILE_STDOUT" || true)"
+            if [[ "$AC_RESULT_LINE" == "AC_RESULT warnings"* ]]; then
+                batch_log WARN "[${N}/${TOTAL}] DONE   in $(fmt_hms "$FILE_ELAPSED")  ${REL}  (${AC_RESULT_LINE#AC_RESULT warnings :: })"
+            else
+                batch_log INFO "[${N}/${TOTAL}] DONE   in $(fmt_hms "$FILE_ELAPSED")  ${REL}"
+            fi
+            SUCCEEDED=$((SUCCEEDED + 1))
+        fi
+    done
+    trap - INT
+
+    batch_log INFO "batch complete — ${SUCCEEDED}/${TOTAL} succeeded."
+    if [[ ${#FAILED_FILES[@]} -gt 0 ]]; then
+        batch_log WARN "  ${#FAILED_FILES[@]} failed:"
+        for f in "${FAILED_FILES[@]}"; do
+            batch_log WARN "    - ${f}"
+        done
+        batch_log WARN "  Each failure's own job log has the detail (see ${JOBS_DIR}). Re-running the"
+        batch_log WARN "  same --batch command later will retry only the ones that didn't succeed."
+        exit 1
+    fi
+    exit 0
 fi
-for step in "${REDO_STEPS[@]+"${REDO_STEPS[@]}"}"; do
-    PIPELINE_ARGS+=("--redo-step" "$step")
-done
 
-# Assemble final command
-DOCKER_CMD=(
-    docker run --rm
-    "${TTY_ARGS[@]+"${TTY_ARGS[@]}"}"
-    "${USER_ARGS[@]}"
-    "${VOLUME_ARGS[@]}"
-    "${ENV_ARGS[@]+"${ENV_ARGS[@]}"}"
-    "${IMAGE_NAME}"
-    "${PIPELINE_ARGS[@]}"
-)
+# ── Single-file mode ────────────────────────────────────────────────────────────
 
-# ── Execute (or print for --dry-run) ──────────────────────────────────────────
+build_docker_cmd "$INPUT_DIR" "$VIDEO_BASENAME" "$SRT_BASENAME" "$OUTPUT_DIR"
 
 if [[ -n "$DRY_RUN" ]]; then
     # Print the command in a readable multi-line form

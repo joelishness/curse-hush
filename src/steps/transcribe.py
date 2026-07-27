@@ -205,12 +205,21 @@ def transcribe(
                     "transcript": t_path.name,
                     "word_count": len(existing.get("words", [])),
                     "skipped":    True,
+                    # Not tracked for a skip-recovered segment -- whether
+                    # *this* segment's original run fell back to whisperx
+                    # isn't recoverable from transcript_NN.json alone, only
+                    # from the aggregate write at the end of a run that
+                    # completed this segment fresh (see below). Explicit
+                    # None, not an omitted key, so every segment_results
+                    # entry has the same shape either way.
+                    "mfa_fallback_reason": None,
                 })
             except (OSError, json.JSONDecodeError):
                 segment_results.append({
                     "index":      seg_idx,
                     "transcript": t_path.name,
                     "skipped":    True,
+                    "mfa_fallback_reason": None,
                 })
             continue
 
@@ -221,6 +230,14 @@ def transcribe(
         )
 
         t0 = time.monotonic()
+        # Set inside the MFA except-branch below when this segment falls
+        # back to whisperx.align() -- None otherwise. Carried into this
+        # segment's own segment_results entry further down, and summed
+        # across all segments into transcription.mfa_fallback_segments at
+        # the end of this function -- the same "field present only when
+        # notable" shape as encode.py's own fallback_reason, surfaced the
+        # same way in pipeline.py's end-of-run summary.
+        mfa_fallback_reason: Optional[str] = None
 
         # ── Load audio ────────────────────────────────────────────────────────
         # whisperx.load_audio() handles stereo→mono and 44.1kHz→16kHz
@@ -277,6 +294,7 @@ def transcribe(
                         seg_idx, n, dialog.name, exc,
                     )
                     use_whisperx_align = True
+                    mfa_fallback_reason = str(exc)
 
             if use_whisperx_align:
                 # Lazy-load or reload alignment model when language changes.
@@ -353,6 +371,7 @@ def transcribe(
             "transcript":  t_path.name,
             "word_count":  len(words),
             "elapsed_sec": round(elapsed, 1),
+            "mfa_fallback_reason": mfa_fallback_reason,
         })
 
     # ── Cleanup models ────────────────────────────────────────────────────────
@@ -367,6 +386,16 @@ def transcribe(
         "model":    model_name,
         "language": language or "auto",
         "segments": segment_results,
+        # Aggregate, not just per-segment detail -- so callers that only
+        # care about "did anything notable happen" (pipeline.py's own
+        # end-of-run summary, and via that, hush.sh's --batch log) can
+        # check one int instead of scanning segment_results themselves.
+        # Undercounts only for segments recovered via the skip-existing
+        # path above, whose original fallback status isn't recoverable --
+        # see that branch's comment.
+        "mfa_fallback_segments": sum(
+            1 for s in segment_results if s.get("mfa_fallback_reason")
+        ),
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "3_transcribe")

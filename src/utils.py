@@ -578,6 +578,24 @@ def validate_config(cfg: dict) -> None:
 
 # ── Job state ─────────────────────────────────────────────────────────────────
 
+def compute_job_id(video_path: Path) -> str:
+    """
+    Stable, content-independent job identifier: sha256[:12] of
+    (absolute_path + ':' + mtime).
+
+    Same path + mtime → same job_id → existing artifacts can be reused.
+    File changes (new mtime) → new job_id → fresh job directory.
+
+    Lives in utils.py (moved from pipeline.py) rather than there so it can
+    be imported on its own -- e.g. by batch_plan.py, to check a candidate
+    file's local job history -- without pulling in pipeline.py's own
+    top-level imports of every steps/ module (whisperx, torch, demucs),
+    which a lightweight planning pass has no need to load at all.
+    """
+    key = f"{video_path.resolve()}:{video_path.stat().st_mtime}"
+    return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
 def write_job(job_dir: Path, state: dict[str, Any]) -> None:
     """
     Atomically overwrite job.json (write-then-rename).

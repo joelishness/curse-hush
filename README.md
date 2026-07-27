@@ -68,6 +68,7 @@ If you skip this step, `hush.sh` will warn that the config directory is empty an
 
 ```
 hush.sh [OPTIONS] <input_video> [subtitle_file]
+hush.sh --batch [--recursive] [OPTIONS] <input_dir>
 
 Options:
   -o, --output DIR      Output directory (default: same directory as input)
@@ -77,6 +78,9 @@ Options:
       --interactive     Pause for review of flagged words before muting
       --no-interactive  Force unattended mode (overrides config.yaml)
       --keep-tmp        Keep large intermediate WAV stems after the run
+  -b, --batch           Process every video file in <input_dir> in sequence —
+                        see "Batch Processing" below
+  -r, --recursive       With --batch, also descend into subdirectories
       --skip-index N    Correct a false positive — see "Correcting Mistakes" below
       --add-interval TEXT START END
                         Correct a false negative — START/END as seconds or
@@ -107,9 +111,32 @@ Options:
 ./hush.sh --dry-run movie.mkv
 ```
 
-By default, the output file is named for Plex's `{edition-Name}` convention, inserted right after the release year so Plex shows it as a selectable Edition of the same movie:
+By default, the output file is named for Plex's `{edition-Name}` convention. Movies get it right after the release year, so Plex shows it as a selectable Edition of the same movie:
 `Movie (1986).sd.hevc.mkv` → `Movie (1986) {edition-Hushed}.sd.hevc.mkv`
+TV episodes get it at the end of the episode title instead, since a movie-style "right after the year" would land it in the middle of the filename (the year there belongs to the series, not the episode):
+`Psych (2006) - s02e01 - American Duos.sd.hevc.mkv` → `Psych (2006) - s02e01 - American Duos {edition-Hushed}.sd.hevc.mkv`
 Set `output.naming_style: suffix` in `config.yaml` for a plain suffix instead: `movie.mkv` → `movie_censored.mkv`.
+
+### Batch Processing
+
+`--batch` processes every video file in a directory, one after another, instead of one `hush.sh` invocation per file:
+
+```bash
+# One season — top-level files only, no subdirectories
+./hush.sh --batch "Psych (2006)/Season 02"
+
+# A whole show — every season + Specials, in one command
+./hush.sh --batch --recursive "Psych (2006)"
+
+# Redirect the whole batch's output elsewhere, mirroring subdirectories under it
+./hush.sh --batch --recursive -o ~/censored/ "Psych (2006)"
+```
+
+A file already having a censored output next to it (e.g. a `{edition-Hushed}` sibling) is skipped automatically — judged by the output file itself, not local job history, since a large library is often built up across more than one machine. Re-running the same `--batch` command later — after adding new episodes, after an interrupted run, after fixing a failure — only processes what's still missing; nothing gets redone. `Ctrl-C` stops the batch after the file currently in progress finishes its current step (that file resumes from there next time, same as any interrupted single-file run — see "Job History" below); an ordinary per-file failure is logged and the batch continues on to the next file, with a summary of anything that failed at the end.
+
+`--batch` can't be combined with `--skip-index` / `--add-interval` / `--redo-review` / `--redo-step` — those target one already-completed job, not a directory; run them against that one file directly instead. `--interactive` does work with `--batch`, but pauses for review on every file in the queue, one after another — usually only worth combining for a small batch.
+
+Every `--batch` run also writes a high-level overview to `<jobs_dir>/batch-logs/`, one file per invocation: the plan phase's results (how many files were found, already done, and queued), and each file's start time, end time, and duration. It deliberately does *not* duplicate each file's own full step-by-step transcript — that already lives in that job's own `job_dir/logs/*.log` — so it stays a quick, scannable summary across 100+ files rather than growing as long as reading through every job individually. It does still flag anything notable in one short line, e.g. an MFA alignment falling back to `whisperx.align()` for a segment, using a compact result line pipeline.py prints for exactly this purpose. Set `AC_LOG_LEVEL=debug` to have the plan phase name the specific files it skipped or queued, not just the counts.
 
 ### Using docker compose (workstation)
 

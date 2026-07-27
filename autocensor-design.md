@@ -1018,7 +1018,7 @@ The correction flags (`--skip-index`, `--add-interval`, `--redo-review`) are §1
 - [ ] Beep replacement mode (sine tone)
 - [ ] `--dry-run` flag (show what would be muted without writing output)
 - [ ] Progress reporting (step names + estimated time)
-- [ ] Batch processing support (`hush.sh *.mkv`)
+- [x] Batch processing support — `hush.sh --batch [--recursive] <input_dir>` (not the `hush.sh *.mkv` shell-glob shape originally sketched here: a directory argument plus a planning pass lets it skip already-censored files and mirror subdirectory structure, neither of which a bare glob expansion could do on its own). See `batch_plan.py` and hush.sh's `--batch` section; skip decisions reuse `steps/mux.py`'s own `_output_path()` rather than a second naming implementation.
 ---
  
 ## 11. Open Questions
