@@ -29,21 +29,28 @@
 #       --no-interactive  Force unattended mode (overrides config.yaml)
 #       --keep-tmp        Retain large intermediate WAV stems after the run
 #   -b, --batch           Process every video file directly inside <input_dir>,
-#                         one after another. Skips any file that already has a
-#                         censored output sitting next to it (judged by output
-#                         filename, e.g. the "{edition-Hushed}" tag -- not by
-#                         local job history alone, since a file may have been
-#                         censored on a different machine). Ctrl-C stops the
-#                         batch after the file in progress finishes its
-#                         current step; re-running the same command resumes --
-#                         already-done files are skipped automatically, and a
-#                         part-finished file resumes from its last completed
-#                         step (see pipeline.py's existing job resume logic).
-#                         Cannot combine with --skip-index/--add-interval/
-#                         --redo-review/--redo-step (those target one already-
-#                         completed job, not a directory). --interactive works,
-#                         but pauses for review on every file in the queue,
-#                         one after another. Writes a high-level overview to
+#                         one after another. For movies (and anything under
+#                         naming_style: suffix), skips any file that already
+#                         has a censored output in place (judged by output
+#                         filename -- not local job history alone, since a
+#                         file may have been censored on a different
+#                         machine). TV episodes are always reprocessed --
+#                         see -r below for why an existence check isn't
+#                         done for these -- so an already-done episode's
+#                         output just gets overwritten with an equivalent
+#                         result, the same as re-running a single movie
+#                         file whose job history was deleted. Ctrl-C stops
+#                         the batch after the file in progress finishes its
+#                         current step; re-running the same command resumes
+#                         -- already-done movies are skipped automatically,
+#                         and a part-finished file (movie or TV) resumes
+#                         from its last completed step (see pipeline.py's
+#                         existing job resume logic). Cannot combine with
+#                         --skip-index/--add-interval/--redo-review/
+#                         --redo-step (those target one already-completed
+#                         job, not a directory). --interactive works, but
+#                         pauses for review on every file in the queue, one
+#                         after another. Writes a high-level overview to
 #                         <jobs_dir>/batch-logs/ -- plan-phase results, each
 #                         file's start/end/duration, and a short note if
 #                         pipeline.py flagged anything (e.g. an MFA alignment
@@ -58,8 +65,23 @@
 #   -r, --recursive       With --batch, also descend into subdirectories (e.g.
 #                         Season 01/, Season 02/, Specials/). Off by default --
 #                         a bare --batch only processes files directly inside
-#                         <input_dir>. Output mirrors each file's subdirectory
-#                         under --output (or <input_dir> itself, by default).
+#                         <input_dir>. Movie output mirrors each file's
+#                         subdirectory under --output (or <input_dir> itself,
+#                         by default). TV episode output does NOT mirror in
+#                         place -- Plex has no per-episode edition concept
+#                         (see https://support.plex.tv/articles/multiple-
+#                         editions-tv-shows/); instead the whole *show*
+#                         gets redirected to a sibling directory, computed
+#                         from each file's own real path in bash:
+#                           Psych (2006)/Season 02/... - s02e01 - ....mkv
+#                           -> Psych (2006) {edition-Hushed}/Season 02/... - s02e01 - ....mkv
+#                         (untagged filename, season/specials structure
+#                         preserved underneath). Because that target is a
+#                         sibling of the show folder rather than a
+#                         descendant of wherever --batch was pointed, it
+#                         can't be reliably existence-checked from the
+#                         planning pass -- see -b above for what that means
+#                         in practice.
 #       --skip-index N    Correction: un-mute the flagged match at this word_index
 #                         (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
 #       --add-interval TEXT START END
@@ -110,15 +132,19 @@ Options:
       --no-interactive  Force unattended mode (overrides config.yaml)
       --keep-tmp        Retain large intermediate WAV stems after the run
   -b, --batch           Process every video file directly inside <input_dir>,
-                        one after another. Skips any file that already has a
-                        censored output sitting next to it (judged by output
-                        filename, e.g. the "{edition-Hushed}" tag -- not by
-                        local job history alone, since a file may have been
-                        censored on a different machine). Ctrl-C stops the
-                        batch after the file in progress finishes its current
-                        step; re-running the same command resumes -- already-
-                        done files are skipped automatically, and a part-
-                        finished file resumes from its last completed step.
+                        one after another. For movies (and anything under
+                        naming_style: suffix), skips any file that already
+                        has a censored output in place (judged by output
+                        filename -- not local job history alone, since a
+                        file may have been censored on a different
+                        machine). TV episodes are always reprocessed -- see
+                        -r below for why -- so an already-done episode's
+                        output just gets overwritten with an equivalent
+                        result. Ctrl-C stops the batch after the file in
+                        progress finishes its current step; re-running the
+                        same command resumes -- already-done movies are
+                        skipped automatically, and a part-finished file
+                        (movie or TV) resumes from its last completed step.
                         Cannot combine with --skip-index/--add-interval/
                         --redo-review/--redo-step (those target one already-
                         completed job, not a directory). --interactive works,
@@ -136,8 +162,20 @@ Options:
   -r, --recursive       With --batch, also descend into subdirectories (e.g.
                         Season 01/, Season 02/, Specials/). Off by default --
                         a bare --batch only processes files directly inside
-                        <input_dir>. Output mirrors each file's subdirectory
-                        under --output (or <input_dir> itself, by default).
+                        <input_dir>. Movie output mirrors each file's
+                        subdirectory under --output (or <input_dir> itself,
+                        by default). TV episode output does NOT mirror in
+                        place -- Plex has no per-episode edition concept, so
+                        the whole show gets redirected to a sibling
+                        directory instead (computed from each file's own
+                        real path, in bash):
+                          Psych (2006)/Season 02/... - s02e01 - ....mkv
+                          -> Psych (2006) {edition-Hushed}/Season 02/... - s02e01 - ....mkv
+                        See https://support.plex.tv/articles/multiple-
+                        editions-tv-shows/. That target is a sibling of the
+                        show folder, not a descendant of wherever --batch
+                        was pointed, which is why it can't be reliably
+                        existence-checked during planning -- see -b above.
       --skip-index N    Correction: un-mute the flagged match at this word_index
                         (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
       --add-interval TEXT START END
@@ -260,6 +298,69 @@ fmt_hms() {
     printf '%02d:%02d:%02d' $((total/3600)) $((total%3600/60)) $((total%60))
 }
 
+# Mirrors batch_plan.py's _is_tv_episode() -- keep the two in sync if
+# this heuristic ever changes. Duplicated rather than shared because
+# each side genuinely needs its own copy: this one decides where to
+# mount /output for the real per-file run (see redirect_for_tv_edition
+# below), which depends on real host directory names nothing running
+# inside a container ever sees; batch_plan.py's copy decides whether to
+# skip its own existence check (see that file's module docstring).
+#
+# $1 = file basename, $2 = its immediate parent directory's basename
+is_tv_episode() {
+    local base_lc="${1,,}" parent_lc="${2,,}"
+
+    # Primary signal: an sNNeNN marker in the filename.
+    [[ "$base_lc" =~ s[0-9]{1,2}e[0-9]{1,3} ]] && return 0
+
+    # Secondary signal: Plex's date-based episode naming (some shows use
+    # "2011-11-15" instead of "s02e01") -- but only when corroborated by
+    # sitting in a season-style folder. A bare date pattern alone is too
+    # easy to collide with a movie whose own title happens to contain
+    # one; requiring the season-folder context is what disambiguates it.
+    if [[ "$base_lc" =~ [0-9]{4}-[0-9]{2}-[0-9]{2} || "$base_lc" =~ [0-9]{2}-[0-9]{2}-[0-9]{4} ]]; then
+        is_season_dir_name "$parent_lc" && return 0
+    fi
+
+    return 1
+}
+
+# $1 = a directory basename, already lowercased by the caller
+is_season_dir_name() {
+    [[ "$1" =~ ^season[[:space:]]*[0-9]{1,2}$ || "$1" == "specials" ]]
+}
+
+# Redirects a mirrored output directory to Plex's TV-editions sibling
+# show directory -- "Show (Year)" -> "Show (Year) {edition-Name}",
+# season/specials subpath preserved underneath -- per
+# https://support.plex.tv/articles/multiple-editions-tv-shows/. Only
+# ever called when naming_style is plex_edition and is_tv_episode
+# matched. Pure path-string arithmetic on an already-resolved, real host
+# path -- no filesystem access needed, so this works identically
+# whether or not anything actually exists yet at the target (nothing
+# here checks -- see batch_plan.py's module docstring for why TV
+# episodes are never existence-checked at all, unlike movies).
+#   $1 = the mirrored output directory hush.sh would otherwise use as-is
+#   $2 = configured edition_name
+redirect_for_tv_edition() {
+    local mirrored_dir="$1" edition_name="$2"
+    local leaf leaf_lc show_root
+
+    leaf="$(basename "$mirrored_dir")"
+    leaf_lc="${leaf,,}"
+
+    if is_season_dir_name "$leaf_lc"; then
+        # mirrored_dir is itself a season/specials folder -- the show
+        # root is one level up; redirect that, then re-append this
+        # season leaf underneath it.
+        show_root="$(dirname "$mirrored_dir")"
+        echo "$(dirname "$show_root")/$(basename "$show_root") {edition-${edition_name}}/${leaf}"
+    else
+        # No season subfolder -- mirrored_dir itself is the show root.
+        echo "$(dirname "$mirrored_dir")/${leaf} {edition-${edition_name}}"
+    fi
+}
+
 # ── Argument defaults ─────────────────────────────────────────────────────────
 
 OUTPUT_DIR=""
@@ -279,6 +380,9 @@ REDO_REVIEW=""
 REDO_STEPS=()
 BATCH=""
 RECURSIVE=""
+NAMING_STYLE=""
+EDITION_NAME=""
+OUT_FORMAT=""
 
 # Saved before the parsing loop below shifts through it -- used only for the
 # batch log header (see --batch), so the log file is self-contained: what
@@ -424,6 +528,55 @@ if [[ -n "$BATCH" && ( -n "$REDO_REVIEW" || ${#SKIP_INDICES[@]} -gt 0 || ${#ADD_
   against that one file directly instead, without --batch."
 fi
 
+# ── Check Docker is available ─────────────────────────────────────────────────
+
+command -v docker >/dev/null 2>&1 \
+    || die "docker not found in PATH; install Docker and try again"
+
+if [[ -z "$DRY_RUN" ]]; then
+    docker info >/dev/null 2>&1 \
+        || die "Docker daemon is not running (or current user lacks permission)"
+fi
+
+# ── Resolve naming_style / edition_name, and redirect TV output ───────────────
+#
+# Needed to decide whether (and how) to redirect a TV episode's output
+# into Plex's sibling "Show (Year) {edition-Name}" directory (see
+# redirect_for_tv_edition above) -- a decision made here, in bash, since
+# only bash has visibility into the real, un-mounted directory names
+# above wherever /input ends up scoped to for a given file. One quick,
+# read-only container call, run once per invocation, not per file. Has
+# to happen before "Create host-side directories" below, so that step
+# creates the right (possibly redirected) directory instead of the
+# plain mirrored one.
+#
+# Skipped entirely for --dry-run: dry-run doesn't require Docker to even
+# be running today (see the skipped `docker info` check just above), and
+# this would be the first thing to break that. The dry-run output further
+# down notes this explicitly rather than silently showing an unredirected
+# path for what might be a TV episode.
+if [[ -z "$DRY_RUN" ]]; then
+    NAMING_OUT="$(docker run --rm --entrypoint python --user "$(id -u):$(id -g)" \
+        -v "${CONFIG_DIR}:/config:ro" "${IMAGE_NAME}" \
+        /app/resolve_naming.py --config /config/config.yaml)" \
+        || die "could not read naming config (see any error above)."
+    while IFS='=' read -r key value; do
+        case "$key" in
+            naming_style) NAMING_STYLE="$value" ;;
+            edition_name) EDITION_NAME="$value" ;;
+            format)       OUT_FORMAT="$value" ;;
+        esac
+    done <<< "$NAMING_OUT"
+
+    # Single-file mode: batch mode's equivalent lives in the per-file
+    # loop further down, where each file's own directory context is
+    # known (see FILE_OUTPUT_DIR there).
+    if [[ -z "$BATCH" && "$NAMING_STYLE" == "plex_edition" ]] \
+        && is_tv_episode "$VIDEO_BASENAME" "$(basename "$INPUT_DIR")"; then
+        OUTPUT_DIR="$(redirect_for_tv_edition "$OUTPUT_DIR" "$EDITION_NAME")"
+    fi
+fi
+
 # ── Create host-side directories if they don't exist ─────────────────────────
 
 for dir in "$OUTPUT_DIR" "$CONFIG_DIR" "$CACHE_DIR" "$JOBS_DIR"; do
@@ -440,16 +593,6 @@ if [[ -z "$(ls -A "$CONFIG_DIR" 2>/dev/null)" ]]; then
     echo "${SCRIPT_NAME}: warning: config directory is empty: ${CONFIG_DIR}" >&2
     echo "  Copy config/config.yaml and config/word_list.txt from the repo into that directory," >&2
     echo "  or leave it empty to use the image's built-in config.yaml as-is." >&2
-fi
-
-# ── Check Docker is available ─────────────────────────────────────────────────
-
-command -v docker >/dev/null 2>&1 \
-    || die "docker not found in PATH; install Docker and try again"
-
-if [[ -z "$DRY_RUN" ]]; then
-    docker info >/dev/null 2>&1 \
-        || die "Docker daemon is not running (or current user lacks permission)"
 fi
 
 # ── Shared docker-invocation pieces (same for every file, single or batch) ────
@@ -612,11 +755,18 @@ if [[ -n "$BATCH" ]]; then
         echo "# profanity-hush dry run (--batch) — planning command that runs first:"
         printf '%q \\\n' "${PLAN_CMD[@]}" | sed '$ s/ \\$//'
         echo
-        echo "# It prints which files under ${INPUT_DIR} still need processing (already-"
-        echo "# censored ones are skipped -- see hush.sh --help). Each one is then run"
-        echo "# exactly like a plain, non-batch --dry-run invocation against that single"
-        echo "# file would be -- same volume/env/pipeline-arg shape, just looped, with"
-        echo "# /input and /output mounted to that file's own directory."
+        echo "# It prints which files under ${INPUT_DIR} still need processing."
+        echo "# Movies already censored are skipped; TV episodes are always queued"
+        echo "# (and their output overwritten if it already exists) -- see"
+        echo "# batch_plan.py's module docstring for why. Each queued file is then"
+        echo "# run exactly like a plain, non-batch --dry-run invocation against that"
+        echo "# single file would be -- same volume/env/pipeline-arg shape, just"
+        echo "# looped, with /input and /output mounted to that file's own directory."
+        echo "#"
+        echo "# Note: --dry-run never touches Docker, so the naming_style lookup"
+        echo "# that would redirect a TV episode's /output to a sibling"
+        echo "# \"Show (Year) {edition-Name}\" directory (Plex's TV-editions"
+        echo "# convention) doesn't run here either -- a real run may redirect it."
         echo "#"
         echo "# A real run also writes a batch log under \${JOBS_DIR}/batch-logs/ --"
         echo "# nothing is written for --dry-run itself."
@@ -654,7 +804,9 @@ if [[ -n "$BATCH" ]]; then
         echo "=== profanity-hush batch run ==="
         echo "Started : $(date '+%Y-%m-%d %H:%M:%S %z')"
         echo "Input   : ${INPUT_DIR}$( [[ -n "$RECURSIVE" ]] && echo " (recursive)" )"
-        echo "Output  : ${OUTPUT_DIR}"
+        echo "Output  : ${OUTPUT_DIR}  (base root -- TV episodes redirect to a sibling"
+        echo "          \"Show (Year) {edition-Name}\" directory; see each file's own"
+        echo "          START line below for exactly where it went)"
         echo "Command : ${SCRIPT_NAME} ${ORIGINAL_ARGS[*]+"${ORIGINAL_ARGS[*]}"}"
         echo "================================="
     } > "$BATCH_LOG_FILE"
@@ -705,6 +857,7 @@ if [[ -n "$BATCH" ]]; then
     fi
 
     SUCCEEDED=0
+    SKIPPED=0
     FAILED_FILES=()
     INTERRUPTED=0
     # A plain variable assignment, not `exit` -- lets the docker run for
@@ -730,9 +883,31 @@ if [[ -n "$BATCH" ]]; then
             FILE_INPUT_DIR="${INPUT_DIR}/${REL_DIR}"
             FILE_OUTPUT_DIR="${OUTPUT_DIR}/${REL_DIR}"
         fi
+
+        if [[ "$NAMING_STYLE" == "plex_edition" ]] \
+            && is_tv_episode "$FILE_BASENAME" "$(basename "$FILE_INPUT_DIR")"; then
+            FILE_OUTPUT_DIR="$(redirect_for_tv_edition "$FILE_OUTPUT_DIR" "$EDITION_NAME")"
+
+            # batch_plan.py deliberately never existence-checks a TV
+            # episode (see its own module docstring for why) -- do the
+            # equivalent check here instead, now that the real redirect
+            # target is known. Safe to do in plain bash, unlike the movie
+            # case: a TV filename needs no transformation at all (see
+            # mux.py's _output_path()), just the out_format extension
+            # swap, so there's no risk of this drifting out of sync with
+            # what Step 7 actually names the file the way replicating
+            # movies' fuller naming logic here would risk.
+            PREDICTED_NAME="${FILE_BASENAME%.*}.${OUT_FORMAT}"
+            if [[ -f "${FILE_OUTPUT_DIR}/${PREDICTED_NAME}" ]]; then
+                batch_log INFO "[${N}/${TOTAL}] SKIP   already done  ${REL}  ->  ${FILE_OUTPUT_DIR}"
+                SKIPPED=$((SKIPPED + 1))
+                continue
+            fi
+        fi
+
         mkdir -p "$FILE_OUTPUT_DIR" || die "could not create directory: ${FILE_OUTPUT_DIR}"
 
-        batch_log INFO "[${N}/${TOTAL}] START  ${REL}"
+        batch_log INFO "[${N}/${TOTAL}] START  ${REL}  ->  ${FILE_OUTPUT_DIR}"
         FILE_STARTED=$(date +%s)
 
         # Only stdout is redirected -- stderr (all of pipeline.py's normal
@@ -751,7 +926,7 @@ if [[ -n "$BATCH" ]]; then
         if [[ "$INTERRUPTED" -eq 1 || "$RC" -eq 130 ]]; then
             batch_log WARN "[${N}/${TOTAL}] INTERRUPTED after $(fmt_hms "$FILE_ELAPSED")  ${REL}"
             batch_log WARN "batch interrupted (Ctrl-C) after ${N}/${TOTAL} files."
-            batch_log WARN "  ${SUCCEEDED} succeeded, ${#FAILED_FILES[@]} failed before the interrupt."
+            batch_log WARN "  ${SUCCEEDED} succeeded, ${SKIPPED} already done, ${#FAILED_FILES[@]} failed before the interrupt."
             batch_log WARN "  Re-run the same command to resume -- already-done files are skipped"
             batch_log WARN "  automatically, and a part-finished file resumes from its last completed step."
             exit 130
@@ -770,7 +945,7 @@ if [[ -n "$BATCH" ]]; then
     done
     trap - INT
 
-    batch_log INFO "batch complete — ${SUCCEEDED}/${TOTAL} succeeded."
+    batch_log INFO "batch complete — ${SUCCEEDED}/${TOTAL} succeeded, ${SKIPPED} already done."
     if [[ ${#FAILED_FILES[@]} -gt 0 ]]; then
         batch_log WARN "  ${#FAILED_FILES[@]} failed:"
         for f in "${FAILED_FILES[@]}"; do
@@ -798,6 +973,14 @@ if [[ -n "$DRY_RUN" ]]; then
     echo "#   ${CONFIG_DIR}  →  /config  (ro)"
     echo "#   ${CACHE_DIR}  →  /cache"
     echo "#   ${JOBS_DIR}  →  /jobs"
+    echo "#"
+    echo "# Note: --dry-run never touches Docker (no daemon required), so the"
+    echo "# naming_style/edition_name lookup that decides whether this is a TV"
+    echo "# episode -- and, if so, redirects /output to a sibling"
+    echo "# \"Show (Year) {edition-Name}\" directory per Plex's TV-editions"
+    echo "# convention -- doesn't run either. The /output path above is exactly"
+    echo "# what a plain movie (or non-plex_edition) run would use; a real TV"
+    echo "# episode run may redirect it."
     exit 0
 fi
 

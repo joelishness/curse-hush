@@ -9,7 +9,11 @@ pipeline (§4) — once this succeeds, the job is done.
 Input  : original video file, audio_encoded.mka (Step 6b)
 Output : /output/{filename per output.naming_style} -- see _output_path
          for the two supported styles (plex_edition, the default, and the
-         original v1 suffix style)
+         original v1 suffix style). For a TV episode under plex_edition,
+         /output is expected to already be the show's sibling edition
+         directory by the time this runs -- see hush.sh's
+         redirect_for_tv_edition() for where that decision is actually
+         made and why it can't be made in here.
 
 **The actual muxing tool depends on output.format** — this is the one step
 in the pipeline that doesn't use ffmpeg for its primary job:
@@ -178,6 +182,35 @@ def mux(
         )
     out_path = _output_path(video_path, output_dir, cfg, out_format)
 
+    # Compares real host paths (AC_INPUT_HOST_DIR / AC_OUTPUT_HOST_DIR,
+    # merged into cfg by utils.load_config() -- see paths.input_host_dir /
+    # paths.output_host_dir), not output_dir/video_path themselves: those
+    # are always /output and /input, two distinct container mount points
+    # that can never compare equal to each other regardless of what real
+    # host directories they're actually bound to. (An earlier version of
+    # this check compared those instead and could never have caught
+    # anything as a result -- comparing container-side paths here was the
+    # bug, not the idea of checking at all.) This is cheap insurance
+    # against the failure mode that matters most: a bug in whatever
+    # redirected the output directory (hush.sh's TV-editions redirection,
+    # or a bad --output value) silently landing the final write on top of
+    # the source file. Skipped, not raised, if either host path is
+    # unknown -- e.g. this cfg came from a context that never set these
+    # env vars at all -- since there's nothing meaningful to compare then.
+    real_input_dir  = cfg_get(cfg, "paths", "input_host_dir", default=None)
+    real_output_dir = cfg_get(cfg, "paths", "output_host_dir", default=None)
+    if real_input_dir and real_output_dir:
+        real_video = Path(real_input_dir) / video_path.name
+        real_out   = Path(real_output_dir) / out_path.name
+        if real_video == real_out:
+            raise RuntimeError(
+                f"Step 7: computed output path ({real_out}) is identical "
+                f"to the input video -- refusing to overwrite the "
+                "source. Check output.naming_style and, for a TV "
+                "episode, whatever directory hush.sh redirected /output "
+                "to for this file."
+            )
+
     if "7_mux" in state.get("steps_completed", []):
         log.info("Step 7 — ↩  already complete; re-using %s.", out_path.name)
         if not out_path.exists():
@@ -271,94 +304,61 @@ def mux(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _split_trailing_tech_tags(stem: str) -> "tuple[str, str]":
-    """
-    Split a filename stem into (title_part, tech_part).
-
-    tech_part is the maximal run of *trailing* dot-separated segments
-    that are each non-empty and contain no whitespace -- the shape a real
-    technical-tag chain always has ("sd.hevc", "1080p.hevc", ...).
-    title_part is everything before that run, dots and all.
-
-    This deliberately is not just "split on the first '.'": an episode
-    title can itself contain literal dots, e.g. an ellipsis --
-    "Lights, Camera... Homicidio" -- and the first "." in the full stem
-    would land in the middle of "Camera...", not at the actual
-    title/tech-tags boundary. Scanning from the *end* instead, a segment
-    that's empty (consecutive dots, i.e. the inside of "...") or that
-    contains a space immediately stops the scan and is left on the title
-    side, since neither shape is ever a real technical tag:
-
-        "Psych (2006) - s02e13 - Lights, Camera... Homicidio.sd.hevc"
-        -> ("Psych (2006) - s02e13 - Lights, Camera... Homicidio", "sd.hevc")
-
-    Returns (stem, "") unchanged if no trailing technical-tag run is
-    found at all (e.g. no dots in the stem, or the segment right before
-    the last dot still has a space in it -- there's nothing purely
-    technical to split off).
-    """
-    parts = stem.split(".")
-    k = len(parts)
-    while k > 0 and parts[k - 1] != "" and not re.search(r"\s", parts[k - 1]):
-        k -= 1
-    if k == len(parts):
-        return stem, ""
-    return ".".join(parts[:k]), ".".join(parts[k:])
-
-
 def _output_path(video_path: Path, output_dir: Path, cfg: dict, out_format: str) -> Path:
     """
     Imported directly by batch_plan.py, not just called from mux() below --
     the leading underscore here is a "not part of steps.mux's own public
     step-function API" marker (that's mux() alone), not "nothing outside
-    this file may import it." batch_plan.py needs the exact same naming
-    decision Step 7 will actually make, to predict whether a given input's
-    output already exists, without a second, drift-prone implementation of
-    the TV/movie tag-placement and dot-boundary logic below. Treat this
-    signature as a two-caller contract when changing it.
+    this file may import it." Treat this signature as a two-caller
+    contract when changing it.
 
     Build the final output filename, per output.naming_style:
 
     plex_edition (default) -- a Plex-friendly {edition-Name} tag (see
       https://support.plex.tv/articles/multiple-editions/). Movies and TV
-      episodes use different insertion points, since the two naming
-      conventions put the year in different places relative to the part
-      Plex actually expects the edition tag to follow:
+      episodes follow *different Plex conventions entirely*, not just a
+      different insertion point in the same filename:
 
-      Movies -- inserted right after the "(YYYY)" release-year portion of
-        the filename if one is present, so Plex shows the censored file
-        as a selectable Edition of the same movie instead of an unrelated
-        second item:
+      Movies -- the tag is inserted right after the "(YYYY)" release-year
+        portion of the filename if one is present, so Plex shows the
+        censored file as a selectable Edition of the same movie instead
+        of an unrelated second item:
           "Movie (1986).sd.hevc.mkv" -> "Movie (1986) {edition-Hushed}.sd.hevc.mkv"
         Falls back to appending the tag at the very end -- still valid
         Plex syntax -- if no "(YYYY)" pattern is found at all.
 
-      TV episodes -- detected via a "sNNeNN"-style season/episode marker
-        (e.g. "s02e01"), which the "(YYYY)" test alone can't distinguish
-        from a movie: a TV episode's "(YYYY)" belongs to the *series*,
-        right at the front of the filename, nowhere near the episode
-        title -- inserting there would land the tag in the middle of the
-        filename instead of at the end of the title, e.g. the wrong
-        "Psych (2006) {edition-Hushed} - s02e01 - American Duos.sd.hevc.mkv"
-        rather than the correct
-        "Psych (2006) - s02e01 - American Duos {edition-Hushed}.sd.hevc.mkv".
-        For these, the tag is inserted at the end of the episode title
-        instead -- i.e. right before any dot-separated technical tags
-        (resolution, codec, etc.) that follow it. Falls back to
-        appending at the very end if there are no technical tags after
-        the title at all.
-
-        The boundary isn't simply "the first '.' in the stem" -- an
-        episode title can itself contain literal dots (an ellipsis, e.g.
-        "Lights, Camera... Homicidio"), and splitting on the first one
-        would cut the tag into the middle of the title instead of after
-        it. See _split_trailing_tech_tags() for how the real boundary is
-        found:
-          "Psych (2006) - s02e13 - Lights, Camera... Homicidio.sd.hevc.mkv"
-          -> "Psych (2006) - s02e13 - Lights, Camera... Homicidio {edition-Hushed}.sd.hevc.mkv"
+      TV episodes -- Plex has no per-episode edition concept
+        (https://support.plex.tv/articles/multiple-editions-tv-shows/
+        says so outright). Instead, the whole *show* gets a sibling
+        directory: "Show (Year)" -> "Show (Year) {edition-Hushed}", with
+        the season/specials structure and episode filenames mirrored
+        underneath completely unchanged. That redirection is decided and
+        carried out by hush.sh, in bash, before this function is ever
+        called (see hush.sh's redirect_for_tv_edition()) -- it depends on
+        real, surrounding directory names this function has no way to
+        see: `output_dir` here is always /output, the container's own
+        opaque mount point name -- never the real host directory hush.sh
+        actually pointed it at, regardless of what that is. Checking
+        `output_dir` itself for the edition tag (an earlier bug) can
+        never see it there even when hush.sh redirected correctly; the
+        real host directory only reaches this function via
+        cfg["paths"]["output_host_dir"] (populated from AC_OUTPUT_HOST_DIR
+        -- see utils.load_config()'s docstring and mux()'s own
+        output_host_dir lookup just below, for the same reasoning applied
+        to logging). By the time this runs, whichever directory
+        AC_OUTPUT_HOST_DIR names IS already the correct one either way --
+        this function only needs to tell the two cases apart to decide
+        the *filename*: if the edition tag appears anywhere in that real
+        host path, hush.sh already redirected it here for a TV episode,
+        so the filename needs no tag at all, just the out_format
+        extension swap, same as any file. Otherwise this is a movie (or a
+        TV episode under naming_style: suffix, which never redirects --
+        see below) and gets the "insert after year" treatment above.
 
     suffix -- the original v1 behaviour: a plain suffix appended before
-      the extension, no Plex Edition semantics.
+      the extension, no Plex Edition semantics and no TV redirection
+      either -- there's no Plex Edition convention to follow for a style
+      that isn't representing an Edition in the first place.
         "movie.mkv" -> "movie_censored.mkv"
 
     Path(name).stem strips only the final extension, so a filename like
@@ -372,17 +372,22 @@ def _output_path(video_path: Path, output_dir: Path, cfg: dict, out_format: str)
         edition_name = str(cfg_get(cfg, "output", "edition_name"))
         tag = f"{{edition-{edition_name}}}"
 
-        episode_match = re.search(r"(?i)\bs\d{1,2}e\d{1,3}\b", stem)
-        if episode_match:
-            # TV episode: the "(YYYY)" (if any) belongs to the series
-            # name up front, not the episode title, so anchor on the
-            # trailing technical-tag chain instead -- whatever precedes
-            # it is the full "Series (Year) - sNNeNN - Title" portion,
-            # and the tag belongs right after that, not after the year
-            # alone. Not just "the first '.' in the stem" -- the title
-            # itself may contain dots (see _split_trailing_tech_tags).
-            title_part, tech_part = _split_trailing_tech_tags(stem)
-            new_stem = f"{title_part} {tag}" + (f".{tech_part}" if tech_part else "")
+        # See this function's docstring above: output_dir is always the
+        # opaque /output mount point, never informative here -- the real
+        # host directory (which hush.sh may have redirected for a TV
+        # episode) only reaches us via AC_OUTPUT_HOST_DIR, already merged
+        # into cfg by utils.load_config(). Empty/missing (e.g. this cfg
+        # came from batch_plan.py's own planning pass, which never sets
+        # AC_OUTPUT_HOST_DIR at all) correctly falls through to the movie
+        # branch below -- batch_plan.py never calls this for a TV episode
+        # in the first place, so that's the only case that reaches here.
+        real_output_dir = cfg_get(cfg, "paths", "output_host_dir", default=None) or ""
+
+        if re.search(r"\{edition-[^}]+\}", real_output_dir):
+            # TV episode, already redirected to its show's sibling
+            # edition directory by hush.sh -- the directory carries the
+            # tag, so the filename itself is untouched.
+            new_stem = stem
         else:
             year_match = re.search(r"\(\d{4}\)", stem)
             if year_match:

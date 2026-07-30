@@ -111,11 +111,19 @@ Options:
 ./hush.sh --dry-run movie.mkv
 ```
 
-By default, the output file is named for Plex's `{edition-Name}` convention. Movies get it right after the release year, so Plex shows it as a selectable Edition of the same movie:
+By default, the output file is named for Plex's `{edition-Name}` convention — but movies and TV shows follow *different* Plex conventions entirely, not just a different spot in the same filename.
+
+Movies get the tag right after the release year, so Plex shows it as a selectable Edition of the same movie:
 `Movie (1986).sd.hevc.mkv` → `Movie (1986) {edition-Hushed}.sd.hevc.mkv`
-TV episodes get it at the end of the episode title instead, since a movie-style "right after the year" would land it in the middle of the filename (the year there belongs to the series, not the episode):
-`Psych (2006) - s02e01 - American Duos.sd.hevc.mkv` → `Psych (2006) - s02e01 - American Duos {edition-Hushed}.sd.hevc.mkv`
-Set `output.naming_style: suffix` in `config.yaml` for a plain suffix instead: `movie.mkv` → `movie_censored.mkv`.
+
+TV shows have no per-episode edition feature ([Plex says so directly](https://support.plex.tv/articles/multiple-editions-tv-shows/)). Instead, the whole *show* gets a sibling directory — season/specials structure and episode filenames mirrored underneath, completely unchanged:
+```
+Psych (2006)/Season 02/Psych (2006) - s02e01 - American Duos.sd.hevc.mkv
+Psych (2006) {edition-Hushed}/Season 02/Psych (2006) - s02e01 - American Duos.sd.hevc.mkv
+```
+This is decided in `hush.sh` itself, before anything runs, since it depends on real directory names above the file that a container never sees. A file is treated as a TV episode if its name has an `sNNeNN` marker, or a date (`2011-11-15`) *and* sits in a `Season NN`/`Specials` folder — a bare date alone isn't enough, since a movie's own title could coincidentally contain one.
+
+Set `output.naming_style: suffix` in `config.yaml` for a plain suffix instead, for either kind: `movie.mkv` → `movie_censored.mkv`. Suffix style never redirects TV output — there's no Plex Edition concept for it to follow in the first place.
 
 ### Batch Processing
 
@@ -132,7 +140,7 @@ Set `output.naming_style: suffix` in `config.yaml` for a plain suffix instead: `
 ./hush.sh --batch --recursive -o ~/censored/ "Psych (2006)"
 ```
 
-A file already having a censored output next to it (e.g. a `{edition-Hushed}` sibling) is skipped automatically — judged by the output file itself, not local job history, since a large library is often built up across more than one machine. Re-running the same `--batch` command later — after adding new episodes, after an interrupted run, after fixing a failure — only processes what's still missing; nothing gets redone. `Ctrl-C` stops the batch after the file currently in progress finishes its current step (that file resumes from there next time, same as any interrupted single-file run — see "Job History" below); an ordinary per-file failure is logged and the batch continues on to the next file, with a summary of anything that failed at the end.
+Already-censored files are skipped automatically for both movies and TV, judged by the output file itself rather than local job history, since a large library is often built up across more than one machine. The check happens in different places for the two: for movies, the planning pass itself predicts and checks the exact output path up front; for TV, verifying a show's sibling-directory output isn't reliably possible from that same planning pass (it's a sibling of the show folder, not a descendant of wherever `--batch` was pointed), so the equivalent check happens one step later, in the per-file loop itself, right before it would otherwise start a given episode — you'll see it as a `SKIP already done` line rather than a `DONE` line. Either way, nothing gets reprocessed that's already there. Re-running the same `--batch` command later only reprocesses what's actually missing; a part-finished file resumes from its last completed step (see "Job History" below) rather than starting over, same as a single-file run. `Ctrl-C` stops the batch after the file currently in progress finishes its current step; an ordinary per-file failure is logged and the batch continues on to the next file, with a summary of anything that failed at the end.
 
 `--batch` can't be combined with `--skip-index` / `--add-interval` / `--redo-review` / `--redo-step` — those target one already-completed job, not a directory; run them against that one file directly instead. `--interactive` does work with `--batch`, but pauses for review on every file in the queue, one after another — usually only worth combining for a small batch.
 
