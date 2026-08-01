@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import shutil
+import string
 import subprocess
 import tempfile
 import difflib
@@ -85,6 +86,20 @@ def _mfa_cmd(*args: str) -> list[str]:
     conda_exe = os.environ.get("MFA_CONDA_EXE", "/opt/conda/bin/conda")
     conda_env = os.environ.get("MFA_CONDA_ENV", "mfa")
     return [conda_exe, "run", "-n", conda_env, "mfa", *args]
+
+
+def _mfa_python_cmd(*args: str) -> list[str]:
+    """
+    Same rationale as _mfa_cmd() immediately above -- conda run, never this
+    process's own PATH -- but invoking the mfa env's own python3 directly
+    rather than the `mfa` CLI entry point. Needed for exactly one thing:
+    _get_g2p_graphemes() below has to import montreal_forced_aligner's own
+    model classes to ask a model what its real grapheme set is, and no
+    `mfa` subcommand exposes that as structured, parseable output.
+    """
+    conda_exe = os.environ.get("MFA_CONDA_EXE", "/opt/conda/bin/conda")
+    conda_env = os.environ.get("MFA_CONDA_ENV", "mfa")
+    return [conda_exe, "run", "-n", conda_env, "python3", *args]
 
 
 # ── One-time-per-container setup ─────────────────────────────────────────────
@@ -235,8 +250,34 @@ def align_with_mfa(
 
     _ensure_mfa_ready(acoustic_model, dictionary, g2p_model, log)
 
+    # None when no g2p_model is configured at all -- see _sanitize_for_mfa()'s
+    # docstring for what that changes. When one is configured, this is the
+    # model's own real alphabet (queried, not guessed -- see
+    # _get_g2p_graphemes()'s docstring for why this replaced an earlier,
+    # incorrect static guess).
+    graphemes = _get_g2p_graphemes(g2p_model, log) if g2p_model else None
+
     whisper_words, whisper_scores = _flatten_whisper_words(whisper_segments)
-    transcript_text = " ".join(whisper_words)
+
+    # See _sanitize_for_mfa()'s docstring for why this exists: align_one's
+    # own text-tokenization path has no equivalent of it, so an un-sanitized
+    # word (capital letters, attached punctuation, a stray digit or symbol,
+    # or -- as it turned out -- even a plain apostrophe/hyphen, if the real
+    # model's alphabet doesn't include them) can crash G2P and take the
+    # entire segment down. whisper_words itself is left untouched -- it's
+    # whisper_words that ends up in transcript.json via
+    # _match_scores_and_words()'s difflib matching, not this sanitized copy.
+    mfa_input_words = [
+        w for w in (_sanitize_for_mfa(w, graphemes) for w in whisper_words) if w
+    ]
+    if not mfa_input_words:
+        raise MFAError(
+            "no alignable text remained after sanitizing for MFA's input "
+            "alphabet -- every recognized word in this segment fell outside "
+            "the G2P model's own grapheme set. Falling back to "
+            "whisperx.align() for this segment."
+        )
+    transcript_text = " ".join(mfa_input_words)
 
     tmp_ctx = None
     if work_dir is None:
@@ -267,23 +308,74 @@ def align_with_mfa(
         tg_target = out_dir / f"{wav_in.stem}.TextGrid"
         _prepare_input_pair(dialog_wav, transcript_text, wav_in, txt_in)
 
-        cmd = _mfa_cmd(
-            "align_one",
-            str(wav_in), str(txt_in), dictionary, acoustic_model, str(tg_target),
-            "--beam", str(beam),
-            "--retry_beam", str(retry_beam),
-            "--clean",
-            "--single_speaker",
-        )
+        # Two attempts, not one: _sanitize_for_mfa() now drops (rather than
+        # partially mangles) any word with a character outside the G2P
+        # model's real alphabet -- see that function's docstring for the
+        # concrete case that caught (genuine foreign-language dialogue,
+        # confirmed against a real transcript, not a hypothetical). But a
+        # word can be built *entirely* from valid characters and still be
+        # a novel-enough grapheme sequence for the compiled FST to fail on
+        # -- an irreducible risk of any G2P system, which is exactly why
+        # MFA's own batch tooling (PyniniGenerator.generate_pronunciations)
+        # wraps its rewriter call in try/except rewrite.Error and just
+        # skips that one word, rather than assuming sanitization alone
+        # makes success guaranteed. align_one has no such per-word net, so
+        # if this still happens, retry the whole segment once with G2P
+        # switched off entirely (dictionary + <unk> for genuine OOV words,
+        # already a case _parse_textgrid_words() handles) before paying the
+        # much larger cost of losing MFA's whole-file alignment altogether
+        # to the whisperx.align() fallback for this segment.
+        attempts = [("with G2P", g2p_model)] if g2p_model else [("dictionary-only", None)]
         if g2p_model:
-            cmd += ["--g2p_model_path", g2p_model]
+            attempts.append(("dictionary-only retry (G2P disabled)", None))
 
-        log.debug("    MFA: %s", " ".join(cmd))
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        proc = None
+        for attempt_label, attempt_g2p_model in attempts:
+            if tg_target.exists():
+                tg_target.unlink()
+            cmd = _mfa_cmd(
+                "align_one",
+                str(wav_in), str(txt_in), dictionary, acoustic_model, str(tg_target),
+                "--beam", str(beam),
+                "--retry_beam", str(retry_beam),
+                "--clean",
+                "--single_speaker",
+            )
+            if attempt_g2p_model:
+                cmd += ["--g2p_model_path", attempt_g2p_model]
+
+            log.debug("    MFA (%s): %s", attempt_label, " ".join(cmd))
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            if proc.returncode == 0:
+                break
+            if "Composition failure" not in proc.stderr:
+                break  # a different failure (e.g. beam size) -- retrying without G2P won't help
+            log.warning(
+                "    MFA G2P composition failure surviving sanitization on %s "
+                "(%s) -- retrying this segment with G2P disabled before "
+                "falling back to whisperx.align().",
+                dialog_wav.name, attempt_label,
+            )
+
         if proc.returncode != 0:
+            hint = ""
+            if "Composition failure" in proc.stderr:
+                # However this got here, it survived BOTH sanitization and
+                # the dictionary-only retry above -- i.e. it happened on the
+                # dictionary-only attempt itself, which doesn't call G2P at
+                # all. That points at something other than a bad OOV word
+                # entirely (a corrupt/mismatched dictionary file, most
+                # likely) -- worth a fresh look rather than assuming this
+                # is the same class of problem again.
+                hint = (
+                    " (G2P composition failure that persisted even on the "
+                    "dictionary-only retry with G2P disabled -- see the "
+                    "comment just above this one in align_mfa.py; this "
+                    "suggests something other than a single bad OOV word.)"
+                )
             raise MFAError(
-                f"mfa align_one exited {proc.returncode} on {dialog_wav.name}: "
-                f"{proc.stderr.strip()[-2000:]}"
+                f"mfa align_one exited {proc.returncode} on {dialog_wav.name}:"
+                f"{hint} {proc.stderr.strip()[-2000:]}"
             )
 
         textgrid_path = _find_output_textgrid(out_dir, tg_target, wav_in.stem, proc, work_dir)
@@ -293,15 +385,198 @@ def align_with_mfa(
         if tmp_ctx is not None:
             tmp_ctx.cleanup()
 
-    scores = _match_scores(whisper_words, whisper_scores, [w for w, _, _ in mfa_words])
+    display_words, scores = _match_scores_and_words(
+        whisper_words, whisper_scores, [w for w, _, _ in mfa_words]
+    )
     words = [
-        {"word": w, "start": round(start, 3), "end": round(end, 3), "score": round(score, 3)}
-        for (w, start, end), score in zip(mfa_words, scores)
+        {"word": dw, "start": round(start, 3), "end": round(end, 3), "score": round(score, 3)}
+        for (_, start, end), dw, score in zip(mfa_words, display_words, scores)
     ]
     return words
 
 
 # ── Input prep ────────────────────────────────────────────────────────────────
+
+# Typographic punctuation WhisperX routinely emits (curly quotes/apostrophes,
+# en/em dashes, the single-character ellipsis glyph) mapped to plain ASCII
+# *before* the real grapheme filter below runs -- so e.g. a curly apostrophe
+# has a chance to survive as a straight one if the model's alphabet includes
+# straight apostrophe, rather than being dropped outright as an unrecognized
+# character either way.
+_TYPOGRAPHIC_TO_ASCII = str.maketrans({
+    "\u2018": "'", "\u2019": "'",   # ‘ ’  → '
+    "\u201c": '"', "\u201d": '"',  # “ ”  → "
+    "\u2013": "-", "\u2014": "-",  # – —  → -
+    "\u2026": "...",               # …    → ...
+})
+
+# Catches the decoder-hallucination-loop artifact this pipeline already
+# knows about (docs/timestamp-drift-investigation.md's "What's still open":
+# a single garbled, repeated-token 'word' up to 190 characters long) --
+# cheap to detect, and not a real word MFA could ever place correctly
+# regardless of sanitization.
+_MAX_MFA_TOKEN_LEN = 20
+
+# Only used as a last resort when no g2p_model is configured at all (see
+# _sanitize_for_mfa()) -- there's no model to ask for a real grapheme set
+# in that case, and no G2P rewriter call for a bad character to crash
+# either, so this only needs to be a reasonable generic guess, not a
+# verified one.
+_MFA_FALLBACK_SAFE_WORD = re.compile(r"^[a-z']+(-[a-z']+)*$")
+
+# Decorative boundary punctuation to strip before the real grapheme check --
+# deliberately everything in string.punctuation EXCEPT apostrophe and
+# hyphen, which can be genuinely meaningful at a word's edge rather than
+# just decoration (see _sanitize_for_mfa()'s docstring).
+_MFA_BOUNDARY_PUNCT = "".join(c for c in string.punctuation if c not in ("'", "-"))
+
+# MFA's own docs for its per-word text processing describe the exact
+# algorithm: "Words will be lower cased and any graphemes that were not in
+# the model's training data will be removed" -- i.e. clean_up_word() in
+# MFA's own g2p/generator.py, run against g2p_model.meta["graphemes"]
+# before the word ever reaches the rewriter:
+#
+#   def clean_up_word(word, graphemes):
+#       new_word = [c for c in word if c in graphemes]
+#       return "".join(new_word), missing_graphemes
+#
+# align_one's online single-utterance path (online/alignment.py's
+# tokenize_utterance_text()) doesn't run this before calling
+# g2p_model.rewriter(w) -- confirmed by the traceback, which shows the raw
+# pynini.lib.rewrite.Error: Composition failure propagating straight up,
+# uncaught. That's the actual bug: not a specific bad character, but the
+# *absence* of this filtering step on this one code path, for every
+# OOV word regardless of what's in it.
+#
+# An earlier version of this fix guessed the alphabet instead of querying
+# it -- lowercase letters, apostrophe, hyphen -- reasoning that MFA's
+# English dictionaries are lowercase ASCII with contractions/compounds.
+# That guess was wrong: reprocessing the same episodes on 2026-07-30 still
+# hit Composition failure on every one of them, past this guessed filter.
+# Apostrophe and/or hyphen most likely aren't actually in english_us_mfa's
+# trained grapheme set at all -- plausible if its G2P training data never
+# needed contractions as separate forms, since those are already fully
+# enumerated in the dictionary and never OOV in the first place -- but
+# there's no need to keep guessing which characters are safe when the
+# model itself can just be asked. _get_g2p_graphemes() does that.
+_G2P_GRAPHEME_CACHE: dict[str, frozenset[str]] = {}
+
+_G2P_GRAPHEME_SCRIPT = (
+    "import json, sys\n"
+    "from montreal_forced_aligner.models import G2PModel\n"
+    "m = G2PModel(sys.argv[1])\n"
+    "print(json.dumps(sorted(m.meta.get('graphemes') or [])))\n"
+)
+
+
+def _get_g2p_graphemes(g2p_model: str, log: logging.LoggerAdapter) -> frozenset[str]:
+    """
+    Query the real grapheme alphabet of the G2P model actually in use,
+    directly from MFA's own G2PModel class running inside its own conda
+    env -- not a static guess in this file. Cached on disk for the
+    container's lifetime (same MFA_ROOT_DIR marker-file pattern as
+    _ensure_mfa_ready()), since this needs a `conda run` round trip into
+    the mfa env's own python3, not just a cheap CLI call, and doesn't
+    change for a given downloaded model.
+    """
+    if g2p_model in _G2P_GRAPHEME_CACHE:
+        return _G2P_GRAPHEME_CACHE[g2p_model]
+
+    root = Path(os.environ.get("MFA_ROOT_DIR", Path.home() / "Documents" / "MFA"))
+    cache_path = root / f".hush_g2p_graphemes_{g2p_model}.json"
+    if cache_path.exists():
+        graphemes = frozenset(json.loads(cache_path.read_text()))
+        _G2P_GRAPHEME_CACHE[g2p_model] = graphemes
+        return graphemes
+
+    proc = subprocess.run(
+        _mfa_python_cmd("-c", _G2P_GRAPHEME_SCRIPT, g2p_model),
+        capture_output=True, text=True, timeout=120,
+    )
+    if proc.returncode != 0:
+        raise MFAError(
+            f"could not read the grapheme set from G2P model {g2p_model!r} "
+            f"(exit {proc.returncode}) -- can't sanitize text for it safely. "
+            f"stderr(tail): {proc.stderr.strip()[-2000:]}"
+        )
+    graphemes = frozenset(json.loads(proc.stdout.strip()))
+    if not graphemes:
+        raise MFAError(f"G2P model {g2p_model!r} reported an empty grapheme set.")
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(sorted(graphemes)))
+    log.info(
+        "    Cached G2P grapheme set for %s (%d characters) -> %s",
+        g2p_model, len(graphemes), cache_path,
+    )
+    _G2P_GRAPHEME_CACHE[g2p_model] = graphemes
+    return graphemes
+
+
+def _sanitize_for_mfa(word: str, graphemes: Optional[frozenset[str]]) -> str:
+    """
+    Best-effort cleanup of one WhisperX token before it goes into align_one's
+    input text file. NOT applied to the copy kept in whisper_words / eventual
+    transcript.json -- those must keep WhisperX's original casing and
+    attached punctuation intact for matching.py's case-sensitive comparisons
+    (see transcribe.py's "Casing policy" / "Punctuation policy" docstrings).
+
+    `graphemes` is the target G2P model's own real alphabet from
+    _get_g2p_graphemes() -- None only when no g2p_model is configured at
+    all, in which case there's no G2P rewriter call this could crash and
+    _MFA_FALLBACK_SAFE_WORD is a good-enough generic guess instead.
+
+    Returns '' for a token that should be dropped from MFA's input entirely
+    (equivalent to WhisperX never having recognized it there) rather than
+    risk it reaching the G2P layer and crashing the whole segment. This is
+    the same trade-off transcribe.py already documents for whisperx.align()
+    itself: "Some tokens cannot be aligned (numerals, currency symbols,
+    punctuation-only tokens)" -- dropping them here before MFA ever sees
+    them is a more graceful version of the same fact, not a new one.
+
+    A word with ANY character outside `graphemes` is dropped whole, not
+    stripped down to its remaining valid characters. An earlier version of
+    this function did the latter -- mirroring MFA's own clean_up_word(),
+    which keeps the remainder for dictionary-generation coverage -- and it
+    was wrong for this use case: confirmed directly against a real
+    fallback transcript (2026-07-30), which turned out to contain a short
+    run of genuine German dialogue ("Zurück in ein Minute. Spaß haben.").
+    Stripping ü/ß out of "Zurück"/"Spaß" character-by-character produced
+    "zurck"/"spa" -- fabricated strings that are *more* likely to crash
+    G2P composition than either the original word or no word at all, since
+    they're not real English orthography and not what was actually said.
+    MFA's batch tooling can afford the partial-keep trade-off because a
+    composition failure there just skips one dictionary entry inside a
+    try/except; align_one has no such net, so the safer trade for this
+    pipeline is: use a word as MFA sees it, or not at all.
+
+    Decorative boundary punctuation (a trailing comma/period/exclamation
+    mark, a leading quote) is stripped BEFORE that whole-word check, not
+    left to trigger it -- transcribe.py deliberately keeps this attached
+    for matching.py's purposes, but it was never part of the word's actual
+    spelling, so treating it the same as an embedded foreign character
+    would (and, in an earlier version of this function, did) wrongly drop
+    the large majority of words in any real transcript, since most
+    sentence-final words carry exactly this kind of attached punctuation.
+    Apostrophe and hyphen are deliberately excluded from what counts as
+    "boundary punctuation" here, since both can be genuinely meaningful at
+    a word's edge (the dropped-g colloquialisms config.yaml's own comments
+    call out -- "sayin'", "rockin'" -- end in a real apostrophe, not a
+    decorative one) -- whether that survives into the word sent to MFA is
+    left to the graphemes check right after, same as any other character.
+    """
+    w = word.translate(_TYPOGRAPHIC_TO_ASCII).lower().strip(_MFA_BOUNDARY_PUNCT)
+    if not w:
+        return ""
+    if graphemes is not None:
+        if any(c not in graphemes for c in w):
+            return ""
+    elif not _MFA_FALLBACK_SAFE_WORD.match(w):
+        return ""
+    if len(w) > _MAX_MFA_TOKEN_LEN:
+        return ""
+    return w
+
 
 def _flatten_whisper_words(whisper_segments: list[dict]) -> tuple[list[str], list[float]]:
     """
@@ -318,7 +593,7 @@ def _flatten_whisper_words(whisper_segments: list[dict]) -> tuple[list[str], lis
     version's transcribe() call exposes word-level confidence pre-alignment
     (check `result["segments"][i].get("words")` before assuming it doesn't
     — this varies by version), prefer wiring that through instead of this
-    per-segment fallback; the matching logic in _match_scores() doesn't
+    per-segment fallback; the matching logic in _match_scores_and_words() doesn't
     care which granularity it's given.
     """
     words: list[str] = []
@@ -445,36 +720,68 @@ def _norm(w: str) -> str:
     return re.sub(r"[^a-z']", "", w.lower())
 
 
-def _match_scores(
+def _match_scores_and_words(
     whisper_words: list[str],
     whisper_scores: list[float],
     mfa_words: list[str],
-) -> list[float]:
+) -> tuple[list[str], list[float]]:
     """
-    Map WhisperX's recognition-confidence scores onto MFA's word list, which
-    won't always tokenize 1:1 with WhisperX's own output (punctuation
-    handling, contractions, G2P-driven splits). Same difflib-based approach
-    used earlier for the drift cross-reference — a straightforward
-    positional zip silently mis-attributes scores the moment token counts
-    diverge even slightly, which is common enough here not to risk it.
+    Map WhisperX's recognition-confidence scores AND its original word text
+    onto MFA's word list, which won't always tokenize 1:1 with WhisperX's
+    own output (punctuation handling, contractions, G2P-driven splits).
+    Same difflib-based approach used earlier for the drift cross-reference —
+    a straightforward positional zip silently mis-attributes both the moment
+    token counts diverge even slightly, which is common enough here not to
+    risk it.
+
+    The word-text half of this fixes a real discrepancy from an earlier
+    version of this function, which only carried scores across and let the
+    caller use MFA's own TextGrid label as the returned "word" directly.
+    MFA's dictionaries/TextGrids are lowercase and already punctuation-free
+    (see _sanitize_for_mfa() for why the *input* side has to be too), which
+    silently violates transcribe.py's own documented policy for this
+    pipeline: "Word casing is preserved exactly as WhisperX produces it. Do
+    NOT lowercase ... required for case-sensitive (=) word list entries" and
+    "Punctuation attached to words ... is preserved here." Every word MFA
+    aligns was quietly losing both, which is exactly the distinction that
+    policy exists to protect (its own example: "Dick" (name) vs. "dick"
+    (profanity)) -- MFA being the default alignment.backend as of this
+    version means this was live for every episode processed with it, not a
+    rare edge case. Restored here by preferring WhisperX's own original
+    token wherever the alignment below finds one to prefer it over, and
+    falling back to MFA's label only for a token MFA introduced that
+    WhisperX has no counterpart for at all ('insert' below).
     """
     wn = [_norm(w) for w in whisper_words]
     mn = [_norm(w) for w in mfa_words]
 
     sm = difflib.SequenceMatcher(None, wn, mn, autojunk=False)
-    out: list[Optional[float]] = [None] * len(mn)
+    scores_out: list[Optional[float]] = [None] * len(mn)
+    words_out: list[Optional[str]] = [None] * len(mn)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
             for k in range(i2 - i1):
-                out[j1 + k] = whisper_scores[i1 + k]
+                scores_out[j1 + k] = whisper_scores[i1 + k]
+                words_out[j1 + k] = whisper_words[i1 + k]
         elif tag == "replace":
             span = whisper_scores[i1:i2] or whisper_scores
             avg = sum(span) / len(span) if span else 0.5
-            for k in range(j1, j2):
-                out[k] = avg
+            wspan = whisper_words[i1:i2]
+            for offset, k in enumerate(range(j1, j2)):
+                scores_out[k] = avg
+                # Same relative position within the replaced span, where one
+                # exists -- an approximation (span lengths can differ), but
+                # a strictly better guess than always reaching for MFA's
+                # label, and it degrades to that same label below wherever
+                # there's genuinely nothing of WhisperX's own to prefer.
+                if offset < len(wspan):
+                    words_out[k] = wspan[offset]
         # 'delete': whisper token with no MFA counterpart — contributes nothing.
-        # 'insert': MFA token with no whisper counterpart — filled by the
-        #           overall-average fallback below.
+        # 'insert': MFA token with no whisper counterpart — both fall back
+        #           to MFA's own values below, since there's nothing of
+        #           WhisperX's to prefer instead.
 
     overall_avg = sum(whisper_scores) / len(whisper_scores) if whisper_scores else 0.5
-    return [s if s is not None else overall_avg for s in out]
+    scores = [s if s is not None else overall_avg for s in scores_out]
+    words = [w if w is not None else mfa_words[idx] for idx, w in enumerate(words_out)]
+    return words, scores
