@@ -138,6 +138,7 @@ def transcribe(
 
     align_backend        = cfg_get(cfg, "alignment", "backend")
     mfa_fallback_allowed = bool(cfg_get(cfg, "alignment", "mfa", "fallback_to_whisperx"))
+    dual_output          = bool(cfg_get(cfg, "alignment", "dual_output"))
     if align_backend not in ("whisperx", "mfa"):
         raise ValueError(
             f"alignment.backend must be 'whisperx' or 'mfa', got {align_backend!r}"
@@ -198,6 +199,17 @@ def transcribe(
                 seg_idx, n, t_path.name,
             )
             transcript_paths.append(t_path)
+            # Checked directly rather than assumed -- a segment can be
+            # "already done" for its primary transcript while still
+            # lacking comparison data, e.g. if alignment.dual_output was
+            # turned on after this segment was originally transcribed (see
+            # config.yaml's own note on that setting only applying going
+            # forward). Reflecting the true, current state here rather
+            # than a stale guess keeps this run's has_mfa_comparison /
+            # has_whisperx_comparison aggregate below honest even when a
+            # skipped segment is involved.
+            has_mfa       = (job_dir / f"transcript_mfa_{seg_idx:02d}.json").exists()
+            has_whisperx  = (job_dir / f"transcript_whisperx_{seg_idx:02d}.json").exists()
             try:
                 existing = json.loads(t_path.read_text())
                 segment_results.append({
@@ -213,6 +225,8 @@ def transcribe(
                     # None, not an omitted key, so every segment_results
                     # entry has the same shape either way.
                     "mfa_fallback_reason": None,
+                    "has_mfa_comparison":      has_mfa,
+                    "has_whisperx_comparison": has_whisperx,
                 })
             except (OSError, json.JSONDecodeError):
                 segment_results.append({
@@ -220,6 +234,8 @@ def transcribe(
                     "transcript": t_path.name,
                     "skipped":    True,
                     "mfa_fallback_reason": None,
+                    "has_mfa_comparison":      has_mfa,
+                    "has_whisperx_comparison": has_whisperx,
                 })
             continue
 
@@ -297,24 +313,10 @@ def transcribe(
                     mfa_fallback_reason = str(exc)
 
             if use_whisperx_align:
-                # Lazy-load or reload alignment model when language changes.
-                if align_model is None or loaded_lang != detected_lang:
-                    if align_model is not None:
-                        log.debug(
-                            "    Language changed %s→%s; reloading alignment model.",
-                            loaded_lang, detected_lang,
-                        )
-                        del align_model, align_metadata
-                        gc.collect()
-                    log.debug(
-                        "    Loading alignment model for language '%s' ...", detected_lang
-                    )
-                    align_model, align_metadata = whisperx.load_align_model(
-                        language_code=detected_lang,
-                        device=device,
-                    )
-                    loaded_lang = detected_lang
-
+                align_model, align_metadata, loaded_lang = _ensure_align_model(
+                    align_model, align_metadata, loaded_lang, detected_lang,
+                    device, whisperx, log,
+                )
                 aligned = whisperx.align(
                     segs_out,
                     align_model,
@@ -323,26 +325,88 @@ def transcribe(
                     device,
                     return_char_alignments=False,
                 )
-
-                # ── Collect words ─────────────────────────────────────────────
-                # Timestamps are segment-local (0-based).  Step 3b applies the
-                # global start_offset to produce film-absolute timestamps.
-                # Words that couldn't be aligned have start/end/score = None;
-                # include them so the full word count is preserved in the JSON.
-                words = []
-                for seg in aligned.get("segments", []):
-                    for w in seg.get("words", []):
-                        word_text = w.get("word", "")
-                        if not word_text:
-                            continue   # skip empty tokens (defensive)
-                        words.append({
-                            "word":  word_text,          # original casing + punctuation
-                            "start": w.get("start"),     # None if alignment failed
-                            "end":   w.get("end"),
-                            "score": w.get("score"),
-                        })
+                words = _collect_whisperx_words(aligned)
             # else: words was already populated by align_with_mfa() above,
             # in the same {"word","start","end","score"} shape.
+
+        # ── Comparison alignment (alignment.dual_output) ────────────────────────
+        # Independent of, and never allowed to affect, `words` above -- see
+        # config.yaml's own documentation of alignment.dual_output. Tracks
+        # which backend actually produced words for THIS segment, whether
+        # as the primary result just above or as the comparison pass here,
+        # so the per-segment file written for each backend below is always
+        # an honest reflection of what happened, not just "whichever was
+        # configured as primary."
+        mfa_words:      Optional[list[dict]] = None
+        whisperx_words: Optional[list[dict]] = None
+        if segs_out:
+            if use_whisperx_align:
+                whisperx_words = words
+            else:
+                mfa_words = words
+
+            if dual_output:
+                if use_whisperx_align:
+                    # Primary was whisperx -- either configured directly, or
+                    # MFA already failed and fell back for THIS segment. In
+                    # the fallback case, retrying the exact same MFA call
+                    # would just fail again (MFA's own failures here are
+                    # deterministic, not flaky), so only attempt a fresh one
+                    # when MFA was never tried at all for this segment.
+                    if mfa_fallback_reason is None:
+                        try:
+                            t_cmp = time.monotonic()
+                            mfa_words = align_with_mfa(dialog, segs_out, cfg, log)
+                            log.debug(
+                                "    MFA comparison alignment: %d words in "
+                                "%.1fs for %s.",
+                                len(mfa_words), time.monotonic() - t_cmp, dialog.name,
+                            )
+                        except MFAError as exc:
+                            log.warning(
+                                "  [%d/%d] MFA comparison alignment failed for "
+                                "%s -- no MFA data for this segment in "
+                                "transcript_mfa.json.  Reason: %s",
+                                seg_idx, n, dialog.name, exc,
+                            )
+                    else:
+                        log.debug(
+                            "  [%d/%d] Skipping MFA comparison for %s -- MFA "
+                            "already failed as primary for this segment (%s).",
+                            seg_idx, n, dialog.name, mfa_fallback_reason,
+                        )
+                else:
+                    # Primary was MFA and it succeeded -- still need a fresh
+                    # whisperx.align() pass for the comparison; nothing
+                    # above already computed it. Broad except (not just a
+                    # specific whisperx exception type) deliberately: this
+                    # is a best-effort comparison pass, and no failure mode
+                    # of it should be allowed to take the segment down --
+                    # KeyboardInterrupt is a BaseException, not caught here,
+                    # so Ctrl-C still stops the run immediately regardless.
+                    try:
+                        t_cmp = time.monotonic()
+                        align_model, align_metadata, loaded_lang = _ensure_align_model(
+                            align_model, align_metadata, loaded_lang, detected_lang,
+                            device, whisperx, log,
+                        )
+                        aligned_cmp = whisperx.align(
+                            segs_out, align_model, align_metadata, audio, device,
+                            return_char_alignments=False,
+                        )
+                        whisperx_words = _collect_whisperx_words(aligned_cmp)
+                        log.debug(
+                            "    WhisperX comparison alignment: %d words in "
+                            "%.1fs for %s.",
+                            len(whisperx_words), time.monotonic() - t_cmp, dialog.name,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "  [%d/%d] WhisperX comparison alignment failed for "
+                            "%s -- no WhisperX data for this segment in "
+                            "transcript_whisperx.json.  Reason: %s",
+                            seg_idx, n, dialog.name, exc,
+                        )
 
         # Release the numpy audio array before the next segment loads its own.
         del audio
@@ -359,6 +423,29 @@ def transcribe(
         }
         t_path.write_text(json.dumps(transcript, indent=2, ensure_ascii=False))
 
+        # Backend-labeled copies (alignment.dual_output's comparison SRTs --
+        # see steps/transcript_srt.py and steps/merge.py) -- written
+        # whenever that backend actually produced words for this segment,
+        # regardless of whether it did so as the primary result above or as
+        # the comparison pass above. Same shape as transcript_NN.json;
+        # merge.py concatenates whichever of these exist, per backend, into
+        # transcript_mfa.json / transcript_whisperx.json. Absent (not an
+        # empty file) for a segment where that backend was never attempted
+        # (dual_output off) or was attempted and failed -- merge.py treats
+        # a missing segment as a real gap in that backend's transcript, not
+        # an error.
+        mfa_path, whisperx_path = None, None
+        if mfa_words is not None:
+            mfa_path = job_dir / f"transcript_mfa_{seg_idx:02d}.json"
+            mfa_path.write_text(json.dumps(
+                {**transcript, "words": mfa_words}, indent=2, ensure_ascii=False,
+            ))
+        if whisperx_words is not None:
+            whisperx_path = job_dir / f"transcript_whisperx_{seg_idx:02d}.json"
+            whisperx_path.write_text(json.dumps(
+                {**transcript, "words": whisperx_words}, indent=2, ensure_ascii=False,
+            ))
+
         log.info(
             "  [%d/%d] ✓  %s  words=%d  elapsed=%s  [%d/%d segments transcribed]",
             seg_idx, n, t_path.name, len(words),
@@ -372,6 +459,8 @@ def transcribe(
             "word_count":  len(words),
             "elapsed_sec": round(elapsed, 1),
             "mfa_fallback_reason": mfa_fallback_reason,
+            "has_mfa_comparison":      mfa_path is not None,
+            "has_whisperx_comparison": whisperx_path is not None,
         })
 
     # ── Cleanup models ────────────────────────────────────────────────────────
@@ -383,9 +472,10 @@ def transcribe(
     # ── Persist metadata and mark done ────────────────────────────────────────
     state = read_job(job_dir)
     state["transcription"] = {
-        "model":    model_name,
-        "language": language or "auto",
-        "segments": segment_results,
+        "model":       model_name,
+        "language":    language or "auto",
+        "segments":    segment_results,
+        "dual_output": dual_output,
         # Aggregate, not just per-segment detail -- so callers that only
         # care about "did anything notable happen" (pipeline.py's own
         # end-of-run summary, and via that, hush.sh's --batch log) can
@@ -395,6 +485,19 @@ def transcribe(
         # see that branch's comment.
         "mfa_fallback_segments": sum(
             1 for s in segment_results if s.get("mfa_fallback_reason")
+        ),
+        # How many of the n segments this job has an MFA-aligned /
+        # WhisperX-aligned transcript for, out of n -- checked live above
+        # rather than assumed, so this is accurate whether dual_output was
+        # on for the whole job, part of it, or produced by
+        # alignment.backend alone with dual_output off entirely. Directly
+        # what steps/merge.py checks to decide whether transcript_mfa.json
+        # / transcript_whisperx.json get produced at all.
+        "segments_with_mfa_data":      sum(
+            1 for s in segment_results if s.get("has_mfa_comparison")
+        ),
+        "segments_with_whisperx_data": sum(
+            1 for s in segment_results if s.get("has_whisperx_comparison")
         ),
     }
     write_job(job_dir, state)
@@ -406,6 +509,69 @@ def transcribe(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _ensure_align_model(
+    align_model: object,
+    align_metadata: object,
+    loaded_lang: str,
+    detected_lang: str,
+    device: str,
+    whisperx,
+    log: logging.LoggerAdapter,
+) -> tuple[object, object, str]:
+    """
+    Lazily (re)load whisperx's own alignment model for detected_lang,
+    reusing the already-loaded one when the language hasn't changed.
+    Shared by the primary alignment.backend: whisperx path and the
+    alignment.dual_output comparison path above, so the two can't drift
+    into loading/reloading logic that behaves differently from each
+    other. Returns (align_model, align_metadata, loaded_lang).
+    """
+    if align_model is None or loaded_lang != detected_lang:
+        if align_model is not None:
+            log.debug(
+                "    Language changed %s→%s; reloading alignment model.",
+                loaded_lang, detected_lang,
+            )
+            del align_model, align_metadata
+            gc.collect()
+        log.debug(
+            "    Loading alignment model for language '%s' ...", detected_lang
+        )
+        align_model, align_metadata = whisperx.load_align_model(
+            language_code=detected_lang,
+            device=device,
+        )
+        loaded_lang = detected_lang
+    return align_model, align_metadata, loaded_lang
+
+
+def _collect_whisperx_words(aligned: dict) -> list[dict]:
+    """
+    Extract this pipeline's {"word","start","end","score"} shape from
+    whisperx.align()'s own return value. Shared by the primary path and
+    the alignment.dual_output comparison path above so both interpret
+    whisperx's output identically.
+
+    Timestamps are segment-local (0-based); Step 3b applies the global
+    start_offset to produce film-absolute timestamps. Words that couldn't
+    be aligned have start/end/score = None; included anyway so the full
+    word count is preserved in the JSON.
+    """
+    words = []
+    for seg in aligned.get("segments", []):
+        for w in seg.get("words", []):
+            word_text = w.get("word", "")
+            if not word_text:
+                continue   # skip empty tokens (defensive)
+            words.append({
+                "word":  word_text,          # original casing + punctuation
+                "start": w.get("start"),     # None if alignment failed
+                "end":   w.get("end"),
+                "score": w.get("score"),
+            })
+    return words
+
 
 def _seg_duration(state: dict, seg_wav_name: str) -> float:
     """

@@ -28,6 +28,20 @@ confusing WhisperX's own decoder — with MFA's beam width already ruled out
 as a contributing factor). What this fixes is specifically: for words
 WhisperX *did* recognize, making sure their reported timestamp is actually
 where they occur.
+
+A second, separate thing this module has to get right, orthogonal to
+timing: MFA's own dictionary/TextGrid vocabulary is lowercase and
+punctuation-free (a forced aligner's output labels are whatever its
+dictionary defines, not WhisperX's original tokens) — the word TEXT
+transcript.json ends up with here is WhisperX's original casing and
+punctuation, recovered by direct index against MFA's aligned output (see
+_restore_original_words()), never MFA's own labels directly. This was a
+real, previously-live bug, not a hypothetical: an earlier version of this
+recovery relied entirely on difflib-based fuzzy matching between
+normalized word lists, which — unlike the direct-index approach — turned
+out not to hold up reliably over movie-length, repetition-heavy dialogue
+(see _restore_original_words()'s own docstring for why, and for the
+narrower case that fuzzy matching is still kept around as a fallback for).
 """
 
 from __future__ import annotations
@@ -265,11 +279,26 @@ def align_with_mfa(
     # or -- as it turned out -- even a plain apostrophe/hyphen, if the real
     # model's alphabet doesn't include them) can crash G2P and take the
     # entire segment down. whisper_words itself is left untouched -- it's
-    # whisper_words that ends up in transcript.json via
-    # _match_scores_and_words()'s difflib matching, not this sanitized copy.
-    mfa_input_words = [
-        w for w in (_sanitize_for_mfa(w, graphemes) for w in whisper_words) if w
-    ]
+    # whisper_words, recovered by direct index (origin_index below; see
+    # _restore_original_words()), that ends up in transcript.json, not this
+    # sanitized copy.
+    #
+    # origin_index[k] records which position in whisper_words produced
+    # mfa_input_words[k] -- sanitization drops some words outright (see
+    # _sanitize_for_mfa()'s docstring: numerals, foreign words outside the
+    # G2P model's grapheme set, tokens over _MAX_MFA_TOKEN_LEN, ...), so the
+    # two lists aren't always the same length and a plain positional zip
+    # isn't safe. Tracking the real correspondence here, once, is what lets
+    # _restore_original_words() map MFA's output back onto WhisperX's
+    # original words by direct index afterward instead of reconstructing it
+    # after the fact via fuzzy string matching.
+    mfa_input_words: list[str] = []
+    origin_index: list[int] = []
+    for i, w in enumerate(whisper_words):
+        s = _sanitize_for_mfa(w, graphemes)
+        if s:
+            mfa_input_words.append(s)
+            origin_index.append(i)
     if not mfa_input_words:
         raise MFAError(
             "no alignable text remained after sanitizing for MFA's input "
@@ -385,13 +414,9 @@ def align_with_mfa(
         if tmp_ctx is not None:
             tmp_ctx.cleanup()
 
-    display_words, scores = _match_scores_and_words(
-        whisper_words, whisper_scores, [w for w, _, _ in mfa_words]
+    words = _restore_original_words(
+        whisper_words, whisper_scores, mfa_words, origin_index, log,
     )
-    words = [
-        {"word": dw, "start": round(start, 3), "end": round(end, 3), "score": round(score, 3)}
-        for (_, start, end), dw, score in zip(mfa_words, display_words, scores)
-    ]
     return words
 
 
@@ -714,7 +739,86 @@ def _parse_textgrid_words(textgrid_path: Path) -> list[tuple[str, float, float]]
     return out
 
 
-# ── Score carry-over ──────────────────────────────────────────────────────────
+# ── Recovering WhisperX's original words from MFA's aligned output ──────────
+
+def _restore_original_words(
+    whisper_words: list[str],
+    whisper_scores: list[float],
+    mfa_words: list[tuple[str, float, float]],
+    origin_index: list[int],
+    log: logging.LoggerAdapter,
+) -> list[dict]:
+    """
+    Map MFA's aligned (label, start, end) triples back onto WhisperX's
+    original words — the step that makes transcript.json read "Reports"
+    and "Miguel's" for a word MFA successfully aligned, rather than MFA's
+    own dictionary-form label ("reports", "miguels").
+
+    Primary path — direct index lookup, not string matching: forced
+    alignment (that's what "forced" means in the name) places every word
+    it's *given* somewhere in the audio; it doesn't invent, merge, split,
+    or drop word-tier entries relative to its own input list. So once
+    _parse_textgrid_words() has already dropped the genuine silence/<eps>
+    intervals (see that function's own docstring), what's left should
+    correspond 1:1, in order, to mfa_input_words — i.e.
+    len(mfa_words) == len(origin_index) — and mfa_words[k] IS the aligned
+    form of whisper_words[origin_index[k]], full stop. No fuzzy matching
+    needed, and none of its failure modes either: this can't confuse two
+    genuinely different words that happen to normalize the same way (a
+    contraction like "Miguel's" vs. a coincidentally-identical MFA
+    dictionary form "miguels" is exactly this — same normalized form,
+    different string), and it can't drift over a long, repetitive segment
+    the way a global diff can (a real risk in a movie-length segment with
+    thousands of words and heavy repetition of common ones —
+    docs/timestamp-drift-investigation.md's "I've been sayin' it" passage
+    is exactly that kind of repetition, and this pipeline's own history:
+    an earlier version relied on _match_scores_and_words() below for
+    every word, not just as a fallback, which is what let MFA's lowercase,
+    unpunctuated labels leak into transcript.json wholesale on real
+    movie-length input despite that function's own difflib-based attempt
+    to prefer WhisperX's original text wherever it could).
+
+    Fallback path — _match_scores_and_words()'s difflib-based matching,
+    used ONLY if that count assumption is ever actually wrong: an MFA
+    behavior this pipeline hasn't seen and doesn't currently understand,
+    rather than the expected case. Logged clearly rather than silently
+    taken, since it's a materially less reliable reconstruction and worth
+    noticing if it starts happening routinely rather than as a one-off.
+    """
+    if len(mfa_words) == len(origin_index):
+        words = []
+        for k, (_label, start, end) in enumerate(mfa_words):
+            i = origin_index[k]
+            words.append({
+                "word":  whisper_words[i],
+                "start": round(start, 3),
+                "end":   round(end, 3),
+                "score": round(whisper_scores[i], 3),
+            })
+        return words
+
+    log.warning(
+        "MFA's word tier has %d real entries but %d words were sent to it "
+        "(after sanitization) -- expected these to match 1:1, since forced "
+        "alignment shouldn't add/drop/merge word-tier entries relative to "
+        "its own input. Falling back to difflib-based word/score matching "
+        "for this segment -- less reliable (see _restore_original_words()'s "
+        "docstring), but not new: this was the only mapping this pipeline "
+        "had before direct-index mapping existed. If you see this warning "
+        "routinely rather than as a one-off, please report it together "
+        "with the segment's dialog audio -- it points at an MFA behavior "
+        "this pipeline doesn't yet account for.",
+        len(mfa_words), len(origin_index),
+    )
+    mfa_labels = [label for label, _, _ in mfa_words]
+    display_words, scores = _match_scores_and_words(whisper_words, whisper_scores, mfa_labels)
+    return [
+        {"word": dw, "start": round(start, 3), "end": round(end, 3), "score": round(score, 3)}
+        for (_, start, end), dw, score in zip(mfa_words, display_words, scores)
+    ]
+
+
+# ── Score/word matching (fallback only -- see _restore_original_words()) ─────
 
 def _norm(w: str) -> str:
     return re.sub(r"[^a-z']", "", w.lower())
@@ -734,20 +838,28 @@ def _match_scores_and_words(
     token counts diverge even slightly, which is common enough here not to
     risk it.
 
-    The word-text half of this fixes a real discrepancy from an earlier
-    version of this function, which only carried scores across and let the
-    caller use MFA's own TextGrid label as the returned "word" directly.
-    MFA's dictionaries/TextGrids are lowercase and already punctuation-free
-    (see _sanitize_for_mfa() for why the *input* side has to be too), which
-    silently violates transcribe.py's own documented policy for this
-    pipeline: "Word casing is preserved exactly as WhisperX produces it. Do
-    NOT lowercase ... required for case-sensitive (=) word list entries" and
-    "Punctuation attached to words ... is preserved here." Every word MFA
-    aligns was quietly losing both, which is exactly the distinction that
-    policy exists to protect (its own example: "Dick" (name) vs. "dick"
-    (profanity)) -- MFA being the default alignment.backend as of this
-    version means this was live for every episode processed with it, not a
-    rare edge case. Restored here by preferring WhisperX's own original
+    FALLBACK ONLY as of this version — see _restore_original_words(), which
+    now handles the expected case (len(mfa_words) == len(origin_index)) by
+    direct index instead, precisely because this function's own
+    reconstruction turned out not to be reliable enough at real
+    movie-length scale to use unconditionally (see that function's
+    docstring). Kept here rather than removed: still a materially better
+    fallback than reaching for MFA's raw label unconditionally on the rare
+    input this pipeline's forced-alignment assumption doesn't hold for.
+
+    The word-text half of this fixed a real discrepancy from an even
+    earlier version of this function, which only carried scores across and
+    let the caller use MFA's own TextGrid label as the returned "word"
+    directly. MFA's dictionaries/TextGrids are lowercase and already
+    punctuation-free (see _sanitize_for_mfa() for why the *input* side has
+    to be too), which silently violates transcribe.py's own documented
+    policy for this pipeline: "Word casing is preserved exactly as
+    WhisperX produces it. Do NOT lowercase ... required for case-sensitive
+    (=) word list entries" and "Punctuation attached to words ... is
+    preserved here." Every word MFA aligns was quietly losing both, which
+    is exactly the distinction that policy exists to protect (its own
+    example: "Dick" (name) vs. "dick" (profanity)) -- restored here, for
+    this fallback, the same way -- by preferring WhisperX's own original
     token wherever the alignment below finds one to prefer it over, and
     falling back to MFA's label only for a token MFA introduced that
     WhisperX has no counterpart for at all ('insert' below).

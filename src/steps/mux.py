@@ -102,6 +102,76 @@ natively via a different mechanism than Matroska, but ffmpeg already
 does this by default for a single input — kept explicit here rather than
 relying on that default).
 
+**Each available aligned-transcript SRT (Step 6c — steps/transcript_srt.py's
+export_srt(), zero to two of them: "mfa" and/or "whisperx") is embedded as
+an ADDITIONAL subtitle track — separate from, and unaffected by, the
+mp4-path limitation just above.** That limitation concerns the *original*
+video's own subtitle tracks (arbitrary formats, some of them the exact
+PGS/bitmap tracks ffmpeg can't reliably parse); these are always plain
+UTF-8 SRT text steps/transcript_srt.py wrote itself, so they hit neither
+problem that motivated skipping subtitle passthrough for mp4 in the first
+place.
+
+  mkv: each source added as one more mkvmerge input file, with
+    --language / --track-name / --default-track-flag scoped to it via
+    the same "options apply to the next-named file" convention already
+    used above for audio_encoded.mka's implicit (no-flag) inclusion.
+    Whatever style each was written in (transcript_srt.karaoke) survives
+    byte-for-byte — confirmed directly, by round-tripping a tagged file
+    through mkvmerge and back out — including the <font color> tags a
+    karaoke rendering depends on, since mkvmerge stores SRT as SRT (codec
+    S_TEXT/UTF8), no re-encoding of the text.
+
+    Replace, don't duplicate: before adding these, video_path's own
+    existing subtitle tracks are probed (_probe_subtitle_tracks(), via
+    `mkvmerge -J`) for any whose name exactly matches one of THIS run's
+    configured track_name_mfa / track_name_whisperx — i.e. this
+    pipeline's own tracks from a previous run, if video_path happens to
+    be pointed back at this job's own prior output rather than the
+    original source. Matches are excluded from passthrough
+    (--subtitle-tracks with the surviving IDs, or --no-subtitles if every
+    existing subtitle track matched) so re-muxing replaces them rather
+    than piling up duplicates every run. Matched by EXACT current name
+    only: change track_name_mfa/track_name_whisperx between runs and a
+    track already embedded under the OLD name is no longer recognized as
+    "ours" and is left in place rather than replaced — the new name just
+    gets added alongside it going forward. The probe is best-effort
+    (_probe_subtitle_tracks() returns "found nothing to replace" rather
+    than raising if video_path can't be identified this way at all) —
+    this is a nice-to-have in service of a debug track staying tidy on
+    repeat runs, never a reason the actual censored video fails to mux.
+
+  mp4: each source converted via ffmpeg's mov_text codec — the only way
+    to place a text subtitle track inside an MP4 container at all, and
+    NOT the same tags-survive story mkv gets: confirmed directly (the
+    same round-trip test) that mov_text strips every <font>/<b>/<i>/<u>
+    tag outright on the way through. This module therefore always embeds
+    each source's mp4_fallback_text — a plain, one-cue-per-group
+    rendering of the exact same grouping the job-directory/sidecar SRT
+    used (see steps/transcript_srt.py's docstring) — rather than that SRT
+    itself, regardless of transcript_srt.karaoke. Embedding the karaoke
+    file as-is would still technically succeed, but every one-cue-per-word
+    group would decode as several back-to-back, visually IDENTICAL
+    redraws of the same plain line once the color is silently gone — at
+    best pointless, at worst looking like a player bug. No replace-by-name
+    detection needed here the way mkv has: video_path for the mp4 path is
+    always the pristine original (mp4 never passes ANY of the original's
+    own subtitle tracks through — see above — so it never carries a track
+    of ours from a previous run to begin with; every mp4 mux starts from
+    scratch and only ever contains what's explicitly added here).
+
+  Either way each added track is written non-default (--default-track-flag
+  0:no for mkv; -disposition:s:0 0 for mp4, the latter best-effort only —
+  confirmed directly that ffmpeg's mp4 muxer, unlike matroska's, has no
+  equivalent "don't infer a default track" override, so a player may
+  still auto-select the first one on open despite the flag; every player
+  tested still lets a viewer turn it back off regardless) so none of them
+  compete with any subtitle track a viewer actually opened the file for.
+  Skipped entirely — no subtitle-related flags added to either command —
+  whenever subtitle_sources is empty (transcript_srt.enabled is false,
+  Step 6c failed, or neither transcript had any word with usable timing —
+  see steps/transcript_srt.py) or transcript_srt.embed_in_output is false.
+
 Crash safety: the muxed file is written to a temp sibling inside /output
 (utils.tmp_output_path() / finalize_output() — the same write-then-rename
 idiom utils.write_job() uses for job.json) and only published under its
@@ -130,7 +200,9 @@ Intermediate cleanup (conditional on keep_intermediates):
 Marks '7_mux' done. Returns the path to the final output file in /output.
 """
 
+import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Optional
 import logging
@@ -149,6 +221,7 @@ from utils import (
     verify_stem_before_reuse,
     write_job,
 )
+from steps.transcript_srt import SrtSource
 
 
 def mux(
@@ -158,11 +231,21 @@ def mux(
     output_dir: Path,
     cfg: dict,
     log: Optional[logging.LoggerAdapter] = None,
+    *,
+    subtitle_sources: Optional[list[SrtSource]] = None,
 ) -> Path:
     """
     Step 7: mux audio_encoded.mka (Step 6b) into the original video's
     container -- mkvmerge for mkv output, ffmpeg for mp4 (see module
     docstring for why these differ).
+
+    subtitle_sources -- steps/transcript_srt.py's export_srt() return
+    value, passed straight through from pipeline.py: zero, one, or two
+    SrtSource entries (one per alignment backend that had a transcript to
+    export). None or an empty list embeds nothing and reproduces this
+    function's exact pre-Step-6c behavior; see the module docstring above
+    for how each entry is used differently for mkv vs mp4 output when
+    there's at least one.
 
     Returns the path to the final output file in /output.
 
@@ -249,27 +332,130 @@ def mux(
     tmp_path = tmp_output_path(out_path)
     tmp_path.unlink(missing_ok=True)  # leftover from a previous interrupted attempt, if any
 
+    subtitle_sources = subtitle_sources or []
+    embed_subtitles = (
+        bool(subtitle_sources)
+        and bool(cfg_get(cfg, "transcript_srt", "embed_in_output"))
+    )
+    track_lang = str(cfg_get(cfg, "transcript_srt", "track_language"))
+
     if out_format == "mkv":
-        cmd = [
-            "mkvmerge", "-o", str(tmp_path),
-            "--no-audio", str(video_path),
-            str(audio_encoded_path),
-        ]
+        cmd = ["mkvmerge", "-o", str(tmp_path)]
+
+        # Replace, don't duplicate: if a previous run of this pipeline
+        # already embedded one of our own tracks into video_path (e.g. it
+        # was pointed back at this job's own prior output -- see module
+        # docstring), passing it through unfiltered alongside the fresh
+        # copy added below would leave two tracks with the same name in
+        # the result. Matched by exact name against every backend's
+        # CURRENTLY configured track_name_{backend} -- see
+        # _find_tracks_to_replace()'s own docstring for what changing
+        # that setting between runs does to this matching.
+        if embed_subtitles:
+            configured_names = {
+                str(cfg_get(cfg, "transcript_srt", f"track_name_{s.backend}"))
+                for s in subtitle_sources
+            }
+            existing_subs = _probe_subtitle_tracks(video_path, log)
+            all_sub_ids = [t["id"] for t in existing_subs]
+            replace_ids = [
+                t["id"] for t in existing_subs
+                if t.get("properties", {}).get("track_name") in configured_names
+            ]
+            if replace_ids:
+                log.info(
+                    "  Replacing %d existing track(s) in %s matching this "
+                    "pipeline's own subtitle track name(s) (track ID(s) %s) "
+                    "rather than adding duplicates.",
+                    len(replace_ids), video_path.name,
+                    ", ".join(str(i) for i in replace_ids),
+                )
+                keep_ids = [i for i in all_sub_ids if i not in replace_ids]
+                if keep_ids:
+                    cmd += ["--subtitle-tracks", ",".join(str(i) for i in keep_ids)]
+                else:
+                    cmd += ["--no-subtitles"]
+
+        cmd += ["--no-audio", str(video_path), str(audio_encoded_path)]
+
+        for source in subtitle_sources:
+            if not embed_subtitles:
+                break
+            # source.job_dir_path as-is -- whatever style
+            # transcript_srt.karaoke wrote, mkvmerge preserves it
+            # byte-for-byte (S_TEXT/UTF8) -- see module docstring.
+            cmd += [
+                "--language", f"0:{track_lang}",
+                "--track-name", f"0:{source.track_name}",
+                "--default-track-flag", "0:no",
+                str(source.job_dir_path),
+            ]
+
         # 0 = clean, 1 = succeeded with warnings, 2 = real failure --
         # see utils.run_cmd's ok_exit_codes docstring.
         run_cmd(cmd, log, ok_exit_codes=frozenset({0, 1}))
     else:
+        # mp4 never passes the original video's own subtitle tracks
+        # through at all (see the "Subtitle/chapter/attachment
+        # preservation for mp4 output" section above) -- video_path is
+        # always the pristine original here, never this pipeline's own
+        # prior mp4 output, so there is nothing of ours already inside it
+        # to detect or replace. Every mux starts from scratch and only
+        # ever contains what's explicitly added below.
+        #
+        # mov_text strips <font> styling outright (confirmed directly --
+        # see module docstring), so mp4 always gets each source's plain
+        # fallback text, written here to scratch files for ffmpeg's own
+        # -i (it needs real paths, not strings) -- never
+        # source.job_dir_path itself, even on the rare run where that
+        # already happens to be plain (transcript_srt.karaoke: false).
+        # One code path either way, correct in both cases, and nothing
+        # left behind afterward.
+        subtitle_tmps: list[Path] = []
+        if embed_subtitles:
+            for i, source in enumerate(subtitle_sources):
+                if not source.mp4_fallback_text:
+                    continue
+                tmp_srt = job_dir / f".transcript_mp4_embed_{source.backend}.srt"
+                tmp_srt.write_text(source.mp4_fallback_text, encoding="utf-8")
+                subtitle_tmps.append(tmp_srt)
+
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(video_path),
             "-i", str(audio_encoded_path),
-            "-map", "0:v:0", "-map", "1:a:0", "-map_chapters", "0",
-            "-c:v", "copy", "-c:a", "copy",
+        ]
+        for tmp_srt in subtitle_tmps:
+            cmd += ["-i", str(tmp_srt)]
+
+        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+        for i in range(len(subtitle_tmps)):
+            cmd += ["-map", f"{i + 2}:s:0"]
+        cmd += ["-map_chapters", "0", "-c:v", "copy", "-c:a", "copy"]
+        if subtitle_tmps:
+            cmd += ["-c:s", "mov_text"]
+            for i, source in enumerate(
+                s for s in subtitle_sources if s.mp4_fallback_text
+            ):
+                track_name = str(cfg_get(cfg, "transcript_srt", f"track_name_{source.backend}"))
+                cmd += [
+                    f"-metadata:s:s:{i}", f"language={track_lang}",
+                    f"-metadata:s:s:{i}", f"handler_name={track_name}",
+                    # Best-effort only -- see module docstring on why
+                    # this isn't guaranteed to actually suppress
+                    # auto-selection for mp4 the way its mkv counterpart is.
+                    f"-disposition:s:{i}", "0",
+                ]
+        cmd += [
             "-avoid_negative_ts", "make_zero",
             "-f", "mp4",
             str(tmp_path),
         ]
-        run_cmd(cmd, log)
+        try:
+            run_cmd(cmd, log)
+        finally:
+            for tmp_srt in subtitle_tmps:
+                tmp_srt.unlink(missing_ok=True)
 
     finalize_output(tmp_path, out_path)
     log.info("  ✓  %s  (%s)", out_path.name, fmt_size(out_path))
@@ -294,6 +480,9 @@ def mux(
         "output_filename": out_path.name,
         "format": out_format,
         "tool":   tool,
+        "subtitles_embedded": (
+            [s.backend for s in subtitle_sources] if embed_subtitles else []
+        ),
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "7_mux")
@@ -303,6 +492,45 @@ def mux(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _probe_subtitle_tracks(video_path: Path, log: logging.LoggerAdapter) -> list[dict]:
+    """
+    List video_path's own subtitle tracks via `mkvmerge -J` (mkvmerge's
+    machine-readable identify mode) -- used by mux()'s mkv branch to find
+    and replace a previous run's own embedded track(s) rather than
+    duplicating them (see that branch's comment, and this module's
+    docstring's subtitle-embedding section).
+
+    Returns [] -- "found nothing to replace," the same as before this
+    detection existed -- rather than raising, whenever video_path can't
+    be identified this way at all (not a Matroska file, mkvmerge itself
+    unavailable, malformed/unexpected output, a timeout, ...). This is a
+    best-effort probe in service of a nice-to-have (avoiding a duplicate
+    debug subtitle track on re-mux); it should never be the reason the
+    actual mux -- and with it, the censored video the user is waiting on
+    -- fails to produce anything at all.
+    """
+    try:
+        result = subprocess.run(
+            ["mkvmerge", "-J", str(video_path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            log.debug(
+                "  Could not identify %s's existing subtitle tracks "
+                "(mkvmerge -J exited %d) -- treating it as having none.",
+                video_path.name, result.returncode,
+            )
+            return []
+        info = json.loads(result.stdout)
+        return [t for t in info.get("tracks", []) if t.get("type") == "subtitles"]
+    except Exception as exc:
+        log.debug(
+            "  Could not identify %s's existing subtitle tracks (%s) -- "
+            "treating it as having none.", video_path.name, exc,
+        )
+        return []
+
 
 def _output_path(video_path: Path, output_dir: Path, cfg: dict, out_format: str) -> Path:
     """

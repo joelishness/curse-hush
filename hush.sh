@@ -93,7 +93,8 @@
 #       --redo-step STEP  Force this step to redo on an existing job, with no
 #                         review.json involved (e.g. --redo-step 7_mux after
 #                         changing the muxer). Repeatable. One of: 4b_flag,
-#                         4b_review, 5_mute, 6_recombine, 6b_encode, 7_mux.
+#                         4b_review, 5_mute, 6_recombine, 6b_encode,
+#                         6c_transcript_srt, 7_mux.
 #                         Cannot combine with --skip-index/--add-interval/
 #                         --redo-review. Requires the job to already exist --
 #                         refuses rather than starting a fresh one if not.
@@ -187,7 +188,8 @@ Options:
       --redo-step STEP  Force this step to redo on an existing job, with no
                         review.json involved (e.g. --redo-step 7_mux after
                         changing the muxer). Repeatable. One of: 4b_flag,
-                        4b_review, 5_mute, 6_recombine, 6b_encode, 7_mux.
+                        4b_review, 5_mute, 6_recombine, 6b_encode,
+                        6c_transcript_srt, 7_mux.
                         Cannot combine with --skip-index/--add-interval/
                         --redo-review. Requires the job to already exist --
                         refuses rather than starting a fresh one if not.

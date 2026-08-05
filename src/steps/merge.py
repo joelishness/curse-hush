@@ -14,6 +14,22 @@ Transcript merge:
   The output transcript.json has no segment_index or segment_start_offset
   at the top level — only the flat words array with global timestamps.
 
+Comparison transcript merge (alignment.dual_output — see config.yaml):
+  Same offset-and-concatenate logic (_merge_transcript_source(), shared
+  with the primary merge above), applied independently to whichever of
+  transcript_mfa_NN.json / transcript_whisperx_NN.json steps/transcribe.py
+  actually produced, into transcript_mfa.json / transcript_whisperx.json —
+  present only when at least one segment has that backend's data. Reacts
+  to file existence rather than reading alignment.dual_output itself, so
+  it's correct whether that setting was on for the whole job, part of it,
+  or off entirely (in which case whichever backend matches
+  alignment.backend still gets its own labeled file here — redundant with
+  transcript.json in that case, but deliberately so; see
+  steps/transcript_srt.py, the only consumer of these two files, which
+  only ever looks for them by backend-labeled name and never reads the
+  generic transcript.json at all). Never affects transcript.json itself or
+  what Steps 4–7 do with it.
+
 Audio stem merge (multi-segment only):
   Uses the ffmpeg concat demuxer with a temporary file list for reliable
   lossless PCM concatenation.  All input stems are 44.1 kHz stereo PCM
@@ -33,8 +49,10 @@ Intermediate cleanup:
     resume artifact for future per-channel reprocessing, §13.3)
   - dialog_NN.wav, score_sfx_NN.wav — deleted only for multi-segment runs,
     only if not keep_intermediates (canonical versions now exist)
-  - transcript_NN.json — deleted under the same keep_intermediates
-    condition as the files above (see "Correction" note below)
+  - transcript_NN.json, and the comparison-merge's own
+    transcript_{mfa,whisperx}_NN.json (whichever exist) — deleted under
+    the same keep_intermediates condition as the files above (see
+    "Correction" note below)
   See utils.keep_intermediate() — the single source of truth for this
   policy, shared with steps/mute.py, steps/recombine.py, and steps/mux.py
   so it can't drift between steps the way it could when each one
@@ -53,10 +71,19 @@ moment this merge succeeds -- so they now follow the same
 keep_intermediates policy as the other per-segment intermediates above,
 rather than being kept forever.
 
-Marks '3b_merge' done.  Writes the three filenames above into job.json's
-"merge" block ("files": {"transcript", "dialog", "score_sfx"}), alongside
-the segment/word_count stats it already recorded.
-Returns (transcript.json, dialog.wav, score_sfx.wav) as a 3-tuple.
+Marks '3b_merge' done.  Writes the canonical filenames into job.json's
+"merge" block ("files": {"transcript", "dialog", "score_sfx"}, plus
+"transcript_mfa" / "transcript_whisperx" when produced), alongside the
+segment/word_count stats it already recorded.
+Returns (transcript.json, dialog.wav, score_sfx.wav) as a 3-tuple --
+unchanged in shape from before the comparison-merge feature existed.
+transcript_mfa.json / transcript_whisperx.json are NOT part of this
+return value; callers (pipeline.py) discover them the same way they're
+discovered here -- checking for job_dir / "transcript_mfa.json" (etc.)
+directly -- since they're always at those exact, fixed names when
+present at all, the same discoverability transcript.json/dialog.wav/
+score_sfx.wav already have on pipeline.py's own "Steps 1a-3b already
+complete" fast path.
 """
 
 import json
@@ -119,62 +146,46 @@ def merge(
     score_sfx_out  = job_dir / "score_sfx.wav"
 
     # ── 1. Merge transcripts ───────────────────────────────────────────────────
-    # Guarded by an existence check for the same reason the audio-concat
-    # branch below already is (see its comment): step 3's cleanup now
-    # deletes transcript_NN.json before mark_step_done() is called, so a
-    # crash in that exact window would otherwise re-enter this branch on
-    # the next run with transcript.json already correct but its
-    # transcript_NN.json sources already gone.
-    if transcript_out.exists():
-        log.info(
-            "  ↩  transcript.json already exists — verifying (resumed "
-            "after a prior interrupted run) ..."
-        )
-        total_words = len(json.loads(transcript_out.read_text()).get("words", []))
+    total_words = _merge_transcript_source(transcript_paths, segments, transcript_out, state, n, log)
+
+    # ── 1b. Merge comparison transcripts (alignment.dual_output) ──────────────
+    # Reacts to whatever per-segment files steps/transcribe.py actually
+    # produced, rather than reading alignment.dual_output itself -- that
+    # module only ever writes a transcript_{mfa,whisperx}_NN.json when that
+    # backend genuinely produced words for that segment (as the primary
+    # result or as the comparison pass -- see its own docstring), so acting
+    # on file existence here is both simpler and correct whether
+    # dual_output is on, off, or was toggled partway through this job.
+    #
+    # transcript_mfa.json / transcript_whisperx.json therefore end up
+    # produced even with dual_output off, whenever alignment.backend
+    # matches that name (redundant with transcript.json's own content in
+    # that case, but deliberately so: steps/transcript_srt.py only ever
+    # looks for these two backend-labeled files, never the generic
+    # transcript.json, so it doesn't need its own separate "which backend
+    # was primary" logic -- see that module's docstring).
+    #
+    # The existence check against the OUTPUT path first, before looking at
+    # per-segment sources, matters for the same reason it already does for
+    # transcript.json above: this job's own per-segment
+    # transcript_{mfa,whisperx}_NN.json sources are deleted once this
+    # merge succeeds (see cleanup below), so a resumed run must recognize
+    # "already merged" without depending on those sources still existing.
+    transcript_mfa_out: Optional[Path] = job_dir / "transcript_mfa.json"
+    mfa_seg_paths = [job_dir / f"transcript_mfa_{i+1:02d}.json" for i in range(n)]
+    mfa_seg_paths = [p if p.exists() else None for p in mfa_seg_paths]
+    if transcript_mfa_out.exists() or any(p is not None for p in mfa_seg_paths):
+        _merge_transcript_source(mfa_seg_paths, segments, transcript_mfa_out, state, n, log)
     else:
-        all_words:    list[dict] = []
-        detected_lang: str       = "en"
-        total_words = 0
+        transcript_mfa_out = None
 
-        for i, (t_path, (seg_wav, start_offset)) in enumerate(
-            zip(transcript_paths, segments)
-        ):
-            seg_idx = i + 1
-            data = json.loads(t_path.read_text())
-            detected_lang = data.get("language", detected_lang)
-            seg_words     = data.get("words", [])
-
-            # Apply global offset to each word's timestamps.
-            # Words with null timestamps (alignment failures) are preserved as-is.
-            adjusted: list[dict] = []
-            for w in seg_words:
-                aw = dict(w)
-                if w.get("start") is not None:
-                    aw["start"] = round(float(w["start"]) + start_offset, 4)
-                if w.get("end") is not None:
-                    aw["end"]   = round(float(w["end"])   + start_offset, 4)
-                adjusted.append(aw)
-
-            seg_end_sec = start_offset + _seg_duration(state, seg_wav.name, i)
-            log.info(
-                "  [%d/%d] %s  offset=%s  words=%d  (%s → %s)",
-                seg_idx, n, t_path.name,
-                f"{start_offset:.1f}s",
-                len(seg_words),
-                fmt_duration(start_offset),
-                fmt_duration(seg_end_sec),
-            )
-            all_words.extend(adjusted)
-            total_words += len(seg_words)
-
-        transcript_data: dict = {
-            "language": detected_lang,
-            "words":    all_words,
-        }
-        transcript_out.write_text(
-            json.dumps(transcript_data, indent=2, ensure_ascii=False)
-        )
-        log.info("  ✓  transcript.json  words=%d", total_words)
+    transcript_whisperx_out: Optional[Path] = job_dir / "transcript_whisperx.json"
+    whisperx_seg_paths = [job_dir / f"transcript_whisperx_{i+1:02d}.json" for i in range(n)]
+    whisperx_seg_paths = [p if p.exists() else None for p in whisperx_seg_paths]
+    if transcript_whisperx_out.exists() or any(p is not None for p in whisperx_seg_paths):
+        _merge_transcript_source(whisperx_seg_paths, segments, transcript_whisperx_out, state, n, log)
+    else:
+        transcript_whisperx_out = None
 
     # ── 2. Merge audio stems ───────────────────────────────────────────────────
     dialogs    = [d for (d, _) in stem_pairs]
@@ -289,16 +300,36 @@ def merge(
         for t_path in transcript_paths:
             _unlink_if(t_path, log)
 
+        # Same reasoning, same policy, for the per-segment comparison files
+        # (alignment.dual_output) -- transcript_mfa.json / transcript_whisperx.json
+        # above are the merged, canonical versions; nothing downstream ever
+        # reads the _NN per-segment sources again either. Harmless no-ops
+        # for any segment that never had one (dual_output off, or that
+        # backend wasn't attempted/failed for that specific segment).
+        for i in range(n):
+            _unlink_if(job_dir / f"transcript_mfa_{i+1:02d}.json", log)
+            _unlink_if(job_dir / f"transcript_whisperx_{i+1:02d}.json", log)
+
     # ── 4. Persist metadata and mark done ─────────────────────────────────────
     state = read_job(job_dir)
+    files = {
+        "transcript": transcript_out.name,
+        "dialog":     dialog_out.name,
+        "score_sfx":  score_sfx_out.name,
+    }
+    # Present only when produced -- same "field present only when notable"
+    # shape used elsewhere in this pipeline (e.g. transcribe.py's own
+    # mfa_fallback_segments) -- so a job with no comparison data at all
+    # (dual_output never on for this job) doesn't carry two keys pointing
+    # at files that don't exist.
+    if transcript_mfa_out is not None:
+        files["transcript_mfa"] = transcript_mfa_out.name
+    if transcript_whisperx_out is not None:
+        files["transcript_whisperx"] = transcript_whisperx_out.name
     state["merge"] = {
         "segments":   n,
         "word_count": total_words,
-        "files": {
-            "transcript": transcript_out.name,
-            "dialog":     dialog_out.name,
-            "score_sfx":  score_sfx_out.name,
-        },
+        "files": files,
         "dialog_sha256":    dialog_hash,
         "score_sfx_sha256": score_sfx_hash,
     }
@@ -314,6 +345,98 @@ def merge(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _merge_transcript_source(
+    per_segment_paths: list[Optional[Path]],
+    segments: list[tuple[Path, float]],
+    out_path: Path,
+    state: dict,
+    n: int,
+    log: logging.LoggerAdapter,
+) -> int:
+    """
+    Merge one alignment source's per-segment transcript files (offset-
+    adjusted, concatenated in segment order) into one canonical file at
+    out_path. Shared by the primary transcript.json merge and the
+    alignment.dual_output comparison merges (transcript_mfa.json /
+    transcript_whisperx.json) in merge() above -- identical offset-
+    application logic either way, just parameterized by which
+    per-segment files to read and where to write the result.
+
+    A None entry in per_segment_paths means this segment has no data for
+    this particular source (see steps/transcribe.py's dual_output
+    comparison logic, which can leave a segment's comparison file
+    genuinely absent when that backend wasn't attempted, or was attempted
+    and failed, rather than writing an empty one) -- contributes zero
+    words for that segment's span: a real, correctly-reported gap in that
+    source's transcript, not a merge failure.
+
+    Guarded by an out_path existence check for the same reason the
+    original (pre-multi-source) version of this logic always was: Step
+    3b's cleanup deletes per_segment_paths once a merge succeeds, so a
+    crash between "this write succeeded" and mark_step_done() would
+    otherwise need to redo the merge on the next run with its sources
+    already gone.
+
+    Returns the total word count merged.
+    """
+    if out_path.exists():
+        log.info(
+            "  ↩  %s already exists — verifying (resumed after a prior "
+            "interrupted run) ...", out_path.name,
+        )
+        return len(json.loads(out_path.read_text()).get("words", []))
+
+    all_words:     list[dict] = []
+    detected_lang: str        = "en"
+    total_words = 0
+
+    for i, (t_path, (seg_wav, start_offset)) in enumerate(zip(per_segment_paths, segments)):
+        seg_idx = i + 1
+        if t_path is None:
+            log.info(
+                "  [%d/%d] %s — no data for this segment.",
+                seg_idx, n, out_path.name,
+            )
+            continue
+
+        data = json.loads(t_path.read_text())
+        detected_lang = data.get("language", detected_lang)
+        seg_words     = data.get("words", [])
+
+        # Apply global offset to each word's timestamps.
+        # Words with null timestamps (alignment failures) are preserved as-is.
+        adjusted: list[dict] = []
+        for w in seg_words:
+            aw = dict(w)
+            if w.get("start") is not None:
+                aw["start"] = round(float(w["start"]) + start_offset, 4)
+            if w.get("end") is not None:
+                aw["end"]   = round(float(w["end"])   + start_offset, 4)
+            adjusted.append(aw)
+
+        seg_end_sec = start_offset + _seg_duration(state, seg_wav.name, i)
+        log.info(
+            "  [%d/%d] %s  offset=%s  words=%d  (%s → %s)",
+            seg_idx, n, t_path.name,
+            f"{start_offset:.1f}s",
+            len(seg_words),
+            fmt_duration(start_offset),
+            fmt_duration(seg_end_sec),
+        )
+        all_words.extend(adjusted)
+        total_words += len(seg_words)
+
+    transcript_data: dict = {
+        "language": detected_lang,
+        "words":    all_words,
+    }
+    out_path.write_text(
+        json.dumps(transcript_data, indent=2, ensure_ascii=False)
+    )
+    log.info("  ✓  %s  words=%d", out_path.name, total_words)
+    return total_words
+
 
 def _ffmpeg_concat(sources: list[Path], dest: Path, log: logging.LoggerAdapter) -> None:
     """

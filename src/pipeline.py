@@ -28,7 +28,8 @@ require re-running Step 2's Demucs separation from scratch.
 
 --redo-step STEP is a separate, narrower tool: it forces the named
 step(s) (one of 4b_flag, 4b_review, 5_mute, 6_recombine, 6b_encode,
-7_mux) to redo on an existing job, with no review.json involved at all.
+6c_transcript_srt, 7_mux) to redo on an existing job, with no
+review.json involved at all.
 For testing a change to a step's own implementation (e.g. switching
 Step 7 from ffmpeg to mkvmerge) against a job that's already sitting on
 disk, this is the supported alternative to hand-editing steps_completed
@@ -44,10 +45,15 @@ falling through to a fresh run, and never writes job.json by hand.
 
 Naming an earlier step cascades to every step after it through 7_mux
 (see _cascade_steps() below) -- redoing 5_mute alone also clears
-6_recombine/6b_encode/7_mux, so a change always propagates to the file
-actually delivered to /output rather than those steps silently reusing
-stale files left over from before the change. --redo-step 7_mux alone
-clears only 7_mux, since nothing in this pipeline is downstream of it.
+6_recombine/6b_encode/6c_transcript_srt/7_mux, so a change always
+propagates to the file actually delivered to /output rather than those
+steps silently reusing stale files left over from before the change.
+--redo-step 7_mux alone clears only 7_mux, since nothing in this
+pipeline is downstream of it. (6c_transcript_srt is the one step in
+this list --skip-index/--add-interval/--redo-review do NOT also clear --
+see that correction branch, and steps/transcript_srt.py's docstring, for
+why: its output depends only on transcript.json, which a content
+correction never touches.)
 """
 import argparse
 import re
@@ -88,6 +94,8 @@ from steps.mute       import mute      as run_mute
 from steps.recombine  import recombine as run_recombine
 from steps.encode     import encode    as run_encode
 from steps.mux        import mux       as run_mux
+from steps.mux        import _output_path
+from steps.transcript_srt import export_srt as run_srt_export
 from steps.matching   import resolve_word_list_path
 
 # ── Fixed container paths ─────────────────────────────────────────────────────
@@ -143,7 +151,7 @@ def make_job_dir_name(video: Path, job_id: str) -> str:
 # deliberately not included -- they're resumed as one atomic block (see
 # the "3b_merge in done" branch below) and are never valid --redo-step
 # targets (enforced by argparse's choices= on --redo-step itself).
-STEP_ORDER = ["4b_flag", "4b_review", "5_mute", "6_recombine", "6b_encode", "7_mux"]
+STEP_ORDER = ["4b_flag", "4b_review", "5_mute", "6_recombine", "6b_encode", "6c_transcript_srt", "7_mux"]
 
 
 def _cascade_steps(named_steps) -> "list[str]":
@@ -173,7 +181,10 @@ def _cascade_steps(named_steps) -> "list[str]":
     the `correcting` branch below) -- it just needs to work from
     whichever point --redo-step names, rather than always starting at
     5_mute. Naming --redo-step 7_mux alone still clears only 7_mux,
-    since nothing in this pipeline is downstream of it.
+    since nothing in this pipeline is downstream of it. (That fixed
+    correction-mode group deliberately does NOT include
+    6c_transcript_srt, unlike this function -- see this module's
+    docstring.)
     """
     to_clear = set()
     for step in named_steps:
@@ -265,22 +276,24 @@ def main() -> None:
         action="append",
         default=None,
         metavar="STEP",
-        choices=["4b_flag", "4b_review", "5_mute", "6_recombine", "6b_encode", "7_mux"],
+        choices=["4b_flag", "4b_review", "5_mute", "6_recombine", "6b_encode", "6c_transcript_srt", "7_mux"],
         help=(
             "Force this step to redo on an existing job, even though it's "
             "already marked complete -- for re-testing a change to the step "
             "itself (a new muxer, a tuned mute padding, a fixed encode "
-            "command) against a job that already exists, without rerunning "
-            "everything before it. Repeatable. Unlike "
-            "--skip-index/--add-interval/--redo-review (which edit "
-            "review.json to fix a *content* mistake and always redo Steps "
-            "5, 6, 6b, and 7 together), this clears only the named "
-            "step(s) plus everything after them through 7_mux -- e.g. "
-            "naming 5_mute also clears 6_recombine/6b_encode/7_mux, so the "
-            "change actually reaches the file delivered to /output instead "
-            "of those steps silently reusing files left over from before "
-            "the change. Naming 7_mux by itself clears only 7_mux, since "
-            "nothing here is downstream of it. Steps 1a-3b aren't offered "
+            "command, a different transcript_srt.karaoke_color) against a "
+            "job that already exists, without rerunning everything before "
+            "it. Repeatable. Unlike --skip-index/--add-interval/"
+            "--redo-review (which edit review.json to fix a *content* "
+            "mistake and always redo Steps 5, 6, 6b, and 7 together -- "
+            "never 6c_transcript_srt, whose output doesn't depend on "
+            "review.json at all), this clears only the named step(s) plus "
+            "everything after them through 7_mux -- e.g. naming 5_mute "
+            "also clears 6_recombine/6b_encode/6c_transcript_srt/7_mux, so "
+            "the change actually reaches the file delivered to /output "
+            "instead of those steps silently reusing files left over from "
+            "before the change. Naming 7_mux by itself clears only 7_mux, "
+            "since nothing here is downstream of it. Steps 1a-3b aren't offered "
             "here: they're resumed as one atomic block (see the 'Steps "
             "1a-3b already complete' check below) and their per-segment "
             "intermediates may already be deleted, so redoing one alone "
@@ -820,10 +833,85 @@ def main() -> None:
         mark_job_failed(job_dir, "6b_encode", exc)
         sys.exit(1)
 
+    # ── Step 6c: export recognized-word transcript as SRT ──────────────────────
+    # A debugging/reference aid layered on top of the censoring pipeline,
+    # not part of it -- see steps/transcript_srt.py's module docstring.
+    # Deliberately NOT fatal the way every step above is: an unexpected
+    # failure here degrades to "no subtitle tracks this run" rather than
+    # aborting a run that has already finished every genuinely expensive
+    # step (1a-6b), the same one-level-up version of the reasoning
+    # alignment.mfa.fallback_to_whisperx already applies per-segment
+    # inside Step 3b. Ctrl-C is the one exception -- that's the user's
+    # own explicit "stop everything," handled identically to every other
+    # step below.
+    #
+    # output_video_path is computed here, ahead of Step 7 itself, purely
+    # so Step 6c can name any sidecar SRTs after the eventual output
+    # video's own filename (transcript_srt.write_sidecar -- see
+    # steps/transcript_srt.py) -- _output_path() is a pure function of
+    # (video, OUTPUT_DIR, cfg, out_format), designed to be called
+    # independently of actually muxing anything (batch_plan.py already
+    # does exactly this for its own planning purposes), so computing it
+    # twice here and again inside run_mux() below is cheap and can't
+    # disagree with itself.
+    out_format = str(cfg_get(cfg, "output", "format")).lower()
+    output_video_path = _output_path(video, OUTPUT_DIR, cfg, out_format)
+
+    sr_log = step_logger("srt")
+    srt_sources: list = []
+    try:
+        srt_sources = run_srt_export(job_dir, output_video_path, cfg, sr_log)
+    except KeyboardInterrupt:
+        sr_log.error("Step 6c interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "6c_transcript_srt")
+        sys.exit(130)
+    except Exception as exc:
+        sr_log.warning(
+            "Step 6c failed (%s) -- continuing without any transcript "
+            "subtitle tracks this run; every other output is unaffected. "
+            "Re-run (or --redo-step 6c_transcript_srt) after investigating "
+            "to try again without repeating Steps 1a-6b.",
+            exc,
+        )
+
+    # If this job's Step 7 already completed under an OLDER version of this
+    # pipeline -- one before Step 6c existed at all -- it has no idea any
+    # subtitle track is now available: it already returned its cached
+    # output the moment it saw "7_mux" in steps_completed, never reaching
+    # the mkvmerge/ffmpeg command that would embed one. Detected here (not
+    # inside mux.py itself, which has no way to know whether its own
+    # "already complete" is stale for a reason specific to a step that
+    # didn't exist the last time it ran) by the one-time signature of
+    # exactly that situation: Step 6c had to do real work just now (it
+    # wasn't already in `done` -- the steps_completed snapshot read before
+    # anything in this invocation ran) and produced at least one source to
+    # embed, while Step 7 was ALREADY marked done in that same snapshot.
+    # Forces exactly one extra re-mux to pick it up -- cheap relative to
+    # everything already spent reaching this point in the job -- and never
+    # fires again for this job afterward, since "6c_transcript_srt" is in
+    # `done` on every run from here on.
+    if (
+        srt_sources
+        and "6c_transcript_srt" not in done
+        and "7_mux" in done
+    ):
+        sr_log.info(
+            "Step 6c produced %d transcript SRT(s) for the first time on a "
+            "job whose Step 7 (mux) already completed under a version of "
+            "this pipeline from before Step 6c existed -- forcing Step 7 "
+            "to redo once so the new subtitle track(s) actually reach the "
+            "output video.",
+            len(srt_sources),
+        )
+        unmark_step_done(job_dir, "7_mux")
+
     # ── Step 7: mux encoded audio into the original video ──────────────────────
     mx_log = step_logger("mux")
     try:
-        output_video = run_mux(job_dir, video, audio_encoded_out, OUTPUT_DIR, cfg, mx_log)
+        output_video = run_mux(
+            job_dir, video, audio_encoded_out, OUTPUT_DIR, cfg, mx_log,
+            subtitle_sources=srt_sources,
+        )
     except KeyboardInterrupt:
         mx_log.error("Step 7 interrupted by user (Ctrl-C).")
         mark_job_interrupted(job_dir, "7_mux")
@@ -851,7 +939,7 @@ def main() -> None:
     steps_label = "1a / 1b / 1c / 2 / 3 / 3b / 4b (flag)"
     if review_path:
         steps_label += " + 4b (review)"
-    steps_label += " / 5 (mute) / 6 (recombine) / 6b (encode) / 7 (mux)"
+    steps_label += " / 5 (mute) / 6 (recombine) / 6b (encode) / 6c (srt) / 7 (mux)"
 
     log.info("=" * 60)
     log.info("Pipeline complete!  Steps %s.", steps_label)
@@ -895,6 +983,22 @@ def main() -> None:
             "  Audio track      : %s @ %s bps  (matches original codec)",
             encode_st.get("encoder", "?"), encode_st.get("bitrate", "?"),
         )
+    srt_st = state.get("transcript_srt", {})
+    srt_backends_reported = [b for b in ("mfa", "whisperx") if srt_st.get(b)]
+    if srt_backends_reported:
+        for backend in srt_backends_reported:
+            b = srt_st[backend]
+            log.info(
+                "  Transcript SRT (%s): %d word(s) in %d group(s), %d cue(s)  (karaoke=%s)",
+                backend, b.get("words", 0), b.get("groups", 0), b.get("cues", 0),
+                b.get("karaoke"),
+            )
+    elif "6c_transcript_srt" not in state.get("steps_completed", []):
+        log.info("  Transcript SRT   : failed this run -- see the [srt] WARN line above; every other output is unaffected.")
+    elif bool(cfg_get(cfg, "transcript_srt", "enabled")):
+        log.info("  Transcript SRT   : none (neither transcript_mfa.json nor transcript_whisperx.json had a word with usable alignment timing)")
+    else:
+        log.info("  Transcript SRT   : disabled (transcript_srt.enabled: false)")
     log.info("")
     log.info("  Final output     : %s", output_video)
     log.info("")
@@ -911,9 +1015,20 @@ def main() -> None:
     # delete by default once consumed (steps/mute.py, steps/recombine.py,
     # steps/encode.py, steps/mux.py) — only log them if they're actually
     # still on disk, i.e. keep_intermediates was set, rather than printing
-    # a path that no longer exists.
+    # a path that no longer exists. Each srt_sources entry's job_dir_path
+    # (and sidecar_path, when transcript_srt.write_sidecar produced one) is
+    # genuinely conditional even ignoring keep_intermediates
+    # (transcript_srt.enabled, or neither transcript having any word with
+    # usable timing, can both make Step 6c produce nothing at all -- see
+    # the Transcript SRT summary lines above) rather than just
+    # sometimes-already-deleted, so these are logged only when actually
+    # present, same test as the large intermediates.
     log.info("    %s", log_path)
     log.info("    %s", transcript_out)
+    for source in srt_sources:
+        log.info("    %s", source.job_dir_path)
+        if source.sidecar_path is not None:
+            log.info("    %s", source.sidecar_path)
     log.info("    %s", matches_out)
     if review_path:
         log.info("    %s", review_path)
