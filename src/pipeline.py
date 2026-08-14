@@ -984,19 +984,25 @@ def main() -> None:
             encode_st.get("encoder", "?"), encode_st.get("bitrate", "?"),
         )
     srt_st = state.get("transcript_srt", {})
-    srt_backends_reported = [b for b in ("mfa", "whisperx") if srt_st.get(b)]
-    if srt_backends_reported:
-        for backend in srt_backends_reported:
-            b = srt_st[backend]
+    # Sorted numerically for any numbered stage key ("1", "2", ...),
+    # with "final" always last -- matches the order export_srt() itself
+    # returns sources in (see steps/transcript_srt.py), and stays correct
+    # however many alignment stages this job ends up with.
+    srt_keys_reported = sorted(
+        srt_st.keys(), key=lambda k: (k == "final", int(k) if k != "final" else 0)
+    )
+    if srt_keys_reported:
+        for key in srt_keys_reported:
+            b = srt_st[key]
             log.info(
                 "  Transcript SRT (%s): %d word(s) in %d group(s), %d cue(s)  (karaoke=%s)",
-                backend, b.get("words", 0), b.get("groups", 0), b.get("cues", 0),
+                b.get("label", key), b.get("words", 0), b.get("groups", 0), b.get("cues", 0),
                 b.get("karaoke"),
             )
     elif "6c_transcript_srt" not in state.get("steps_completed", []):
         log.info("  Transcript SRT   : failed this run -- see the [srt] WARN line above; every other output is unaffected.")
     elif bool(cfg_get(cfg, "transcript_srt", "enabled")):
-        log.info("  Transcript SRT   : none (neither transcript_mfa.json nor transcript_whisperx.json had a word with usable alignment timing)")
+        log.info("  Transcript SRT   : none (no alignment-stage or authoritative transcript had a word with usable alignment timing)")
     else:
         log.info("  Transcript SRT   : disabled (transcript_srt.enabled: false)")
     log.info("")

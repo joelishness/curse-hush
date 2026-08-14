@@ -14,21 +14,24 @@ Transcript merge:
   The output transcript.json has no segment_index or segment_start_offset
   at the top level — only the flat words array with global timestamps.
 
-Comparison transcript merge (alignment.dual_output — see config.yaml):
+Alignment-stage transcript merge (alignment.dual_output — see config.yaml):
   Same offset-and-concatenate logic (_merge_transcript_source(), shared
-  with the primary merge above), applied independently to whichever of
-  transcript_mfa_NN.json / transcript_whisperx_NN.json steps/transcribe.py
-  actually produced, into transcript_mfa.json / transcript_whisperx.json —
-  present only when at least one segment has that backend's data. Reacts
-  to file existence rather than reading alignment.dual_output itself, so
-  it's correct whether that setting was on for the whole job, part of it,
-  or off entirely (in which case whichever backend matches
-  alignment.backend still gets its own labeled file here — redundant with
-  transcript.json in that case, but deliberately so; see
-  steps/transcript_srt.py, the only consumer of these two files, which
-  only ever looks for them by backend-labeled name and never reads the
-  generic transcript.json at all). Never affects transcript.json itself or
-  what Steps 4–7 do with it.
+  with the primary merge above), applied independently to whichever
+  transcript_{N}_NN.json files steps/transcribe.py actually produced, for
+  each stage number in job.json's own "alignment_stages" legend (also
+  written by that step), into transcript_{N}.json — present only when at
+  least one segment has that stage's data. Reacts to per-segment file
+  existence rather than reading alignment.dual_output itself, so it's
+  correct whether that setting was on for the whole job, part of it, or
+  off entirely (in which case whichever stage matches alignment.backend
+  still gets its own numbered file here — redundant with transcript.json
+  in that case, but deliberately so; see steps/transcript_srt.py, the
+  only consumer of these files, which only ever looks for them by
+  stage-numbered name and never reads the generic transcript.json at
+  all). A future stage 3 needs no changes here: it appears in
+  alignment_stages the moment steps/transcribe.py starts writing one, and
+  is merged the same way as stages 1 and 2 today. Never affects
+  transcript.json itself or what Steps 4–7 do with it.
 
 Audio stem merge (multi-segment only):
   Uses the ffmpeg concat demuxer with a temporary file list for reliable
@@ -49,10 +52,10 @@ Intermediate cleanup:
     resume artifact for future per-channel reprocessing, §13.3)
   - dialog_NN.wav, score_sfx_NN.wav — deleted only for multi-segment runs,
     only if not keep_intermediates (canonical versions now exist)
-  - transcript_NN.json, and the comparison-merge's own
-    transcript_{mfa,whisperx}_NN.json (whichever exist) — deleted under
-    the same keep_intermediates condition as the files above (see
-    "Correction" note below)
+  - transcript_NN.json, and every alignment stage's own
+    transcript_{N}_NN.json (whichever numbers job.json's
+    "alignment_stages" lists) — deleted under the same keep_intermediates
+    condition as the files above (see "Correction" note below)
   See utils.keep_intermediate() — the single source of truth for this
   policy, shared with steps/mute.py, steps/recombine.py, and steps/mux.py
   so it can't drift between steps the way it could when each one
@@ -73,17 +76,16 @@ rather than being kept forever.
 
 Marks '3b_merge' done.  Writes the canonical filenames into job.json's
 "merge" block ("files": {"transcript", "dialog", "score_sfx"}, plus
-"transcript_mfa" / "transcript_whisperx" when produced), alongside the
-segment/word_count stats it already recorded.
+"transcript_{N}" for each alignment stage number actually produced),
+alongside the segment/word_count stats it already recorded.
 Returns (transcript.json, dialog.wav, score_sfx.wav) as a 3-tuple --
-unchanged in shape from before the comparison-merge feature existed.
-transcript_mfa.json / transcript_whisperx.json are NOT part of this
-return value; callers (pipeline.py) discover them the same way they're
-discovered here -- checking for job_dir / "transcript_mfa.json" (etc.)
-directly -- since they're always at those exact, fixed names when
-present at all, the same discoverability transcript.json/dialog.wav/
-score_sfx.wav already have on pipeline.py's own "Steps 1a-3b already
-complete" fast path.
+unchanged in shape from every earlier version of this pipeline.
+transcript_{N}.json files are NOT part of this return value; callers
+(pipeline.py) discover them the same way they're discovered here --
+checking for job_dir / f"transcript_{N}.json" directly -- since they're
+always at those exact, fixed names when present at all, the same
+discoverability transcript.json/dialog.wav/score_sfx.wav already have on
+pipeline.py's own "Steps 1a-3b already complete" fast path.
 """
 
 import json
@@ -148,44 +150,39 @@ def merge(
     # ── 1. Merge transcripts ───────────────────────────────────────────────────
     total_words = _merge_transcript_source(transcript_paths, segments, transcript_out, state, n, log)
 
-    # ── 1b. Merge comparison transcripts (alignment.dual_output) ──────────────
-    # Reacts to whatever per-segment files steps/transcribe.py actually
-    # produced, rather than reading alignment.dual_output itself -- that
-    # module only ever writes a transcript_{mfa,whisperx}_NN.json when that
-    # backend genuinely produced words for that segment (as the primary
-    # result or as the comparison pass -- see its own docstring), so acting
-    # on file existence here is both simpler and correct whether
-    # dual_output is on, off, or was toggled partway through this job.
+    # ── 1b. Merge each alignment stage's own transcript ─────────────────────────
+    # Reacts to job.json's own "alignment_stages" legend (written by Step 3
+    # -- see steps/transcribe.py) for WHICH stage numbers to look for, and
+    # to whatever per-segment transcript_{N}_NN.json files actually exist
+    # for WHETHER a given stage has anything to merge -- both correct
+    # whether alignment.dual_output was on for the whole job, part of it,
+    # or a stage's data only exists because it was the authoritative one
+    # (see steps/transcribe.py's own docstring). A future stage 3 needs no
+    # changes here at all: it shows up in alignment_stages the moment
+    # steps/transcribe.py starts writing one, and is merged the same way.
     #
-    # transcript_mfa.json / transcript_whisperx.json therefore end up
-    # produced even with dual_output off, whenever alignment.backend
-    # matches that name (redundant with transcript.json's own content in
-    # that case, but deliberately so: steps/transcript_srt.py only ever
-    # looks for these two backend-labeled files, never the generic
-    # transcript.json, so it doesn't need its own separate "which backend
-    # was primary" logic -- see that module's docstring).
+    # transcript_{N}.json for the authoritative stage therefore ends up
+    # produced even with dual_output off (redundant with transcript.json's
+    # own content in that case, but deliberately so: steps/transcript_srt.py
+    # only ever looks for these stage-numbered files, never the generic
+    # transcript.json, so it doesn't need its own separate "which stage was
+    # authoritative" logic -- see that module's docstring).
     #
-    # The existence check against the OUTPUT path first, before looking at
-    # per-segment sources, matters for the same reason it already does for
-    # transcript.json above: this job's own per-segment
-    # transcript_{mfa,whisperx}_NN.json sources are deleted once this
-    # merge succeeds (see cleanup below), so a resumed run must recognize
-    # "already merged" without depending on those sources still existing.
-    transcript_mfa_out: Optional[Path] = job_dir / "transcript_mfa.json"
-    mfa_seg_paths = [job_dir / f"transcript_mfa_{i+1:02d}.json" for i in range(n)]
-    mfa_seg_paths = [p if p.exists() else None for p in mfa_seg_paths]
-    if transcript_mfa_out.exists() or any(p is not None for p in mfa_seg_paths):
-        _merge_transcript_source(mfa_seg_paths, segments, transcript_mfa_out, state, n, log)
-    else:
-        transcript_mfa_out = None
-
-    transcript_whisperx_out: Optional[Path] = job_dir / "transcript_whisperx.json"
-    whisperx_seg_paths = [job_dir / f"transcript_whisperx_{i+1:02d}.json" for i in range(n)]
-    whisperx_seg_paths = [p if p.exists() else None for p in whisperx_seg_paths]
-    if transcript_whisperx_out.exists() or any(p is not None for p in whisperx_seg_paths):
-        _merge_transcript_source(whisperx_seg_paths, segments, transcript_whisperx_out, state, n, log)
-    else:
-        transcript_whisperx_out = None
+    # The existence check against each stage's OUTPUT path first, before
+    # looking at per-segment sources, matters for the same reason it
+    # already does for transcript.json above: this job's own per-segment
+    # transcript_{N}_NN.json sources are deleted once this merge succeeds
+    # (see cleanup below), so a resumed run must recognize "already merged"
+    # without depending on those sources still existing.
+    stage_outputs: dict[int, Path] = {}
+    for stage in state.get("alignment_stages", []):
+        number   = stage["number"]
+        out_path = job_dir / f"transcript_{number}.json"
+        seg_paths = [job_dir / f"transcript_{number}_{i+1:02d}.json" for i in range(n)]
+        seg_paths = [p if p.exists() else None for p in seg_paths]
+        if out_path.exists() or any(p is not None for p in seg_paths):
+            _merge_transcript_source(seg_paths, segments, out_path, state, n, log)
+            stage_outputs[number] = out_path
 
     # ── 2. Merge audio stems ───────────────────────────────────────────────────
     dialogs    = [d for (d, _) in stem_pairs]
@@ -300,15 +297,16 @@ def merge(
         for t_path in transcript_paths:
             _unlink_if(t_path, log)
 
-        # Same reasoning, same policy, for the per-segment comparison files
-        # (alignment.dual_output) -- transcript_mfa.json / transcript_whisperx.json
-        # above are the merged, canonical versions; nothing downstream ever
-        # reads the _NN per-segment sources again either. Harmless no-ops
-        # for any segment that never had one (dual_output off, or that
-        # backend wasn't attempted/failed for that specific segment).
-        for i in range(n):
-            _unlink_if(job_dir / f"transcript_mfa_{i+1:02d}.json", log)
-            _unlink_if(job_dir / f"transcript_whisperx_{i+1:02d}.json", log)
+        # Same reasoning, same policy, for each alignment stage's own
+        # per-segment files -- transcript_{N}.json above (for whichever
+        # numbers stage_outputs has) is the merged, canonical version;
+        # nothing downstream ever reads the _NN per-segment sources again
+        # either. Harmless no-ops for any segment/stage combination that
+        # never had one (dual_output off, or that stage wasn't
+        # attempted/failed for that specific segment).
+        for stage in state.get("alignment_stages", []):
+            for i in range(n):
+                _unlink_if(job_dir / f"transcript_{stage['number']}_{i+1:02d}.json", log)
 
     # ── 4. Persist metadata and mark done ─────────────────────────────────────
     state = read_job(job_dir)
@@ -317,15 +315,13 @@ def merge(
         "dialog":     dialog_out.name,
         "score_sfx":  score_sfx_out.name,
     }
+    for number, path in stage_outputs.items():
+        files[f"transcript_{number}"] = path.name
     # Present only when produced -- same "field present only when notable"
     # shape used elsewhere in this pipeline (e.g. transcribe.py's own
     # mfa_fallback_segments) -- so a job with no comparison data at all
-    # (dual_output never on for this job) doesn't carry two keys pointing
-    # at files that don't exist.
-    if transcript_mfa_out is not None:
-        files["transcript_mfa"] = transcript_mfa_out.name
-    if transcript_whisperx_out is not None:
-        files["transcript_whisperx"] = transcript_whisperx_out.name
+    # (dual_output never on for this job) doesn't carry keys pointing at
+    # files that don't exist.
     state["merge"] = {
         "segments":   n,
         "word_count": total_words,

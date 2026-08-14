@@ -125,19 +125,21 @@ place.
     Replace, don't duplicate: before adding these, video_path's own
     existing subtitle tracks are probed (_probe_subtitle_tracks(), via
     `mkvmerge -J`) for any whose name exactly matches one of THIS run's
-    configured track_name_mfa / track_name_whisperx — i.e. this
-    pipeline's own tracks from a previous run, if video_path happens to
-    be pointed back at this job's own prior output rather than the
-    original source. Matches are excluded from passthrough
+    subtitle_sources' own track_name (steps/transcript_srt.py — built
+    from transcript_srt.track_name_prefix plus each source's label) —
+    i.e. this pipeline's own tracks from a previous run, if video_path
+    happens to be pointed back at this job's own prior output rather
+    than the original source. Matches are excluded from passthrough
     (--subtitle-tracks with the surviving IDs, or --no-subtitles if every
     existing subtitle track matched) so re-muxing replaces them rather
     than piling up duplicates every run. Matched by EXACT current name
-    only: change track_name_mfa/track_name_whisperx between runs and a
-    track already embedded under the OLD name is no longer recognized as
-    "ours" and is left in place rather than replaced — the new name just
-    gets added alongside it going forward. The probe is best-effort
-    (_probe_subtitle_tracks() returns "found nothing to replace" rather
-    than raising if video_path can't be identified this way at all) —
+    only: change track_name_prefix between runs (or the set of alignment
+    stages that ran) and a track already embedded under the OLD name is
+    no longer recognized as "ours" and is left in place rather than
+    replaced — the new name just gets added alongside it going forward.
+    The probe is best-effort (_probe_subtitle_tracks() returns "found
+    nothing to replace" rather than raising if video_path can't be
+    identified this way at all) —
     this is a nice-to-have in service of a debug track staying tidy on
     repeat runs, never a reason the actual censored video fails to mux.
 
@@ -347,15 +349,13 @@ def mux(
         # was pointed back at this job's own prior output -- see module
         # docstring), passing it through unfiltered alongside the fresh
         # copy added below would leave two tracks with the same name in
-        # the result. Matched by exact name against every backend's
-        # CURRENTLY configured track_name_{backend} -- see
-        # _find_tracks_to_replace()'s own docstring for what changing
+        # the result. Matched by exact name against each source's own
+        # CURRENT track_name (steps/transcript_srt.py -- built from
+        # transcript_srt.track_name_prefix plus that source's label) --
+        # see _probe_subtitle_tracks()'s own docstring for what changing
         # that setting between runs does to this matching.
         if embed_subtitles:
-            configured_names = {
-                str(cfg_get(cfg, "transcript_srt", f"track_name_{s.backend}"))
-                for s in subtitle_sources
-            }
+            configured_names = {s.track_name for s in subtitle_sources}
             existing_subs = _probe_subtitle_tracks(video_path, log)
             all_sub_ids = [t["id"] for t in existing_subs]
             replace_ids = [
@@ -416,7 +416,7 @@ def mux(
             for i, source in enumerate(subtitle_sources):
                 if not source.mp4_fallback_text:
                     continue
-                tmp_srt = job_dir / f".transcript_mp4_embed_{source.backend}.srt"
+                tmp_srt = job_dir / f".transcript_mp4_embed_{source.key}.srt"
                 tmp_srt.write_text(source.mp4_fallback_text, encoding="utf-8")
                 subtitle_tmps.append(tmp_srt)
 
@@ -437,10 +437,9 @@ def mux(
             for i, source in enumerate(
                 s for s in subtitle_sources if s.mp4_fallback_text
             ):
-                track_name = str(cfg_get(cfg, "transcript_srt", f"track_name_{source.backend}"))
                 cmd += [
                     f"-metadata:s:s:{i}", f"language={track_lang}",
-                    f"-metadata:s:s:{i}", f"handler_name={track_name}",
+                    f"-metadata:s:s:{i}", f"handler_name={source.track_name}",
                     # Best-effort only -- see module docstring on why
                     # this isn't guaranteed to actually suppress
                     # auto-selection for mp4 the way its mkv counterpart is.
@@ -481,7 +480,7 @@ def mux(
         "format": out_format,
         "tool":   tool,
         "subtitles_embedded": (
-            [s.backend for s in subtitle_sources] if embed_subtitles else []
+            [s.key for s in subtitle_sources] if embed_subtitles else []
         ),
     }
     write_job(job_dir, state)

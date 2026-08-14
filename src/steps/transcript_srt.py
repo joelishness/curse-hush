@@ -2,36 +2,37 @@
 profanity-hush — Step 6c: export aligned transcripts as SRT subtitles
 
 Why this exists: figuring out *why* a word got muted at the wrong moment,
-or why MFA and WhisperX disagree about a word, normally means cross-
-referencing the output video against a transcript against the original
-audio by hand, across three separate tools — exactly the tedious process
+or why two alignment stages disagree, normally means cross-referencing
+the output video against a transcript against the original audio by
+hand, across three separate tools — exactly the tedious process
 docs/timestamp-drift-investigation.md's whole worked example walks
 through. This step makes that a "turn a subtitle track on" problem
-instead: each available aligned transcript becomes its own subtitle
-track showing every word that backend recognized, at exactly the
-timestamp it gives it, so a mistimed mute — or a disagreement between
-alignment methods — is immediately visible as a mismatch between what
-the track says is being spoken and what's actually audible.
+instead: each available transcript — every alignment stage's own, plus
+the authoritative/censoring-relevant result — becomes its own subtitle
+track showing every word recognized there, at exactly the timestamp it
+gives it, so a mistimed mute — or a disagreement between stages — is
+immediately visible as a mismatch between what the track says is being
+spoken and what's actually audible.
 
-Input  : transcript_mfa.json and/or transcript_whisperx.json (Step 3b —
-         see steps/merge.py's docstring for exactly when each exists:
-         depends on alignment.backend and alignment.dual_output).
-Output : transcript_mfa.srt and/or transcript_whisperx.srt, saved in the
-         job directory, and — transcript_srt.write_sidecar — a copy of
-         each next to the output video too. Also returned in memory (see
-         export_srt()'s docstring) for steps/mux.py to embed.
+Input  : transcript_{N}.json for each alignment stage number job.json's
+         "alignment_stages" legend lists (steps/transcribe.py,
+         steps/merge.py), plus transcript.json, the authoritative one.
+Output : transcript_{N}.srt for each stage, plus transcript.srt for the
+         authoritative result — saved in the job directory, and —
+         transcript_srt.write_sidecar — a copy of each next to the output
+         video too. Also returned in memory (see export_srt()'s
+         docstring) for steps/mux.py to embed.
 Marks '6c_transcript_srt' done.
 
 Does this belong in the --skip-index/--add-interval/--redo-review
 correction-mode unmark list (pipeline.py) alongside 5_mute/6_recombine/
 6b_encode/7_mux? No, deliberately not: these SRTs are derived purely from
-transcript_mfa.json / transcript_whisperx.json (what was recognized),
-never from matches.json/review.json/censor_log.json (what got muted) — a
-correction changes the latter, never the former, so this step's own
-output can't be stale after one. It still runs on a correction re-run
-(pipeline.py always calls it, same as every run), but only to hit its own
-"already complete" branch below and hand steps/mux.py back the same
-files.
+transcript.json and transcript_{N}.json (what was recognized), never from
+matches.json/review.json/censor_log.json (what got muted) — a correction
+changes the latter, never the former, so this step's own output can't be
+stale after one. It still runs on a correction re-run (pipeline.py always
+calls it, same as every run), but only to hit its own "already complete"
+branch below and hand steps/mux.py back the same files.
 
 Failure handling is deliberately NOT the same as every other step's: an
 unexpected failure here logs a warning and lets the pipeline continue
@@ -109,21 +110,26 @@ actual censored film would never want burned in permanently in the first
 place. Soft-embedding (a selectable, non-default track) is the only
 option consistent with that guarantee — see steps/mux.py.
 
-── Why two SRTs instead of one ───────────────────────────────────────────
+── Why one SRT per stage, plus one more for the authoritative result ────
 
 Earlier versions of this step read a single, generic transcript.json —
 whatever alignment.backend happened to produce, per segment, including
-any per-segment whisperx fallback baked invisibly into the same file (see
-steps/align_mfa.py's fallback handling). That's still exactly what
-transcript.json is for matching/muting (steps/matching.py, steps/mute.py)
-— unchanged. But it makes a poor comparison tool: there's no way to tell,
-from transcript.json alone, whether a given word's timing came from MFA
-or from a whisperx fallback, which is precisely the distinction someone
-troubleshooting a disagreement between the two needs to see. Backend-
-labeled sources (transcript_mfa.json / transcript_whisperx.json — see
+any per-segment fallback baked invisibly into the same file (see
+steps/transcribe.py's cascade). That's still exactly what transcript.json
+is for matching/muting (steps/matching.py, steps/mute.py) — unchanged.
+But it makes a poor comparison tool on its own: there's no way to tell,
+from transcript.json alone, whether a given word's timing came from the
+authoritative stage or a fallback, which is precisely the distinction
+someone troubleshooting a disagreement between stages needs to see.
+Stage-numbered sources (transcript_1.json, transcript_2.json, ... — see
 steps/merge.py) fix that: each is a clean, honestly-gapped view of what
-one specific backend actually produced, independent of which one was
-"primary" for censoring purposes.
+one specific stage actually produced, independent of which one was
+authoritative for censoring purposes. Numbered, not named after a
+specific tool, for the same reason steps/transcribe.py's own
+_ALIGNMENT_STAGES registry is: a future stage 3 (a different aligner
+entirely) needs no changes here — job.json's own "alignment_stages"
+legend is read fresh each run, so a new stage number just starts showing
+up as one more SRT the moment steps/transcribe.py starts producing it.
 """
 
 import json
@@ -153,7 +159,7 @@ from utils import (
 # way there is for, say, max_words_per_group.
 _SENTENCE_END_RE = re.compile(r"[.?!]+[\"'\u2019\u201d)\]]*$")
 
-# Floor for a single karaoke cue's duration, in seconds. A backend's word
+# Floor for a single karaoke cue's duration, in seconds. A stage's word
 # list should always be strictly time-ordered with non-overlapping spans
 # (a forced/CTC aligner can't place two words in the same instant) --
 # this only guards against a same-timestamp or out-of-order anomaly
@@ -161,25 +167,29 @@ _SENTENCE_END_RE = re.compile(r"[.?!]+[\"'\u2019\u201d)\]]*$")
 # reject outright.
 _MIN_CUE_SEC = 0.05
 
-# The two alignment backends this step knows how to source a transcript
-# from -- also the config-key suffix (transcript_srt.track_name_mfa, ...)
-# and the filename tag (transcript_mfa.srt, <video>.eng.mfa.srt, ...) for
-# each. Order here is the order sources are processed and returned in.
-_BACKENDS = ("mfa", "whisperx")
-
 
 @dataclass
 class SrtSource:
     """
-    One alignment backend's SRT output for this job — everything
-    steps/mux.py needs to embed it, and everything pipeline.py needs to
-    log it as a kept output.
+    One transcript's SRT output for this job — everything steps/mux.py
+    needs to embed it, and everything pipeline.py needs to log it as a
+    kept output.
 
-    backend            — "mfa" | "whisperx".
-    job_dir_path        — job_dir/transcript_{backend}.srt. Always written
-                           (in whichever style transcript_srt.karaoke
-                           selects) whenever this source exists at all.
-    sidecar_path         — a copy of the same content next to the output
+    key                 — "1", "2", ... for one alignment stage's own
+                           transcript (see job.json's "alignment_stages"
+                           legend, steps/transcribe.py), or "final" for
+                           the authoritative/censoring-relevant one. Used
+                           for logging and job.json bookkeeping only --
+                           not part of any filename this module writes
+                           (see job_dir_path/sidecar_path below).
+    label               — human-readable, e.g. "Stage 2 (MFA)" or
+                           "Final (authoritative)".
+    job_dir_path        — job_dir/transcript_{N}.srt for a stage, or
+                           job_dir/transcript.srt for the authoritative
+                           one. Always written (in whichever style
+                           transcript_srt.karaoke selects) whenever this
+                           source exists at all.
+    sidecar_path        — a copy of the same content next to the output
                            video, named per config.yaml's convention.
                            None when transcript_srt.write_sidecar is false.
     mp4_fallback_text   — a plain (no <font> tags) one-cue-per-group
@@ -188,10 +198,12 @@ class SrtSource:
                            for output.format: mp4 specifically (see this
                            module's docstring for why mp4 can't show the
                            karaoke version at all).
-    track_name          — transcript_srt.track_name_{backend}, for
-                           steps/mux.py's embedded-track metadata.
+    track_name          — transcript_srt.track_name_prefix plus this
+                           source's own label, for steps/mux.py's
+                           embedded-track metadata.
     """
-    backend:            str
+    key:                str
+    label:              str
     job_dir_path:       Path
     sidecar_path:       Optional[Path]
     mp4_fallback_text:  str
@@ -205,20 +217,24 @@ def export_srt(
     log: Optional[logging.LoggerAdapter] = None,
 ) -> list[SrtSource]:
     """
-    Step 6c: render each available aligned transcript into its own SRT.
+    Step 6c: render each available transcript into its own SRT — every
+    alignment stage job.json's "alignment_stages" legend (steps/
+    transcribe.py) lists a transcript_{N}.json for (steps/merge.py), plus
+    transcript.json, the authoritative/censoring-relevant one.
 
     output_video_path — the final output video's path (e.g. from
     steps.mux._output_path(), called early by pipeline.py for exactly
     this purpose). Used only to derive sidecar filenames
-    (<output_video_path.stem>.<language>.<backend>.srt, written next to
-    it) — the file itself need not exist yet when this runs, since Step
-    6c always runs before Step 7 actually produces it.
+    (<output_video_path.stem>.<language>.<N-or-nothing>.srt, written next
+    to it) — the file itself need not exist yet when this runs, since
+    Step 6c always runs before Step 7 actually produces it.
 
-    Returns one SrtSource per backend that had a transcript_{backend}.json
-    (steps/merge.py) with at least one word with usable alignment timing
-    — so 0, 1, or 2 entries, in _BACKENDS order. Empty whenever
-    transcript_srt.enabled is false, or neither backend produced any
-    usable timing at all.
+    Returns one SrtSource per stage that had a transcript_{N}.json with
+    at least one word with usable alignment timing, in ascending stage
+    order, followed by one more for transcript.json if it qualifies too
+    — so anywhere from 0 to (number of registered stages + 1) entries.
+    Empty whenever transcript_srt.enabled is false, or nothing at all
+    had any usable timing.
     """
     if log is None:
         log = step_logger("srt")
@@ -232,14 +248,29 @@ def export_srt(
         mark_step_done(job_dir, "6c_transcript_srt")
         return []
 
+    # Discovered from job.json's own "alignment_stages" legend (written
+    # by steps/transcribe.py), not a hardcoded list here -- see this
+    # module's own docstring ("Why one SRT per stage...") for why: a
+    # future stage 3 just starts appearing the moment that legend lists
+    # it, with nothing in this function needing to change.
+    candidates: list[tuple[str, str, Path, str]] = [
+        (
+            str(stage["number"]),
+            f"Stage {stage['number']} ({stage['label']})",
+            job_dir / f"transcript_{stage['number']}.json",
+            f"_{stage['number']}",
+        )
+        for stage in state.get("alignment_stages", [])
+    ]
+    candidates.append(("final", "Final", job_dir / "transcript.json", ""))
+
     sources: list[SrtSource] = []
-    for backend in _BACKENDS:
-        transcript_path = job_dir / f"transcript_{backend}.json"
+    for key, label, transcript_path, suffix in candidates:
         if not transcript_path.exists():
             continue
         source = _export_one_source(
-            job_dir, output_video_path, backend, transcript_path,
-            already_done, cfg, log,
+            job_dir, output_video_path, key, label, suffix,
+            transcript_path, already_done, cfg, log,
         )
         if source is not None:
             sources.append(source)
@@ -248,9 +279,9 @@ def export_srt(
 
     if not sources:
         log.warning(
-            "Step 6c — neither transcript_mfa.json nor "
-            "transcript_whisperx.json exists (or neither has any word "
-            "with usable alignment timing) — nothing to export."
+            "Step 6c — no transcript (any alignment stage, or the "
+            "authoritative transcript.json) had any word with usable "
+            "alignment timing — nothing to export."
         )
     log.info("  ✓  Step 6c complete.")
     return sources
@@ -259,22 +290,31 @@ def export_srt(
 def _export_one_source(
     job_dir: Path,
     output_video_path: Path,
-    backend: str,
+    key: str,
+    label: str,
+    suffix: str,
     transcript_path: Path,
     already_done: bool,
     cfg: dict,
     log: logging.LoggerAdapter,
 ) -> Optional[SrtSource]:
     """
-    Process one alignment backend's transcript into an SrtSource — shared
-    logic for both "mfa" and "whisperx", called once per available
-    backend by export_srt() above.
+    Process one transcript (one alignment stage's own, or the
+    authoritative one) into an SrtSource — shared logic for every source
+    export_srt() finds, called once per candidate.
+
+    suffix is the job_dir_path filename tag: "" for the authoritative
+    transcript.json (→ transcript.srt), or f"_{N}" for stage N (→
+    transcript_N.srt). The sidecar filename (<video>.eng.N.srt /
+    <video>.eng.srt) uses a dot-separated variant derived from `key`
+    instead -- see config.yaml's own documentation of write_sidecar for
+    the full naming convention and why the two differ.
 
     Returns None if transcript_path has no word with usable alignment
     timing at all (nothing to place on a timeline either way) — logged,
     not an error.
     """
-    srt_out = job_dir / f"transcript_{backend}.srt"
+    srt_out = job_dir / f"transcript{suffix}.srt"
 
     data      = json.loads(transcript_path.read_text())
     all_words = data.get("words", [])
@@ -288,17 +328,23 @@ def _export_one_source(
         log.warning(
             "Step 6c — %s has %d word(s), none with usable alignment "
             "timing — nothing to export for %s.",
-            transcript_path.name, len(all_words), backend,
+            transcript_path.name, len(all_words), label,
         )
         return None
 
-    track_name = str(cfg_get(cfg, "transcript_srt", f"track_name_{backend}"))
+    track_prefix = str(cfg_get(cfg, "transcript_srt", "track_name_prefix"))
+    track_name   = f"{track_prefix} \u2014 {label}"
 
     sidecar_path: Optional[Path] = None
     if bool(cfg_get(cfg, "transcript_srt", "write_sidecar")):
         track_language = str(cfg_get(cfg, "transcript_srt", "track_language"))
+        # Dot-separated, not the underscore job_dir_path uses -- Plex/
+        # Kodi's own "<basename>.<language>.<flag>.ext" convention (see
+        # config.yaml's write_sidecar comment) needs the stage number as
+        # its own dot-delimited segment, e.g. ".eng.2.srt", not ".eng_2.srt".
+        sidecar_suffix = f".{key}" if key != "final" else ""
         sidecar_path = output_video_path.parent / (
-            f"{output_video_path.stem}.{track_language}.{backend}.srt"
+            f"{output_video_path.stem}.{track_language}{sidecar_suffix}.srt"
         )
         # Step 6c runs before Step 7 (steps/mux.py), which is normally
         # what creates OUTPUT_DIR -- ensure it exists here too, rather
@@ -330,7 +376,7 @@ def _export_one_source(
         # the overall step flag, since it's a cheap copy either way.
         if sidecar_path is not None:
             sidecar_path.write_text(srt_out.read_text(encoding="utf-8"), encoding="utf-8")
-        return SrtSource(backend, srt_out, sidecar_path, plain_text, track_name)
+        return SrtSource(key, label, srt_out, sidecar_path, plain_text, track_name)
 
     karaoke_enabled = bool(cfg_get(cfg, "transcript_srt", "karaoke"))
     chosen_text = (
@@ -338,9 +384,9 @@ def _export_one_source(
     )
 
     log.info(
-        "Step 6c — exporting %s-aligned transcript to SRT  "
+        "Step 6c — exporting %s transcript to SRT  "
         "(%d word(s) in %d group(s), karaoke=%s)",
-        backend, len(words), len(prepared), karaoke_enabled,
+        label, len(words), len(prepared), karaoke_enabled,
     )
 
     tmp = tmp_output_path(srt_out)
@@ -356,8 +402,9 @@ def _export_one_source(
         log.info("  ✓  %s", sidecar_path)
 
     state = read_job(job_dir)
-    per_backend = state.get("transcript_srt", {})
-    per_backend[backend] = {
+    per_source = state.get("transcript_srt", {})
+    per_source[key] = {
+        "label":   label,
         "words":   len(words),
         "groups":  len(prepared),
         "cues":    n_cues,
@@ -365,10 +412,10 @@ def _export_one_source(
         "file":    srt_out.name,
         "sidecar": sidecar_path.name if sidecar_path is not None else None,
     }
-    state["transcript_srt"] = per_backend
+    state["transcript_srt"] = per_source
     write_job(job_dir, state)
 
-    return SrtSource(backend, srt_out, sidecar_path, plain_text, track_name)
+    return SrtSource(key, label, srt_out, sidecar_path, plain_text, track_name)
 
 
 # ── Grouping (bundling flat words into subtitle-line-sized chunks) ───────────

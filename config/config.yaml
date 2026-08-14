@@ -112,27 +112,42 @@ alignment:
   #              behavior documented above.
   backend: mfa
 
-  # Also run whichever aligner ISN'T `backend` above, per segment, purely
-  # so transcript_srt (Step 6c) can offer both an MFA-aligned and a
-  # WhisperX-aligned subtitle track side by side for comparison -- see
-  # that section below. Never affects `backend`'s own result or its own
-  # fallback_to_whisperx behavior above; this is a second, independent,
-  # best-effort pass that only feeds the comparison SRT. A segment where
-  # this comparison pass fails (or where `backend` itself already fell
-  # back for that segment, making a retry pointless -- see
-  # steps/transcribe.py) just has no data from that aligner for that
-  # segment's span in the comparison transcript -- logged, never fatal,
-  # never a reason to fail the segment or the run.
-  # Roughly doubles this step's alignment time (MFA is normally the
-  # slower of the two either way, so running WhisperX's own align() pass
-  # in addition typically adds much less than doubling in practice) --
-  # defaulting to true FOR NOW, DURING DEVELOPMENT, while actively
-  # troubleshooting alignment discrepancies; turn off once that settles.
-  # Only takes effect for segments transcribed *after* this is turned on
-  # -- like alignment.backend itself, changing this on an existing job
-  # does not retroactively apply to Steps 1a-3b's already-cached result
-  # (see pipeline.py's docstring on why those steps aren't individually
-  # redoable).
+  # Runs a numbered pipeline of alignment stages, not a fixed choice
+  # between two named tools -- see steps/transcribe.py's _ALIGNMENT_STAGES
+  # (the registry of stages this pipeline knows how to run; today
+  # 1=WhisperX, 2=MFA) and steps/merge.py (which merges each stage's own
+  # transcript_{N}_NN.json into transcript_{N}.json). `backend` above picks
+  # which stage's result is AUTHORITATIVE for censoring (mfa -> stage 2,
+  # cascading down to stage 1 for any segment stage 2 doesn't cover;
+  # whisperx -> stage 1 only, even if a later stage also ran) -- see
+  # transcribe.py's own docstring for the cascade rule. Stage numbers are
+  # deliberately never tied to a specific tool's name in any filename this
+  # pipeline writes, specifically so a future stage 3 (a different
+  # aligner entirely) slots in without renaming anything already on disk;
+  # job.json's own "alignment_stages" block is always the source of truth
+  # for which tool a given number actually was on this job.
+  #
+  # Stage 1 always runs, for every segment, regardless of this setting --
+  # it's the fallback source `backend: mfa` itself depends on, not
+  # something optional. What this setting actually controls: whether
+  # stage 2+ also run on segments where the authoritative stage (`backend`
+  # above) doesn't already require them -- i.e. purely for
+  # transcript_srt's (Step 6c) side-by-side comparison tracks. A stage
+  # that fails for a given segment (or, for stage 2 specifically, one
+  # that `backend` already knows failed as the authoritative attempt,
+  # making a retry pointless) just has no data for that segment's span in
+  # that stage's own transcript -- logged, never fatal, never a reason to
+  # fail the segment or the run.
+  # Roughly doubles this step's alignment time with today's two stages
+  # (MFA is normally the slower of the two either way, so adding
+  # WhisperX's own align() pass typically costs much less than doubling
+  # in practice) -- defaulting to true FOR NOW, DURING DEVELOPMENT, while
+  # actively troubleshooting alignment discrepancies; turn off once that
+  # settles. Only takes effect for segments transcribed *after* this is
+  # turned on -- like alignment.backend itself, changing this on an
+  # existing job does not retroactively apply to Steps 1a-3b's
+  # already-cached result (see pipeline.py's docstring on why those steps
+  # aren't individually redoable).
   dual_output: true
 
   mfa:
@@ -348,16 +363,19 @@ output:
 # ── Transcript SRT export (Step 6c) ─────────────────────────────────────────
 transcript_srt:
 
-  # Render each available aligned transcript -- MFA's and/or WhisperX's, see
-  # alignment.dual_output below -- into its own SRT, saved next to the
-  # output video and/or in the job directory. Built as a debugging aid:
-  # figuring out *why* a word got muted at the wrong moment, or why one
-  # alignment backend disagrees with the other, normally means
-  # cross-referencing the output video against transcript.json against the
-  # original audio by hand, across three separate tools (see
+  # Render each available alignment stage's transcript -- transcript_1.json,
+  # transcript_2.json, ... (steps/merge.py; see alignment.dual_output and
+  # steps/transcribe.py's _ALIGNMENT_STAGES for what produces which number)
+  # -- plus transcript.json, the authoritative/censoring-relevant one,
+  # regardless of which stage produced it for a given segment -- each into
+  # its own SRT, saved next to the output video and/or in the job
+  # directory. Built as a debugging aid: figuring out *why* a word got
+  # muted at the wrong moment, or why two alignment stages disagree,
+  # normally means cross-referencing the output video against a transcript
+  # against the original audio by hand, across three separate tools (see
   # docs/timestamp-drift-investigation.md for exactly how tedious that is)
-  # -- with this on, it's "turn a subtitle track on and watch," for either
-  # backend independently.
+  # -- with this on, it's "turn a subtitle track on and watch," for any
+  # stage independently, or for the final result.
   enabled: true
 
   # Also mux every available SRT into the final output video as an
@@ -370,27 +388,30 @@ transcript_srt:
   # already completed will re-mux once to pick the tracks up (see
   # pipeline.py's Step-6c/7 migration check) -- and re-running it again
   # later, after these tracks already exist in the output, REPLACES them
-  # rather than adding duplicates (matched by exact track_name_mfa /
-  # track_name_whisperx below -- see steps/mux.py's module docstring).
+  # rather than adding duplicates (matched by exact track name -- see
+  # track_name_prefix below and steps/mux.py's module docstring).
   embed_in_output: false
 
   # Write each available SRT next to the final output video too, using
-  # the same base name as the video plus a language and alignment-method
-  # tag, e.g. for "Movie {edition-Hushed}.1080p.hevc.mkv":
-  #   Movie {edition-Hushed}.1080p.hevc.eng.mfa.srt
-  #   Movie {edition-Hushed}.1080p.hevc.eng.whisperx.srt
-  # The .eng.<method>.srt tail mirrors Plex/Kodi's own external-subtitle
+  # the same base name as the video plus a language and stage-number tag,
+  # e.g. for "Movie {edition-Hushed}.1080p.hevc.mkv" once two alignment
+  # stages have run:
+  #   Movie {edition-Hushed}.1080p.hevc.eng.1.srt   (stage 1 -- WhisperX)
+  #   Movie {edition-Hushed}.1080p.hevc.eng.2.srt   (stage 2 -- MFA)
+  #   Movie {edition-Hushed}.1080p.hevc.eng.srt     (authoritative/final)
+  # The .eng.<N>.srt tail mirrors Plex/Kodi's own external-subtitle
   # convention of "<basename>.<language>.<flag>.ext" (Plex's own documented
-  # flags there are just forced/sdh/cc, so "mfa"/"whisperx" won't be
+  # flags there are just forced/sdh/cc, so a stage number won't be
   # auto-recognized as anything special) -- keeping .eng. intact and
-  # immediately before the method tag is what keeps this readable at a
+  # immediately before the stage number is what keeps this readable at a
   # glance and still gets picked up by "add subtitle file" style pickers in
-  # any player, which is this setting's actual goal: telling the two apart
-  # by filename when selecting one manually, not automatic language-track
-  # matching. Independent of, and always on top of, the job-directory copy
-  # (transcript_mfa.srt / transcript_whisperx.srt), which is unconditional
-  # whenever a source is available -- this setting only controls the extra
-  # copy placed next to the video itself.
+  # any player, which is this setting's actual goal: telling every stage
+  # apart by filename when selecting one manually, not automatic
+  # language-track matching. Independent of, and always on top of, the
+  # job-directory copy (transcript_1.srt, transcript_2.srt, ...,
+  # transcript.srt), which is unconditional whenever a source is available
+  # -- this setting only controls the extra copy placed next to the video
+  # itself.
   write_sidecar: true
 
   # Karaoke-style highlighting: color the single word actually being
@@ -403,27 +424,26 @@ transcript_srt:
   # <font color=karaoke_color>. Confirmed directly: this survives byte-
   # for-byte through mkvmerge into MKV (output.format: mkv, the default)
   # and renders correctly via libass (ffmpeg's `subtitles` burn-in filter,
-  # mpv) and other SRT-capable players (VLC and others) pointed at either
-  # SRT directly (job directory or sidecar), regardless of output.format.
-  # It does NOT survive output.format: mp4's embed specifically --
-  # confirmed directly that ffmpeg's mov_text (the only way to put a text
-  # subtitle inside an MP4 container at all) strips every styling tag
-  # outright -- so steps/mux.py embeds a plain, one-cue-per-line rendering
-  # there instead, regardless of this setting. Both the job-directory copy
-  # and any sidecar copy are unaffected either way and still get the
-  # karaoke version when this is true -- this limitation is specific to
-  # mp4's embedded track.
+  # mpv) and other SRT-capable players (VLC and others) pointed at any of
+  # these SRTs directly (job directory or sidecar), regardless of
+  # output.format. It does NOT survive output.format: mp4's embed
+  # specifically -- confirmed directly that ffmpeg's mov_text (the only
+  # way to put a text subtitle inside an MP4 container at all) strips
+  # every styling tag outright -- so steps/mux.py embeds a plain,
+  # one-cue-per-line rendering there instead, regardless of this setting.
+  # Both the job-directory copies and any sidecar copies are unaffected
+  # either way and still get the karaoke version when this is true -- this
+  # limitation is specific to mp4's embedded tracks.
   # false: skip the karaoke rendering everywhere (job directory, sidecar,
   # and any embed) and only group words like a traditional subtitle track.
   karaoke: true
 
   # Color applied to the currently-spoken word when karaoke is true.
   # #RRGGBB hex. A bright, saturated color reads best against traditional
-  # white/default subtitle text. Shared by both alignment methods' SRTs --
-  # players show at most one subtitle track at a time by default, so
-  # telling the two apart by filename/track name (see track_name_mfa /
-  # track_name_whisperx below) matters far more than giving them different
-  # colors would.
+  # white/default subtitle text. Shared by every stage's SRT -- players
+  # show at most one subtitle track at a time by default, so telling them
+  # apart by filename/track name (see track_name_prefix below) matters far
+  # more than giving each stage a different color would.
   karaoke_color: "#FFD400"
 
   # ── Grouping: how recognized words are bundled into subtitle lines ──────
@@ -433,8 +453,8 @@ transcript_srt:
   # line is simply full. (One more rule applies unconditionally, with no
   # setting here: a word ending in '.', '?', or '!' always ends its group
   # -- see steps/transcript_srt.py's _SENTENCE_END_RE.) Applied
-  # independently to each alignment method's own word list -- MFA's and
-  # WhisperX's timing can differ enough that the two SRTs end up grouped
+  # independently to each stage's own word list -- different alignment
+  # stages' timing can differ enough that their SRTs end up grouped
   # slightly differently even for the same stretch of dialogue, which is
   # exactly the kind of discrepancy this feature exists to make visible.
 
@@ -460,21 +480,23 @@ transcript_srt:
   max_chars_per_line: 42
   max_lines_per_group: 2
 
-  # Embedded subtitle track metadata (steps/mux.py) -- what a player's
-  # subtitle track picker shows for each track, and also the exact string
-  # steps/mux.py matches on to find and replace a track from a previous
-  # run rather than adding a duplicate (see embed_in_output above). Change
-  # these and a previously-embedded track under the OLD name is no longer
-  # recognized as "ours" on the next mux -- it's left in place rather than
-  # replaced, and only the new name gets added going forward. Two
-  # settings, not one, so the two tracks are told apart in a player's
-  # subtitle menu the same way the sidecar filenames tell them apart on
-  # disk.
-  track_name_mfa: "Hushed Transcript (MFA-aligned)"
-  track_name_whisperx: "Hushed Transcript (WhisperX-aligned)"
+  # Embedded subtitle track metadata (steps/mux.py) -- the prefix for
+  # what a player's subtitle track picker shows for each track. The full
+  # name is built from this plus each stage's own label from job.json's
+  # "alignment_stages" (see steps/transcribe.py) -- e.g.
+  # "Hushed Transcript -- Stage 2 (MFA)" -- and "Hushed Transcript (Final)"
+  # for the authoritative track, so a new stage 3 gets a sensible track
+  # name automatically, with nothing here to update. This is also the
+  # prefix steps/mux.py matches against to find and replace a track from a
+  # previous run rather than adding a duplicate (see embed_in_output
+  # above) -- change it and a previously-embedded track under the OLD
+  # prefix is no longer recognized as "ours" on the next mux; it's left in
+  # place rather than replaced, and only tracks under the new prefix get
+  # added going forward.
+  track_name_prefix: "Hushed Transcript"
 
-  # ISO 639-2 (3-letter) language code for both embedded tracks and both
-  # sidecar filenames. Deliberately a raw string here rather than derived
+  # ISO 639-2 (3-letter) language code for every embedded track and every
+  # sidecar filename. Deliberately a raw string here rather than derived
   # from whisperx.language (ISO 639-1, 2-letter, and nullable for
   # auto-detect) -- there's no lookup table to keep in sync with that
   # setting. Set this directly if your content isn't English.
