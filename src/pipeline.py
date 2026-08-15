@@ -49,11 +49,14 @@ Naming an earlier step cascades to every step after it through 7_mux
 propagates to the file actually delivered to /output rather than those
 steps silently reusing stale files left over from before the change.
 --redo-step 7_mux alone clears only 7_mux, since nothing in this
-pipeline is downstream of it. (6c_transcript_srt is the one step in
-this list --skip-index/--add-interval/--redo-review do NOT also clear --
-see that correction branch, and steps/transcript_srt.py's docstring, for
-why: its output depends only on transcript.json, which a content
-correction never touches.)
+pipeline is downstream of it. --skip-index/--add-interval/--redo-review
+clear that exact same group (5_mute/6_recombine/6b_encode/
+6c_transcript_srt/7_mux) -- see that correction branch below. This used
+to exclude 6c_transcript_srt (its output depended only on
+transcript.json, which a content correction never touched), but no
+longer does: transcript_srt.hush (config.yaml) now renders the
+authoritative SRT's text from censor_log.json too, which is exactly what
+these corrections change -- see steps/transcript_srt.py's docstring.
 """
 import argparse
 import re
@@ -95,7 +98,7 @@ from steps.recombine  import recombine as run_recombine
 from steps.encode     import encode    as run_encode
 from steps.mux        import mux       as run_mux
 from steps.mux        import _output_path
-from steps.transcript_srt import export_srt as run_srt_export
+from steps.transcript_srt import export_srt as run_srt_export, validate_hush_config
 from steps.matching   import resolve_word_list_path
 
 # ── Fixed container paths ─────────────────────────────────────────────────────
@@ -177,14 +180,11 @@ def _cascade_steps(named_steps) -> "list[str]":
 
     Cascading through every step after the named one mirrors exactly
     what the --skip-index/--add-interval/--redo-review path already
-    does for 5_mute/6_recombine/6b_encode/7_mux as a fixed group (see
-    the `correcting` branch below) -- it just needs to work from
-    whichever point --redo-step names, rather than always starting at
-    5_mute. Naming --redo-step 7_mux alone still clears only 7_mux,
-    since nothing in this pipeline is downstream of it. (That fixed
-    correction-mode group deliberately does NOT include
-    6c_transcript_srt, unlike this function -- see this module's
-    docstring.)
+    does for 5_mute/6_recombine/6b_encode/6c_transcript_srt/7_mux as a
+    fixed group (see the `correcting` branch below) -- it just needs to
+    work from whichever point --redo-step names, rather than always
+    starting at 5_mute. Naming --redo-step 7_mux alone still clears only
+    7_mux, since nothing in this pipeline is downstream of it.
     """
     to_clear = set()
     for step in named_steps:
@@ -285,11 +285,10 @@ def main() -> None:
             "job that already exists, without rerunning everything before "
             "it. Repeatable. Unlike --skip-index/--add-interval/"
             "--redo-review (which edit review.json to fix a *content* "
-            "mistake and always redo Steps 5, 6, 6b, and 7 together -- "
-            "never 6c_transcript_srt, whose output doesn't depend on "
-            "review.json at all), this clears only the named step(s) plus "
-            "everything after them through 7_mux -- e.g. naming 5_mute "
-            "also clears 6_recombine/6b_encode/6c_transcript_srt/7_mux, so "
+            "mistake and always redo Steps 5, 6, 6b, 6c, and 7 together), "
+            "this clears only the named step(s) plus everything after "
+            "them through 7_mux -- e.g. naming 5_mute also clears "
+            "6_recombine/6b_encode/6c_transcript_srt/7_mux, so "
             "the change actually reaches the file delivered to /output "
             "instead of those steps silently reusing files left over from "
             "before the change. Naming 7_mux by itself clears only 7_mux, "
@@ -316,6 +315,14 @@ def main() -> None:
     # setting below -- see utils.validate_config()'s docstring for why
     # this matters for a pipeline meant to run unattended for hours.
     utils.validate_config(cfg)
+    # A semantic check validate_config() itself doesn't do (it only
+    # checks presence -- see its own docstring): transcript_srt.hush.mode/
+    # simple_style is one of the values Step 6c can actually do something
+    # with. Also upfront, for the same reason -- see
+    # steps/transcript_srt.py's validate_hush_config() docstring for why
+    # this one specifically can't just wait for Step 6c to hit a bad
+    # value itself.
+    validate_hush_config(cfg)
     log_level = cfg_get(cfg, "output", "log_level")
     setup_logging(log_level)
     log = step_logger("pipeline")
@@ -555,17 +562,21 @@ def main() -> None:
         if args.redo_review:
             unmark_step_done(job_dir, "4b_review")
 
-        # Steps 5, 6, 6b, and 7 all depend, directly or indirectly, on
+        # Steps 5, 6, 6b, 6c, and 7 all depend, directly or indirectly, on
         # review.json -- invalidate every one of them so the normal step
         # machinery below redoes them with the corrected overrides, rather
-        # than hitting their own "already complete" resume-checks. This is
-        # also why output.keep_correction_artifacts (steps/mute.py,
+        # than hitting their own "already complete" resume-checks. (6c
+        # depends on it only through transcript_srt.hush, config.yaml --
+        # the authoritative SRT's own redacted text, via censor_log.json
+        # -- not through anything about which per-stage transcripts
+        # exist; see steps/transcript_srt.py's docstring.) This is also
+        # why output.keep_correction_artifacts (steps/mute.py,
         # steps/recombine.py) defaults to true: Step 5 needs dialog.wav to
         # still be on disk to actually redo, not just to be told it should.
-        for step in ("5_mute", "6_recombine", "6b_encode", "7_mux"):
+        for step in ("5_mute", "6_recombine", "6b_encode", "6c_transcript_srt", "7_mux"):
             unmark_step_done(job_dir, step)
 
-        cx_log.info("Correction recorded -- Steps 5, 6, 6b, and 7 will redo to apply it.")
+        cx_log.info("Correction recorded -- Steps 5, 6, 6b, 6c, and 7 will redo to apply it.")
         if args.redo_review:
             cx_log.info("Step 4b's review loop will also re-run from scratch (--redo-review).")
 

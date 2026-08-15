@@ -26,13 +26,16 @@ Marks '6c_transcript_srt' done.
 
 Does this belong in the --skip-index/--add-interval/--redo-review
 correction-mode unmark list (pipeline.py) alongside 5_mute/6_recombine/
-6b_encode/7_mux? No, deliberately not: these SRTs are derived purely from
-transcript.json and transcript_{N}.json (what was recognized), never from
-matches.json/review.json/censor_log.json (what got muted) — a correction
-changes the latter, never the former, so this step's own output can't be
-stale after one. It still runs on a correction re-run (pipeline.py always
-calls it, same as every run), but only to hit its own "already complete"
-branch below and hand steps/mux.py back the same files.
+6b_encode/7_mux? As of transcript_srt.hush (see below), yes, for the
+authoritative source specifically: hushing needs censor_log.json, which
+is exactly what those corrections change, so the authoritative SRT can
+now go stale on one the same way 5_mute/6_recombine/6b_encode/7_mux's own
+outputs can. (Before hush existed, this step read only transcript.json/
+transcript_{N}.json — what was recognized, never what got muted — so it
+genuinely couldn't go stale on a content correction; per-stage sources
+still only ever read transcript_{N}.json and are still exactly as
+stale-proof as before.) See pipeline.py's own docstring and
+_cascade_steps() for the unmark list itself.
 
 Failure handling is deliberately NOT the same as every other step's: an
 unexpected failure here logs a warning and lets the pipeline continue
@@ -43,8 +46,29 @@ every genuinely expensive step (1a through 6b) has already succeeded, and
 there's no good reason a bug in grouping/rendering a subtitle file should
 cost someone the censored video they've been waiting hours for. Config
 validation failures are the one exception and stay fatal, same as every
-other setting (see utils.validate_config()) — those are caught before
-Step 1a even starts, not here.
+other setting (see utils.validate_config(), and, specific to hush.mode/
+hush.simple_style, validate_hush_config() below) — both are called, and
+so both already have to have passed, before Step 1a even starts, not
+here.
+
+── Hushing the authoritative SRT ─────────────────────────────────────────
+
+transcript_srt.hush (config.yaml) redacts words known to have been muted
+in the actual audio — censor_log.json, Step 5's final, post-review/post-
+correction record — from the authoritative ("final") source's own SRT
+text, so a viewer with that track on doesn't get to read the exact word
+they can't hear (autocensor-design.md §13.1.1 has the original problem
+statement). Applied ONLY to the authoritative source, never to a
+per-stage comparison one: censor_log.json's word timing is only ever
+computed against transcript.json (steps/matching.py's find_matches()),
+and this whole module exists because a per-stage transcript's timing for
+nominally "the same" word can disagree with that by several real seconds
+(docs/timestamp-drift-investigation.md) — reusing censor_log.json's
+timing against a per-stage source risks a silently wrong redaction, with
+no way to tell from the output alone that it happened. The per-stage
+sources stay a truthful, unmodified debugging aid instead, exactly as
+before hush existed. See _apply_hush() below, and config.yaml's own
+transcript_srt.hush comment, for the rest.
 
 ── Does SRT actually support karaoke-style word highlighting? ───────────
 
@@ -135,6 +159,7 @@ up as one more SRT the moment steps/transcribe.py starts producing it.
 import json
 import logging
 import re
+import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -332,6 +357,17 @@ def _export_one_source(
         )
         return None
 
+    # Only the authoritative source's own words are ever candidates for
+    # hushing — censor_log.json's word timing is only ever computed
+    # against transcript.json (steps/matching.py's find_matches()), so a
+    # per-stage transcript_N.json (key != "final") is left exactly as
+    # recognized. Done here, before grouping/wrapping below, so a
+    # replacement's actual on-screen length (not the original word's)
+    # is what line-wrapping and sentence-boundary detection see — see
+    # config.yaml's transcript_srt.hush comment for the full reasoning.
+    if key == "final":
+        words = _apply_hush(words, job_dir, cfg, log)
+
     track_prefix = str(cfg_get(cfg, "transcript_srt", "track_name_prefix"))
     track_name   = f"{track_prefix} \u2014 {label}"
 
@@ -416,6 +452,249 @@ def _export_one_source(
     write_job(job_dir, state)
 
     return SrtSource(key, label, srt_out, sidecar_path, plain_text, track_name)
+
+
+# ── Hushing (redacting censor_log.json's muted words in the authoritative
+# source's own SRT text — see this module's docstring and config.yaml's
+# transcript_srt.hush comment for why this applies only to that source) ──
+
+# Same leading/trailing-only punctuation set steps/matching.py's
+# strip_punct() strips (mid-word punctuation like the apostrophe in
+# "don't" is kept) — duplicated rather than imported so _split_punct()
+# below can recover the stripped runs themselves, not just the core
+# strip_punct() itself returns.
+_PUNCT = string.punctuation
+
+_HUSH_MODES = ("keep", "simple", "substitute")
+
+
+def validate_hush_config(cfg: dict) -> None:
+    """
+    Fail fast, before Step 1a starts, on a transcript_srt.hush.mode (or
+    simple_style) this version can't actually do anything with. Called
+    once from pipeline.py's main(), immediately after
+    utils.validate_config(cfg) — and defensively again, every run, from
+    _apply_hush() below, in case something ever calls export_srt()
+    without going through pipeline.py's main() first.
+
+    The same kind of check steps/mute.py makes for censoring.method (mute
+    vs the not-yet-implemented beep) — including reusing that function's
+    own RuntimeError-with-a-clear-message style — except done here,
+    upfront, rather than at first use inside the step itself: unlike
+    Step 5, this step (Step 6c) deliberately treats its own exceptions as
+    non-fatal (see this module's docstring), so a bad value caught only
+    inside _apply_hush() would surface as a quiet warning after Steps
+    1a-6b already spent hours of CPU time, not a clear error before any
+    of them started. Deliberately separate from utils.validate_config():
+    that function only ever checks a setting is PRESENT (see its own
+    docstring) — this checks that this one setting's small enum is
+    something Step 6c can actually do.
+    """
+    mode = cfg_get(cfg, "transcript_srt", "hush", "mode")
+    if mode == "substitute":
+        raise RuntimeError(
+            "transcript_srt.hush.mode: substitute is not implemented yet "
+            "— see autocensor-design.md §13.1.1. Set transcript_srt.hush."
+            "mode to 'simple' (or 'keep') in config.yaml to proceed."
+        )
+    if mode not in ("keep", "simple"):
+        raise RuntimeError(
+            f"Step 6c: unknown transcript_srt.hush.mode {mode!r} "
+            "(expected 'keep', 'simple', or 'substitute')."
+        )
+    if mode == "simple":
+        style = cfg_get(cfg, "transcript_srt", "hush", "simple_style")
+        if style not in ("token", "mask"):
+            raise RuntimeError(
+                f"Step 6c: unknown transcript_srt.hush.simple_style "
+                f"{style!r} (expected 'token' or 'mask')."
+            )
+
+
+def _load_muted_intervals(
+    job_dir: Path, log: logging.LoggerAdapter,
+) -> list[tuple[float, float]]:
+    """
+    Read censor_log.json — Step 5's definitive, post-review/post-
+    correction record of exactly what got muted (steps/mute.py) — and
+    return every entry's (start, end) as a start-sorted list.
+
+    Deliberately NOT matches.json: that's Step 4b's pre-review candidate
+    list, which still includes anything a human (or --skip-index) later
+    rejected — hushing against it would redact words that are actually
+    still audible in the output. censor_log.json is what Step 5 actually
+    acted on, so it's the only list that can't disagree with the audio.
+
+    Missing entirely is treated as "nothing muted" rather than an error
+    (shouldn't happen given Step 6c always runs after Step 5 — see
+    pipeline.py's STEP_ORDER — but this function has no reason to be the
+    one place that's fatal about it, consistent with this whole step's
+    own deliberately-non-fatal failure handling).
+    """
+    path = job_dir / "censor_log.json"
+    if not path.exists():
+        log.debug("  hush: %s not found — treating as no muted words.", path.name)
+        return []
+    entries = json.loads(path.read_text()).get("entries", [])
+    return sorted(
+        (float(e["start"]), float(e["end"]))
+        for e in entries
+        if e.get("start") is not None and e.get("end") is not None
+    )
+
+
+def _hushed_word_indices(
+    words: list[dict], muted_intervals: list[tuple[float, float]],
+) -> set[int]:
+    """
+    Which positions in `words` (already time-ordered, already filtered to
+    words with real start/end — see _export_one_source()) overlap a
+    muted_intervals span.
+
+    A phrase match covers several consecutive words in one word_list.txt
+    entry (steps/matching.py's Match.span), but only its first word's
+    index survives into censor_log.json (steps/mute.py's own log entries
+    keep word_index, start, and end, but not span) — checking [start,
+    end] overlap here, rather than trusting word_index alone, is what
+    catches every word in a multi-word match, not just the first.
+
+    Standard sorted-interval-list intersection sweep — both `words` and
+    muted_intervals are individually non-overlapping and start-sorted
+    (words because real speech doesn't overlap itself; muted_intervals
+    because every one of them derives from those same non-overlapping
+    word timestamps) — so each pointer only ever advances: one O(n+m)
+    pass over both lists together, never a rewind.
+
+    Compares against censor_log.json's UNPADDED start/end — Step 5's
+    censoring.padding_ms is an audio-click guard, not a claim about word
+    boundaries; using the padded interval here could pull in a
+    genuinely different, unmatched neighboring word if the gap between
+    the two is smaller than 2x padding_ms.
+    """
+    hushed: set[int] = set()
+    i = j = 0
+    while i < len(words) and j < len(muted_intervals):
+        ws, we = float(words[i]["start"]), float(words[i]["end"])
+        ms, me = muted_intervals[j]
+        if max(ws, ms) < min(we, me):
+            hushed.add(i)
+        if we < me:
+            i += 1
+        else:
+            j += 1
+    return hushed
+
+
+def _split_punct(word: str) -> tuple[str, str, str]:
+    """
+    Split into (leading_punct, core, trailing_punct) — the same leading/
+    trailing-only stripping steps/matching.strip_punct() does (mid-word
+    punctuation like the apostrophe in "don't" stays put), but keeping
+    both stripped runs instead of discarding them, so hushing can
+    reattach them around the replacement text unchanged — e.g. "shit!"
+    keeps its "!" after masking, so _SENTENCE_END_RE (grouping happens
+    after hushing — see _export_one_source()) still sees it and makes
+    the same line-break decision it would have for the unhushed word.
+    """
+    core = word.strip(_PUNCT)
+    if not core:
+        return word, "", ""
+    start = word.index(core)
+    return word[:start], core, word[start + len(core):]
+
+
+def _mask_core(core: str, cfg: dict) -> str:
+    """
+    "simple_style: mask" rendering of one word's core (post-_split_punct)
+    — mask_character repeated out to mask_fixed_length (or core's own
+    length, when that's 0, the default), optionally keeping the real
+    first and/or last letter per mask_preserve_first/mask_preserve_last.
+
+    Always leaves at least one real mask character in the middle, even
+    when that makes the result one character longer than requested —
+    otherwise a short core, or preserve_first+preserve_last together on
+    a two-letter word, could reveal the entire original word while still
+    being labelled "hushed".
+    """
+    mask_char = (str(cfg_get(cfg, "transcript_srt", "hush", "mask_character")) or "*")[0]
+    preserve_first = bool(cfg_get(cfg, "transcript_srt", "hush", "mask_preserve_first"))
+    preserve_last  = bool(cfg_get(cfg, "transcript_srt", "hush", "mask_preserve_last"))
+    fixed_length   = int(cfg_get(cfg, "transcript_srt", "hush", "mask_fixed_length"))
+
+    first = core[0] if preserve_first else ""
+    last  = core[-1] if (preserve_last and len(core) > 1) else ""
+    target_len = fixed_length if fixed_length > 0 else len(core)
+    middle_len = max(target_len - len(first) - len(last), 1)
+    return f"{first}{mask_char * middle_len}{last}"
+
+
+def _hush_word_text(word: str, cfg: dict) -> str:
+    """
+    One matched word's replacement text for hush.mode: simple — leading/
+    trailing punctuation preserved exactly (_split_punct above), core
+    replaced per simple_style (a fixed token, or a mask_core() mask).
+    """
+    prefix, core, suffix = _split_punct(word)
+    if not core:
+        return word   # nothing to hush -- matching.py never matches an
+                       # all-punctuation token, so this shouldn't happen
+                       # in practice; the word as-is is the safe fallback
+                       # if it somehow does.
+
+    style = cfg_get(cfg, "transcript_srt", "hush", "simple_style")
+    if style == "token":
+        replacement = str(cfg_get(cfg, "transcript_srt", "hush", "simple_token"))
+    else:
+        replacement = _mask_core(core, cfg)
+    return f"{prefix}{replacement}{suffix}"
+
+
+def _apply_hush(
+    words: list[dict], job_dir: Path, cfg: dict, log: logging.LoggerAdapter,
+) -> list[dict]:
+    """
+    Render transcript_srt.hush.mode's chosen treatment over `words` — the
+    authoritative ("final") transcript's own word list. Called ONLY for
+    that source (see _export_one_source()) — never for a per-stage
+    comparison transcript; see config.yaml's transcript_srt.hush comment
+    for why cross-referencing censor_log.json against those isn't safe.
+
+    Returns a new list, same length and order as `words`. Only entries
+    whose [start, end] overlaps something in censor_log.json get a
+    different "word" value — every other key (start/end/score, ...) is
+    untouched, and every entry that ISN'T hushed is the exact same dict
+    object passed in, never copied, so _render_group_lines()'s identity-
+    based highlight_word check (this module's docstring) keeps working
+    unchanged downstream.
+
+    validate_hush_config(cfg) is assumed to have already run once, at
+    startup (pipeline.py's main()) — re-checked here anyway, cheaply, as
+    a safety net for any other caller.
+    """
+    validate_hush_config(cfg)
+    mode = cfg_get(cfg, "transcript_srt", "hush", "mode")
+
+    if mode == "keep":
+        return words
+
+    muted_intervals = _load_muted_intervals(job_dir, log)
+    if not muted_intervals:
+        return words
+
+    hushed_idx = _hushed_word_indices(words, muted_intervals)
+    if not hushed_idx:
+        return words
+
+    result = list(words)
+    for i in hushed_idx:
+        w = result[i]
+        result[i] = {**w, "word": _hush_word_text(str(w.get("word", "") or ""), cfg)}
+
+    log.info(
+        "  hush: %d word(s) replaced in the authoritative SRT "
+        "(transcript_srt.hush.mode=%s).", len(hushed_idx), mode,
+    )
+    return result
 
 
 # ── Grouping (bundling flat words into subtitle-line-sized chunks) ───────────

@@ -15,7 +15,7 @@ Automatically censor profanity from movie files. Feed it a video; get back a cen
 
 Optionally: cross-reference an SRT subtitle file (Phase 3) or pause for interactive review before muting (available now via `--interactive`).
 
-Also produced alongside the censored video: `transcript.srt`, a karaoke-style subtitle track of every word WhisperX/MFA actually recognized, each at its own real timestamp — saved in the job directory and, by default, muxed into the output video as an additional (non-default) subtitle track, purpose-built to make it easy to spot *why* a word was muted at the wrong moment by just turning that track on. See [Job History](#job-history) below, and `transcript_srt` in `config/config.yaml` to adjust or disable it. (Unrelated to the *input* SRT cross-reference mentioned above — that's about feeding an existing subtitle file in to improve matching accuracy; this one is an *output*, generated purely from what was recognized.)
+Also produced alongside the censored video: `transcript.srt`, a karaoke-style subtitle track of every word WhisperX/MFA actually recognized, each at its own real timestamp — saved in the job directory, optionally muxed into the output video as an additional (non-default) subtitle track (`transcript_srt.embed_in_output`, off by default for now while this feature settles), purpose-built to make it easy to spot *why* a word was muted at the wrong moment by just turning that track on. Words actually muted in the audio are hushed in this SRT's own text too, by default (`transcript_srt.hush`, see [Configuration](#configuration) below) — a viewer with the track on no longer gets to read the exact word they can't hear. See [Job History](#job-history) below, and `transcript_srt` in `config/config.yaml` to adjust or disable any of this. (Unrelated to the *input* SRT cross-reference mentioned above — that's about feeding an existing subtitle file in to improve matching accuracy; this one is an *output*, generated purely from what was recognized.)
 
 ---
 
@@ -229,9 +229,12 @@ output:
   keep_correction_artifacts: true   # keeps dialog.wav/score_sfx.wav so corrections stay cheap
 
 transcript_srt:
-  enabled: true          # save + embed transcript.srt (see "How it works" above)
+  enabled: true          # save transcript.srt (see "How it works" above)
   karaoke: true           # color the current word; false = plain grouped lines only
   karaoke_color: "#FFD400"
+  hush:
+    mode: simple          # keep | simple | substitute (not yet implemented) -- redact
+                           # muted words in transcript.srt's own text; see config.yaml
 ```
 
 See the full file at `config/config.yaml` for all options and their documentation.
@@ -286,7 +289,7 @@ Console timestamps automatically match this machine's local clock: `hush.sh` det
 
 Every run creates a job record under `~/.local/share/profanity-hush/jobs/`, in a folder named `YYYYMMDD_HHMMSS_<movie-slug>_<hex8>` (the timestamp is your local time — see [Logging](#logging) above — and the slug makes it easy to spot the right job by filename without opening anything). The merged `transcript.json` and the censor log are always preserved, along with `dialog.wav` and `score_sfx.wav` (the pre-mute audio stems) — together these are what makes [correcting a mistake](#correcting-mistakes) after watching the film fast, without repeating the expensive separation and transcription steps. (The per-segment `transcript_NN.json` files WhisperX writes on the way to `transcript.json` are cleaned up once merged, same as the other per-segment intermediates — pass `--keep-tmp` if you want to inspect them.)
 
-`transcript.srt` — a subtitle rendering of that same `transcript.json`, karaoke-highlighted word-by-word by default — is also saved here (unless `transcript_srt.enabled: false`, or the transcript had no word with usable timing at all). Unlike the files above, it isn't needed for anything internally; it exists purely so you can watch the film with it on and see exactly what was recognized, and when, alongside the muted audio.
+`transcript.srt` — a subtitle rendering of that same `transcript.json`, karaoke-highlighted word-by-word by default — is also saved here (unless `transcript_srt.enabled: false`, or the transcript had no word with usable timing at all). Unlike the files above, it isn't needed for anything internally; it exists purely so you can watch the film with it on and see what was recognized, and when, alongside the muted audio — words actually muted are hushed in this file's own text by default too (`transcript_srt.hush.mode: simple`), matching what's actually audible rather than spelling it out; set that to `keep` and re-run with `--redo-step 6c_transcript_srt` (see [Re-running a Single Step](#re-running-a-single-step)) for a one-off pass showing the original recognized text instead.
 
 Large intermediate WAV files are deleted by default once each is no longer needed. Pass `--keep-tmp` to retain all of them (including ones not needed for corrections); see `output.keep_correction_artifacts` in `config.yaml` to control just the two needed for corrections independently.
 
@@ -371,7 +374,7 @@ Both flags are repeatable and combinable in one run (and the two timestamp notat
 ./hush.sh --skip-index 4856 --skip-index 412 --add-interval "oops" 88.0 88.4 movie.mkv
 ```
 
-Re-running on the same input file (same path, unchanged) automatically finds the existing job — no job ID to look up or pass. Only the muting, recombining, and muxing steps (5–7) redo; typically a couple of minutes, not the original multi-hour run. This depends on `dialog.wav`/`score_sfx.wav` still being in the job directory, which is the default (`output.keep_correction_artifacts: true`) — if you've set that to `false`, or `--keep-tmp` wasn't used before that setting existed, the fix needs a full re-run instead, and `hush.sh` will say so clearly rather than silently doing the expensive thing.
+Re-running on the same input file (same path, unchanged) automatically finds the existing job — no job ID to look up or pass. Only the muting, recombining, encoding, transcript-SRT, and muxing steps (5–7, including 6b and 6c) redo; typically a couple of minutes, not the original multi-hour run. This depends on `dialog.wav`/`score_sfx.wav` still being in the job directory, which is the default (`output.keep_correction_artifacts: true`) — if you've set that to `false`, or `--keep-tmp` wasn't used before that setting existed, the fix needs a full re-run instead, and `hush.sh` will say so clearly rather than silently doing the expensive thing.
 
 **Prefer a fuller second look instead?** `--redo-review` re-enters the interactive review loop from scratch (every flagged word, not just the one you noticed) on an already-completed job:
 
@@ -391,7 +394,7 @@ This can't be combined with `--skip-index`/`--add-interval` in the same run — 
 ./hush.sh --redo-step 7_mux movie.mkv
 ```
 
-Repeatable, and valid for `4b_flag`, `4b_review`, `5_mute`, `6_recombine`, `6b_encode`, `6c_transcript_srt`, and `7_mux`. Steps 1a–3b aren't offered: they're resumed as a single atomic block, and their per-segment intermediates may already be gone, so redoing one of them alone isn't safe. `--redo-step` never touches `review.json` and can't be combined with `--skip-index`/`--add-interval`/`--redo-review` in the same run. (`6c_transcript_srt` is also the one step in that list `--skip-index`/`--add-interval`/`--redo-review` do *not* redo automatically — its output depends only on `transcript.json`, which those corrections never change.)
+Repeatable, and valid for `4b_flag`, `4b_review`, `5_mute`, `6_recombine`, `6b_encode`, `6c_transcript_srt`, and `7_mux`. Steps 1a–3b aren't offered: they're resumed as a single atomic block, and their per-segment intermediates may already be gone, so redoing one of them alone isn't safe. `--redo-step` never touches `review.json` and can't be combined with `--skip-index`/`--add-interval`/`--redo-review` in the same run.
 
 It also requires the job to actually be found first: if `compute_job_id()` doesn't land on an existing job for this input file (same path, unchanged), `hush.sh` refuses with a clear error rather than silently falling through to a full from-scratch run. This is also why hand-editing `steps_completed` in `job.json` directly isn't recommended, even though each step does check its own entry independently and the edit can appear to work: a single stray character (a trailing comma is the classic one) makes the whole file invalid JSON, and an unparseable `job.json` looks identical to "no job exists yet" to the code that's trying to find it — the visible symptom is a full multi-hour re-run with no explanation, not an error. `--redo-step` is the safe, validated way to get the same result.
 
@@ -420,6 +423,7 @@ RAM size alone doesn't fully protect against this — it depends on what else is
 - **Context-blind matching:** The word list has no understanding of usage context. `=dick` / `Dick` case distinction is the primary mitigation; interactive review handles the rest.
 - **v1 processes only the primary audio track.** Commentary tracks and alternate language tracks in the source container are dropped.
 - **Densely repetitive dialogue can still slip through, regardless of alignment backend.** A line repeated verbatim multiple times in a row (confirmed on one real film) can cause WhisperX's own recognition to drop it entirely — no alignment backend can place a word that was never recognized as text in the first place. See `docs/timestamp-drift-investigation.md` for the one specific case this was traced down to, and why it's now understood to be a recognition gap rather than a timing one.
+- **Subtitle hushing (`transcript_srt.hush`) only ever applies to the authoritative `transcript.srt`, never to the per-stage comparison tracks (`transcript_1.srt`, `transcript_2.srt`, ...).** Those exist specifically to show literally what each alignment stage recognized, unmodified, for troubleshooting a bad mute — and `censor_log.json`'s timing is only ever computed against the authoritative transcript, so there's no safe way to redact the others without risking a wrong word. `transcript_srt.embed_in_output` is off by default for now regardless, so none of this reaches the shipped video unless that's turned on.
 
 ---
 

@@ -1060,21 +1060,15 @@ Items in this section are explicitly outside v1 scope but are anticipated future
  
 Two distinct but related capabilities; either can be implemented independently.
  
-#### 13.1.1 Profanity Substitution in Subtitles
+#### 13.1.1 Profanity Substitution in Subtitles — **`keep`/`simple` Implemented; `substitute` Still Open**
  
-When a word is muted in the audio, the corresponding subtitle entry currently still displays the original word. A viewer with subtitles on would read the censored word even though they cannot hear it.
+When a word is muted in the audio, the corresponding subtitle entry used to still display the original word — a viewer with subtitles on would read the censored word even though they couldn't hear it. Implemented as `transcript_srt.hush` (`config.yaml`), Step 6c (`steps/transcript_srt.py`):
  
-**Proposed behavior:** For each word muted in the audio, find the matching SRT cue and replace the flagged word with a configurable substitution. Examples:
+- **`mode: keep`** — unchanged: the recognized word, exactly as WhisperX/MFA produced it.
+- **`mode: simple`** (**default**) — the matched word's text is replaced, without needing to know *which* `word_list.txt` entry matched, only *that* one did (`censor_log.json` already records this): either a fixed token (`simple_style: token`, e.g. `[hushed]`) or a same-length character mask (`simple_style: mask`, e.g. `shit` → `s***` at the defaults — `mask_character`/`mask_preserve_first`/`mask_preserve_last`/`mask_fixed_length` control the rest).
+- **`mode: substitute`** — **still not implemented**, and the reason is the one this section originally undersold: it needs to know not just *that* a word matched, but *which specific `word_list.txt` entry* matched, so it knows which substitute to use (`freak`/`frick`/`f***` all need a "this is `fuck`" signal `simple` never required). `word_list.txt`'s notation-based format (§8, `steps/matching.py`) has no field for this today, `Match`/`WordListEntry` don't carry one, and neither does `censor_log.json` — all three would need extending, plus a design decision on how a *phrase* entry (e.g. `pissed off`) substitutes (one word for several, or several for several), and on matching the original word's casing (`Shit` → `Crap`, not `crap`) the way FrostCo/AdvancedProfanityFilter's own `preserveCase` does — that project's `Config.ts` (per-word `lists`/`matchMethod`/`repeat`/`separators`/`sub` options) is the reference point being considered for this, re-implemented rather than copied, per-entry rather than as a parallel structure to `word_list.txt`. Selecting `mode: substitute` today fails the run outright, before Step 1a starts (`pipeline.py`'s startup call to `validate_hush_config()`), rather than silently doing nothing or falling back to `simple`.
  
-| Original | Substitution options |
-|---|---|
-| freak | [censored] / frick / f*** |
-| crap | [censored] / shoot / s*** |
-| goddang | [censored] / dang / g****** |
- 
-The substitution strategy (euphemism, asterisk-redaction, or bracketed tag) would be configurable, either globally or per-word. A `substitutions` section would be added to `config.yaml`, with a fallback of `[censored]` for any flagged word not explicitly listed.
- 
-**Architectural note:** The v1 pipeline already identifies which words are flagged and at what timestamps. The SRT cue containing that timestamp can be located using the same interval-matching logic already in `steps/align_srt.py`. The SRT substitution step would be a natural addition after Step 5 (mute), writing a modified `.srt` file alongside the censored video.
+**Architectural note (revised from the original v1 proposal above):** that proposal assumed `steps/align_srt.py`'s interval-matching logic; that step still doesn't exist (Phase 3, unstarted — see `README.md`'s "How it works"). What Step 6c actually uses instead: `censor_log.json` (Step 5's own final, post-review/post-correction record of exactly what got muted) cross-referenced against the authoritative transcript's own `[start, end]` word timing by interval overlap (`steps/transcript_srt.py`'s `_hushed_word_indices()`) — no separate alignment step needed, since Step 6c already has both the transcript and the censor log in hand by the time it runs. Deliberately applied ONLY to the authoritative SRT, never the per-stage comparison ones (`transcript_1.srt`, `transcript_2.srt`, ...): `censor_log.json`'s timing is only ever computed against the authoritative transcript, and §13.8 below is a whole worked example of a per-stage transcript's timing for nominally "the same" word disagreeing from it by several real seconds — reusing that timing against a per-stage source risks a silently wrong redaction, with no way to tell from the output alone that it happened. This also meant the `--skip-index`/`--add-interval`/`--redo-review` correction-mode unmark list (`pipeline.py`) had to change: Step 6c's authoritative output now depends on `censor_log.json`, so it's no longer exempt from being invalidated by a correction the way it was before `hush` existed.
  
 #### 13.1.2 SRT Correction / Reconciliation Against Transcript
  

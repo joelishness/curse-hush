@@ -446,6 +446,95 @@ transcript_srt:
   # more than giving each stage a different color would.
   karaoke_color: "#FFD400"
 
+  # ── Hushing: how words the pipeline actually muted are rendered in the
+  # AUTHORITATIVE SRT's own text (transcript.srt / its sidecar / its
+  # embedded or mp4-fallback text) -- NEVER the per-stage comparison SRTs
+  # (transcript_1.srt, transcript_2.srt, ...), which always show the
+  # literal recognized word, unmodified, regardless of this section. That
+  # split is deliberate, not an oversight: which words got muted
+  # (censor_log.json -- Step 5's own final, post-review/post-correction
+  # record) is only ever computed against transcript.json's own word
+  # timing (steps/matching.py's find_matches()), and
+  # docs/timestamp-drift-investigation.md's whole worked example is about
+  # a per-stage transcript's timing for nominally "the same" word
+  # disagreeing by several real seconds -- reusing censor_log.json's
+  # timing there risks silently redacting the wrong word (or missing the
+  # right one) with no way to tell from the output that it happened. The
+  # per-stage SRTs exist specifically to show what was actually
+  # recognized, unedited, for troubleshooting exactly that kind of
+  # disagreement (see steps/transcript_srt.py's own module docstring) --
+  # hushing them would work against their one purpose. embed_in_output
+  # above is off by default for now regardless, so none of this reaches
+  # the shipped video unless that's turned on.
+  hush:
+
+    # keep       — leave every word exactly as WhisperX/MFA recognized
+    #              it, same as if this whole section didn't exist. Mainly
+    #              useful for a one-off debugging pass -- see the
+    #              README's "Reprocessing after a mistake" -- not usually
+    #              what you want in a file you'd actually share or watch
+    #              with subtitles on.
+    # simple     — replace with either a fixed token or a same-length
+    #              character mask -- see simple_style below. DEFAULT.
+    #              Only needs to know THAT censor_log.json muted a word,
+    #              never which specific word_list.txt entry matched, so
+    #              today's censor_log.json already has everything this
+    #              needs -- no change to matching/muting required.
+    # substitute — NOT YET IMPLEMENTED. Replace with a specific,
+    #              meaning-preserving word per word_list.txt entry (e.g.
+    #              "shit" -> "crap") -- needs a still-to-be-designed
+    #              richer word_list.txt format carrying a substitute word
+    #              per entry (today's format -- see that file's own
+    #              header comment -- has no such field) and a
+    #              matching.py/censor_log.json change to record which
+    #              specific entry matched a word, not just that one did.
+    #              See autocensor-design.md §13.1.1 for the fuller plan.
+    #              Selecting this fails the run outright before Step 1a
+    #              starts (pipeline.py's startup validation) with a clear
+    #              error, the same RuntimeError-with-a-clear-message
+    #              style censoring.method: beep uses at Step 5 -- see
+    #              that setting's own comment.
+    mode: simple
+
+    # "mode: simple" only. How the replacement text is built.
+    #   token — every hushed word becomes simple_token, verbatim, however
+    #           long or short the original word was (e.g. both "shit" and
+    #           "goddammit" become "[hushed]").
+    #   mask  — same length as the original word (or mask_fixed_length,
+    #           if set above 0), built from mask_character, optionally
+    #           keeping the real first and/or last letter -- e.g. "shit"
+    #           -> "s***" at the defaults below. DEFAULT: closer to a
+    #           familiar broadcast/print redaction convention, and --
+    #           unlike a fixed token -- keeps each hushed word visually
+    #           distinct from every other one in the same line.
+    simple_style: mask
+
+    # "simple_style: token" only. The literal replacement text -- used
+    # as-is, subject to the same &/</> escaping every other word in the
+    # SRT already gets (steps/transcript_srt.py's _escape()).
+    simple_token: "[hushed]"
+
+    # "simple_style: mask" only. The character repeated to build the
+    # mask. Only the first character is used if more than one is given.
+    mask_character: "*"
+
+    # "simple_style: mask" only. Show the word's real first letter before
+    # the mask -- "shit" -> "s***" (true, the default) vs "****" (false).
+    mask_preserve_first: true
+
+    # "simple_style: mask" only. Show the word's real last letter after
+    # the mask -- combined with mask_preserve_first above, "shit" ->
+    # "s**t". False by default: showing only the first letter is the more
+    # familiar convention, and a word is easier to guess with both ends
+    # visible.
+    mask_preserve_last: false
+
+    # "simple_style: mask" only. Mask length in characters, regardless of
+    # the real word's own length. 0 (default) matches the real word's own
+    # length instead -- the usual choice, since any fixed length either
+    # gives away a short word's real length or overshoots a long one.
+    mask_fixed_length: 0
+
   # ── Grouping: how recognized words are bundled into subtitle lines ──────
   # A new group starts as soon as the next word would break ANY ONE of the
   # limits below -- the same kind of call a human subtitle editor makes
