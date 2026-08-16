@@ -50,8 +50,13 @@ Pipeline (run in sequence, per segment):
   SRT export, or mux.py's embedding needs to change to pick it up.
 
   Neither stage changes what text was recognized — both take Whisper's
-  own output as given and only refine *when* each word occurs. Fixing
-  what gets recognized in the first place (WhisperX's decoder skipping a
+  own output as given and only refine *when* each word occurs. For stage
+  2 specifically this is a structural guarantee, not just a design intent
+  that happens to hold today: MFA's own output never reaches
+  transcript.json as word text under any code path, including its
+  fallback ones — see steps/align_mfa.py's module docstring for why that
+  needed to be said explicitly (it wasn't always true here). Fixing what
+  gets recognized in the first place (WhisperX's decoder skipping a
   stretch of dense, repetitive dialogue outright — see the same
   investigation doc) is a separate, still-open recall problem, not
   something any alignment stage can address.
@@ -141,9 +146,27 @@ Punctuation policy:
   here; stripping happens at match time in steps/matching.py.
 
 Unaligned words:
-  Some tokens cannot be aligned (numerals, currency symbols, punctuation-
-  only tokens).  These appear in the transcript with start/end/score set to
-  null.  Downstream steps skip null-timestamped words at mute time.
+  Stage 1 (WhisperX): some tokens can't be aligned to a real character
+  boundary (rare with the wildcard-column handling recent whisperx
+  versions use for unknown characters -- see steps/align_mfa.py's module
+  docstring -- but not eliminated by it). These appear with
+  start/end/score set to null. Downstream steps skip null-timestamped
+  words at mute time.
+
+  Stage 2 (MFA): MFA's own dictionary can't place a token containing a
+  character outside its G2P model's alphabet (numerals, foreign scripts,
+  ...) at all, so those tokens are never sent to it in the first place
+  (see steps/align_mfa.py's _sanitize_for_mfa()). Rather than appearing
+  null the way stage 1's unalignable tokens do, these get an
+  INTERPOLATED timestamp instead -- WhisperX's own relative timing
+  between the nearest words MFA did confidently place, affine-warped to
+  fit MFA's corrected span (see _interpolate_stage2_words()). Only falls
+  back to null if stage 1's own per-word output for this segment isn't
+  usable as that interpolation basis, or a word sits outside the
+  outermost MFA anchors on either end of the segment and stage 1 itself
+  had no timing for it either -- both are corner cases, not the routine
+  path. Either way, word TEXT is unaffected -- always WhisperX's
+  original token, at every position, from either stage.
 
 VAD:
   Uses Silero VAD (vad_method="silero"), which is free and requires no
@@ -422,7 +445,7 @@ def transcribe(
             if target_stage >= 2 or dual_output:
                 try:
                     t_stage = time.monotonic()
-                    stage_words[2] = align_with_mfa(dialog, segs_out, cfg, log)
+                    stage_words[2] = align_with_mfa(dialog, segs_out, stage_words[1], cfg, log)
                     log.debug(
                         "    Stage 2 (MFA) alignment: %d words in %.1fs for %s.",
                         len(stage_words[2]), time.monotonic() - t_stage, dialog.name,

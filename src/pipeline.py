@@ -1080,17 +1080,39 @@ def main() -> None:
     # since nothing else was ever on stdout to begin with -- it's just one
     # extra terminal line, easy to ignore.
     #
-    # "Notable" here means the same two fallback paths already surfaced
-    # above in the human-readable summary: an MFA alignment falling back
-    # to whisperx.align() (steps/transcribe.py), and an unsupported audio
-    # codec falling back to ac3 (steps/encode.py) -- not a general-purpose
-    # event log. Extending it to cover more cases later means adding to
-    # `notable` here, the same way these two already do.
+    # "Notable" started as an enumerated list of exactly two fallback
+    # paths, each with its own dedicated state field threaded up from the
+    # step that can trigger it: an MFA alignment falling back to
+    # whisperx.align() (steps/transcribe.py's mfa_fallback_segments), and
+    # an unsupported audio codec falling back to ac3 (steps/encode.py's
+    # fallback_reason). Both still get their own specific,
+    # human-readable entry below -- "MFA fallback: 2 segment(s)" says
+    # more than a bare count could, and it's cheap to keep now that it
+    # already exists.
+    #
+    # But that enumeration alone silently under-covers: every OTHER
+    # log.warning() anywhere in this pipeline -- e.g. steps/align_mfa.py
+    # retrying a segment when MFA's G2P composition fails, or falling
+    # back to difflib-based word/score matching when MFA's word tier
+    # doesn't match its own input 1:1 -- had no dedicated field wired
+    # through to here, so it reached the console and this job's own
+    # logs/*.log but never the batch log, indistinguishable there from a
+    # run with nothing to report. utils.warning_summary() closes that gap
+    # generically instead of one enumerated case at a time: it reports
+    # every WARNING-and-above record logged anywhere in this run,
+    # regardless of whether anyone's also added bespoke tracking for it,
+    # so a new warning shows up in the batch log the same day it starts
+    # happening. A totally clean run -- no MFA fallback, no audio
+    # fallback, no warnings logged at all -- still prints "AC_RESULT ok"
+    # exactly as before.
     notable: list[str] = []
     if mfa_fallback_segments:
         notable.append(f"MFA fallback: {mfa_fallback_segments} segment(s)")
     if encode_st.get("fallback_reason"):
         notable.append(f"audio fallback: {encode_st['fallback_reason']}")
+    warning_note = utils.warning_summary()
+    if warning_note:
+        notable.append(warning_note)
     print("AC_RESULT ok" if not notable else f"AC_RESULT warnings :: {' | '.join(notable)}", flush=True)
 
 

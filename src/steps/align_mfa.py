@@ -29,19 +29,48 @@ as a contributing factor). What this fixes is specifically: for words
 WhisperX *did* recognize, making sure their reported timestamp is actually
 where they occur.
 
-A second, separate thing this module has to get right, orthogonal to
-timing: MFA's own dictionary/TextGrid vocabulary is lowercase and
-punctuation-free (a forced aligner's output labels are whatever its
-dictionary defines, not WhisperX's original tokens) — the word TEXT
-transcript.json ends up with here is WhisperX's original casing and
-punctuation, recovered by direct index against MFA's aligned output (see
-_restore_original_words()), never MFA's own labels directly. This was a
-real, previously-live bug, not a hypothetical: an earlier version of this
-recovery relied entirely on difflib-based fuzzy matching between
-normalized word lists, which — unlike the direct-index approach — turned
-out not to hold up reliably over movie-length, repetition-heavy dialogue
-(see _restore_original_words()'s own docstring for why, and for the
-narrower case that fuzzy matching is still kept around as a fallback for).
+MFA is a TIMING correction only — never a text source. Word text
+(casing, punctuation, numerals, everything) always comes from WhisperX's
+own output, unconditionally; MFA's own dictionary/TextGrid vocabulary is
+lowercase, punctuation-free, and drops anything outside its G2P model's
+alphabet before it's even sent (see _sanitize_for_mfa()), so it was never
+going to be a usable text source anyway. Concretely:
+
+  1. Only the words that survive sanitization are sent to MFA at all
+     (origin_index tracks which whisper_words position each one came
+     from). Everything else — numerals, foreign-alphabet words, tokens
+     over _MAX_MFA_TOKEN_LEN — is never in MFA's input to begin with.
+  2. Of what comes back, only entries this pipeline can match to MFA's
+     own input with high confidence (_confident_mfa_anchors() — direct
+     1:1 index when the tier's count matches what was sent, which is
+     the common case; a conservative difflib reconciliation that trusts
+     only exact-match stretches when it doesn't) become "anchors" — a
+     whisper_words position paired with a corrected (start, end).
+  3. Every anchor's WORD TEXT still comes from whisper_words, never from
+     MFA's own tier label — an anchor contributes timing only.
+  4. Every word that ISN'T an anchor — sent to MFA but not confidently
+     matched back, or never sent at all — gets an INTERPOLATED timestamp
+     (_interpolate_stage2_words()): WhisperX's own relative timing
+     between the nearest anchors on each side, affine-warped (scaled +
+     shifted, preserving shape) to fit the corrected span exactly. A
+     word past the last anchor or before the first keeps WhisperX's raw
+     timing untouched — this corrects gaps BETWEEN confirmed points, it
+     never extrapolates beyond them.
+
+This replaced an earlier design (still visible in git history) where a
+tier-count mismatch fell back to reconstructing the ENTIRE word list via
+difflib fuzzy matching against MFA's own labels — including using MFA's
+raw dictionary-form label as the "word" wherever that reconstruction
+couldn't find a WhisperX counterpart to prefer instead. That turned out to
+be a real, previously-live bug: on real movie-length, repetition-heavy
+dialogue, a mismatched tier is common enough (see _confident_mfa_anchors()'s
+own docstring) that this wasn't a rare edge case, and the failure mode
+was bad in both directions at once — words WhisperX actually recognized
+correctly could get silently swapped for the wrong neighbour, and MFA's
+own recognized-but-never-validated label could appear as a "word" nobody
+ever actually said. The design above closes that off structurally rather
+than case-by-case: text is never at risk, because text is never sourced
+from MFA in the first place, at any stage, under any fallback.
 """
 
 from __future__ import annotations
@@ -206,6 +235,7 @@ def _ensure_mfa_ready(acoustic_model: str, dictionary: str, g2p_model: Optional[
 def align_with_mfa(
     dialog_wav: Path,
     whisper_segments: list[dict],
+    whisperx_words: list[dict],
     cfg: dict,
     log: logging.LoggerAdapter,
     work_dir: Optional[Path] = None,
@@ -222,12 +252,28 @@ def align_with_mfa(
         breakdown is exactly what this function produces, via MFA instead
         of whisperx.align().
 
+    whisperx_words — transcribe.py's own stage_words[1]: whisperx.align()'s
+        per-word output for this SAME segment (same words, same order —
+        see _flatten_whisper_words() and _collect_whisperx_words(), which
+        both walk this segment's text the same way), already computed by
+        the time this is called since stage 1 always runs first. Used
+        ONLY as the interpolation basis for whatever this function can't
+        get a confident MFA timestamp for — never for word text, and
+        never for anything at positions MFA *does* confidently cover.
+        See _interpolate_stage2_words() for the mechanism, and this
+        module's own docstring for why word text never comes from MFA at
+        all, at any stage.
+
     Raises MFAError if alignment fails and
     alignment.mfa.fallback_to_whisperx is false. If true (the default),
     the caller (transcribe.py) is expected to catch MFAError and retry that
     segment through the whisperx.align() path instead — this function
     itself does not know how to do that fallback, since it has no access to
-    the whisperx align model/metadata transcribe.py is holding.
+    the whisperx align model/metadata transcribe.py is holding. Note this
+    is about the MFA *subprocess* failing outright (bad G2P composition,
+    a crash, etc.) — a segment that runs fine but can't be confidently
+    reconciled word-for-word does NOT raise this; see
+    _confident_mfa_anchors() for why that's a different, non-fatal case.
     """
     if not whisper_segments:
         return []
@@ -279,9 +325,10 @@ def align_with_mfa(
     # or -- as it turned out -- even a plain apostrophe/hyphen, if the real
     # model's alphabet doesn't include them) can crash G2P and take the
     # entire segment down. whisper_words itself is left untouched -- it's
-    # whisper_words, recovered by direct index (origin_index below; see
-    # _restore_original_words()), that ends up in transcript.json, not this
-    # sanitized copy.
+    # always whisper_words' own text that ends up in transcript.json, at
+    # every position, anchored or interpolated alike (see
+    # _interpolate_stage2_words()); this sanitized copy exists purely to
+    # ask MFA where things are, never what they are.
     #
     # origin_index[k] records which position in whisper_words produced
     # mfa_input_words[k] -- sanitization drops some words outright (see
@@ -289,9 +336,10 @@ def align_with_mfa(
     # G2P model's grapheme set, tokens over _MAX_MFA_TOKEN_LEN, ...), so the
     # two lists aren't always the same length and a plain positional zip
     # isn't safe. Tracking the real correspondence here, once, is what lets
-    # _restore_original_words() map MFA's output back onto WhisperX's
-    # original words by direct index afterward instead of reconstructing it
-    # after the fact via fuzzy string matching.
+    # _confident_mfa_anchors() below map MFA's output back onto WhisperX's
+    # original word positions by direct index in the common case, and what
+    # lets _interpolate_stage2_words() translate its anchors from
+    # mfa_input_words-space back into whisper_words-space afterward.
     mfa_input_words: list[str] = []
     origin_index: list[int] = []
     for i, w in enumerate(whisper_words):
@@ -414,9 +462,11 @@ def align_with_mfa(
         if tmp_ctx is not None:
             tmp_ctx.cleanup()
 
-    words = _restore_original_words(
-        whisper_words, whisper_scores, mfa_words, origin_index, log,
+    anchors = _confident_mfa_anchors(mfa_input_words, mfa_words, log)
+    words = _interpolate_stage2_words(
+        whisper_words, whisper_scores, whisperx_words, origin_index, anchors, log,
     )
+    _enforce_monotonic(words, log)
     return words
 
 
@@ -618,8 +668,10 @@ def _flatten_whisper_words(whisper_segments: list[dict]) -> tuple[list[str], lis
     version's transcribe() call exposes word-level confidence pre-alignment
     (check `result["segments"][i].get("words")` before assuming it doesn't
     — this varies by version), prefer wiring that through instead of this
-    per-segment fallback; the matching logic in _match_scores_and_words() doesn't
-    care which granularity it's given.
+    per-segment fallback; nothing downstream (_confident_mfa_anchors(),
+    _interpolate_stage2_words()) cares which granularity it's given, since
+    a score is just carried through by index either way, never computed
+    from anything MFA returns.
     """
     words: list[str] = []
     scores: list[float] = []
@@ -739,161 +791,328 @@ def _parse_textgrid_words(textgrid_path: Path) -> list[tuple[str, float, float]]
     return out
 
 
-# ── Recovering WhisperX's original words from MFA's aligned output ──────────
-
-def _restore_original_words(
-    whisper_words: list[str],
-    whisper_scores: list[float],
-    mfa_words: list[tuple[str, float, float]],
-    origin_index: list[int],
-    log: logging.LoggerAdapter,
-) -> list[dict]:
-    """
-    Map MFA's aligned (label, start, end) triples back onto WhisperX's
-    original words — the step that makes transcript.json read "Reports"
-    and "Miguel's" for a word MFA successfully aligned, rather than MFA's
-    own dictionary-form label ("reports", "miguels").
-
-    Primary path — direct index lookup, not string matching: forced
-    alignment (that's what "forced" means in the name) places every word
-    it's *given* somewhere in the audio; it doesn't invent, merge, split,
-    or drop word-tier entries relative to its own input list. So once
-    _parse_textgrid_words() has already dropped the genuine silence/<eps>
-    intervals (see that function's own docstring), what's left should
-    correspond 1:1, in order, to mfa_input_words — i.e.
-    len(mfa_words) == len(origin_index) — and mfa_words[k] IS the aligned
-    form of whisper_words[origin_index[k]], full stop. No fuzzy matching
-    needed, and none of its failure modes either: this can't confuse two
-    genuinely different words that happen to normalize the same way (a
-    contraction like "Miguel's" vs. a coincidentally-identical MFA
-    dictionary form "miguels" is exactly this — same normalized form,
-    different string), and it can't drift over a long, repetitive segment
-    the way a global diff can (a real risk in a movie-length segment with
-    thousands of words and heavy repetition of common ones —
-    docs/timestamp-drift-investigation.md's "I've been sayin' it" passage
-    is exactly that kind of repetition, and this pipeline's own history:
-    an earlier version relied on _match_scores_and_words() below for
-    every word, not just as a fallback, which is what let MFA's lowercase,
-    unpunctuated labels leak into transcript.json wholesale on real
-    movie-length input despite that function's own difflib-based attempt
-    to prefer WhisperX's original text wherever it could).
-
-    Fallback path — _match_scores_and_words()'s difflib-based matching,
-    used ONLY if that count assumption is ever actually wrong: an MFA
-    behavior this pipeline hasn't seen and doesn't currently understand,
-    rather than the expected case. Logged clearly rather than silently
-    taken, since it's a materially less reliable reconstruction and worth
-    noticing if it starts happening routinely rather than as a one-off.
-    """
-    if len(mfa_words) == len(origin_index):
-        words = []
-        for k, (_label, start, end) in enumerate(mfa_words):
-            i = origin_index[k]
-            words.append({
-                "word":  whisper_words[i],
-                "start": round(start, 3),
-                "end":   round(end, 3),
-                "score": round(whisper_scores[i], 3),
-            })
-        return words
-
-    log.warning(
-        "MFA's word tier has %d real entries but %d words were sent to it "
-        "(after sanitization) -- expected these to match 1:1, since forced "
-        "alignment shouldn't add/drop/merge word-tier entries relative to "
-        "its own input. Falling back to difflib-based word/score matching "
-        "for this segment -- less reliable (see _restore_original_words()'s "
-        "docstring), but not new: this was the only mapping this pipeline "
-        "had before direct-index mapping existed. If you see this warning "
-        "routinely rather than as a one-off, please report it together "
-        "with the segment's dialog audio -- it points at an MFA behavior "
-        "this pipeline doesn't yet account for.",
-        len(mfa_words), len(origin_index),
-    )
-    mfa_labels = [label for label, _, _ in mfa_words]
-    display_words, scores = _match_scores_and_words(whisper_words, whisper_scores, mfa_labels)
-    return [
-        {"word": dw, "start": round(start, 3), "end": round(end, 3), "score": round(score, 3)}
-        for (_, start, end), dw, score in zip(mfa_words, display_words, scores)
-    ]
-
-
-# ── Score/word matching (fallback only -- see _restore_original_words()) ─────
+# ── Anchoring MFA's output against WhisperX's original words ────────────────
+#
+# Two-step process, replacing the single-function reconstruction this used
+# to be (still visible in git history as _restore_original_words() /
+# _match_scores_and_words()):
+#
+#   1. _confident_mfa_anchors() decides WHICH mfa_input_words positions we
+#      trust MFA's timing for at all -- direct 1:1 index in the common
+#      case, a conservative equal-only difflib reconciliation otherwise.
+#      Returns TIMES only, keyed by position -- never touches word text.
+#   2. _interpolate_stage2_words() turns those anchors into a full,
+#      same-length-as-whisper_words output list, filling every
+#      non-anchored position (dropped by sanitization, or not confidently
+#      matched back) by affine-warping WhisperX's own relative timing
+#      between the nearest anchors on each side. Word text is
+#      whisper_words[i] at every position, full stop -- anchored or
+#      interpolated, this function has no code path that can produce
+#      anything else.
+#
+# The old design's fallback reconstructed the ENTIRE word list from
+# scratch via difflib whenever the tier-count assumption didn't hold,
+# including reaching for MFA's own raw dictionary-form label as the
+# "word" wherever that reconstruction had nothing of WhisperX's to prefer
+# instead. On real movie-length, repetition-heavy dialogue that assumption
+# failed often enough to matter (see _confident_mfa_anchors()'s own
+# docstring for how often, on real input), and the failure mode compounded
+# a timing problem with a text-correctness one at the same time: a word
+# WhisperX transcribed correctly could get silently swapped for a
+# neighbour, or replaced outright by a label MFA guessed but this pipeline
+# never validated against anything. Splitting "where do I trust MFA's
+# time" from "what do I show as the word" -- and making the second
+# question always whisper_words[i], never conditionally MFA's label --
+# closes that off structurally: the worst this design can now do to a
+# word's TEXT is nothing at all, because there's no path left where MFA's
+# own label ever reaches the output.
 
 def _norm(w: str) -> str:
     return re.sub(r"[^a-z']", "", w.lower())
 
 
-def _match_scores_and_words(
+def _confident_mfa_anchors(
+    mfa_input_words: list[str],
+    mfa_words: list[tuple[str, float, float]],
+    log: logging.LoggerAdapter,
+) -> dict[int, tuple[float, float]]:
+    """
+    Decide which positions in mfa_input_words (equivalently, origin_index)
+    this pipeline trusts MFA's own (start, end) for. Returns {k: (start,
+    end)} — a partial map in general, never word text.
+
+    Primary path — direct index, not string matching: forced alignment
+    (that's what "forced" means in the name) places every word it's
+    *given* somewhere in the audio; it doesn't invent, merge, split, or
+    drop word-tier entries relative to its own input list. So once
+    _parse_textgrid_words() has already dropped the genuine silence/<eps>
+    intervals (see that function's own docstring), what's left should
+    correspond 1:1, in order, to mfa_input_words — i.e.
+    len(mfa_words) == len(mfa_input_words) — and mfa_words[k] IS the
+    aligned form of mfa_input_words[k], full stop. This is the fast,
+    common-case path: every position becomes an anchor, no difflib
+    involved at all.
+
+    Fallback path — conservative difflib reconciliation, used when that
+    count assumption doesn't hold: NOT a rare, hypothetical case on real
+    input (see the warning below, and docs/timestamp-drift-investigation.md's
+    "I've been sayin' it" passage for the kind of dense repetition that
+    tends to trigger it) — routine enough that it needs to degrade safely
+    rather than assume it won't happen. The two normalized token
+    sequences (mfa_input_words vs. MFA's own labels — both already
+    lowercase/punctuation-free, so this is a much better-conditioned
+    comparison than diffing against WhisperX's original casing/punctuation
+    would be) are reconciled with difflib, but ONLY 'equal' opcode
+    stretches are trusted as anchors. 'replace'/'insert'/'delete' spans
+    contribute NO anchors at all, on purpose — a wrong guess here would
+    hand a word a plausible-looking but incorrect timestamp with no way
+    to tell from the output alone, whereas a position this function
+    simply doesn't cover just falls through to interpolation in
+    _interpolate_stage2_words(), which is always safe by construction.
+    Conservative in the same spirit as _parse_textgrid_words() keeping
+    "<unk>"/"spn" as a visible low-confidence token rather than silently
+    dropping it: prefer a visible, bounded gap over a silent, confident-
+    looking mistake.
+    """
+    if len(mfa_words) == len(mfa_input_words):
+        return {k: (start, end) for k, (_label, start, end) in enumerate(mfa_words)}
+
+    input_norm = [_norm(w) for w in mfa_input_words]
+    label_norm = [_norm(label) for label, _, _ in mfa_words]
+    sm = difflib.SequenceMatcher(None, input_norm, label_norm, autojunk=False)
+    anchors: dict[int, tuple[float, float]] = {}
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "equal":
+            continue
+        for offset in range(i2 - i1):
+            _label, start, end = mfa_words[j1 + offset]
+            anchors[i1 + offset] = (start, end)
+
+    log.warning(
+        "MFA's word tier has %d real entries but %d words were sent to it "
+        "(after sanitization) -- expected these to match 1:1, since forced "
+        "alignment shouldn't add/drop/merge word-tier entries relative to "
+        "its own input. Reconciled the two normalized token sequences and "
+        "recovered %d/%d position(s) as confident anchors (exact-match "
+        "stretches only); the rest of this segment's words -- including "
+        "every word never sent to MFA to begin with -- get an interpolated "
+        "timestamp instead (see _interpolate_stage2_words()), never a "
+        "guessed word or an MFA-derived label. If you see this warning "
+        "routinely rather than as a one-off, please report it together "
+        "with the segment's dialog audio -- it points at an MFA behavior "
+        "this pipeline doesn't yet account for.",
+        len(mfa_words), len(mfa_input_words), len(anchors), len(mfa_input_words),
+    )
+    return anchors
+
+
+def _fill_gap(
+    words: list[Optional[dict]],
+    gap: list[int],
     whisper_words: list[str],
     whisper_scores: list[float],
-    mfa_words: list[str],
-) -> tuple[list[str], list[float]]:
+    whisperx_words: list[dict],
+    lo_i: Optional[int],
+    hi_i: Optional[int],
+    corrected_lo: Optional[float],
+    corrected_hi: Optional[float],
+) -> None:
     """
-    Map WhisperX's recognition-confidence scores AND its original word text
-    onto MFA's word list, which won't always tokenize 1:1 with WhisperX's
-    own output (punctuation handling, contractions, G2P-driven splits).
-    Same difflib-based approach used earlier for the drift cross-reference —
-    a straightforward positional zip silently mis-attributes both the moment
-    token counts diverge even slightly, which is common enough here not to
-    risk it.
+    Fill words[i] in place for every i in `gap` — a run of whisper_words
+    positions with no confident MFA anchor of their own (see
+    _confident_mfa_anchors()). Word text is always whisper_words[i];
+    score is always whisper_scores[i] — only start/end vary by branch.
 
-    FALLBACK ONLY as of this version — see _restore_original_words(), which
-    now handles the expected case (len(mfa_words) == len(origin_index)) by
-    direct index instead, precisely because this function's own
-    reconstruction turned out not to be reliable enough at real
-    movie-length scale to use unconditionally (see that function's
-    docstring). Kept here rather than removed: still a materially better
-    fallback than reaching for MFA's raw label unconditionally on the rare
-    input this pipeline's forced-alignment assumption doesn't hold for.
+    UNBOUNDED (lo_i or hi_i is None — this gap touches the start/end of
+    the segment, so there's no anchor on that side to interpolate
+    toward): WhisperX's own raw per-word timing, untouched. Deliberately
+    NOT extrapolated from the single nearest anchor on the other side —
+    interpolating BETWEEN two confirmed points is safe by construction
+    (it can't disagree with either one), extrapolating beyond the last
+    confirmed point is a genuinely different, weaker claim this design
+    doesn't make.
 
-    The word-text half of this fixed a real discrepancy from an even
-    earlier version of this function, which only carried scores across and
-    let the caller use MFA's own TextGrid label as the returned "word"
-    directly. MFA's dictionaries/TextGrids are lowercase and already
-    punctuation-free (see _sanitize_for_mfa() for why the *input* side has
-    to be too), which silently violates transcribe.py's own documented
-    policy for this pipeline: "Word casing is preserved exactly as
-    WhisperX produces it. Do NOT lowercase ... required for case-sensitive
-    (=) word list entries" and "Punctuation attached to words ... is
-    preserved here." Every word MFA aligns was quietly losing both, which
-    is exactly the distinction that policy exists to protect (its own
-    example: "Dick" (name) vs. "dick" (profanity)) -- restored here, for
-    this fallback, the same way -- by preferring WhisperX's own original
-    token wherever the alignment below finds one to prefer it over, and
-    falling back to MFA's label only for a token MFA introduced that
-    WhisperX has no counterpart for at all ('insert' below).
+    BOUNDED (both sides anchored): affine-warp WhisperX's own
+    [whisperx_words[lo_i].end, whisperx_words[hi_i].start] sub-timeline
+    onto MFA's corrected [corrected_lo, corrected_hi] — same shape (each
+    word's relative position and duration within the gap), rescaled to
+    fit the corrected span exactly. This is deliberately a scale-and-shift
+    of WhisperX's OWN relative timing, not a fresh estimate from word
+    count or duration alone: preserves whatever real signal WhisperX's
+    timing has about which words in the gap were short/long, quick/slow,
+    while still being anchored to MFA's more trustworthy endpoints. Falls
+    back to evenly-spaced slots across the whole gap if WhisperX's own
+    timing for this stretch isn't usable for that (any word in the gap
+    null, or the boundary span itself zero/negative width) — still
+    correctly bounded either way, just without the finer within-gap
+    shape when the input to preserve isn't there. See align_mfa.py's
+    module docstring's account of why an earlier version of this module
+    trusted MFA's own drift-prone WhisperX-internal timing far less than
+    the corrected anchors either side of it — the same reasoning is why
+    the correction is anchored on confirmed MFA points, not on
+    WhisperX's own gap boundary as reported.
     """
-    wn = [_norm(w) for w in whisper_words]
-    mn = [_norm(w) for w in mfa_words]
+    if lo_i is None or hi_i is None:
+        for i in gap:
+            w = whisperx_words[i]
+            words[i] = {
+                "word": whisper_words[i],
+                "start": w.get("start"),
+                "end": w.get("end"),
+                "score": round(whisper_scores[i], 3),
+            }
+        return
 
-    sm = difflib.SequenceMatcher(None, wn, mn, autojunk=False)
-    scores_out: list[Optional[float]] = [None] * len(mn)
-    words_out: list[Optional[str]] = [None] * len(mn)
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            for k in range(i2 - i1):
-                scores_out[j1 + k] = whisper_scores[i1 + k]
-                words_out[j1 + k] = whisper_words[i1 + k]
-        elif tag == "replace":
-            span = whisper_scores[i1:i2] or whisper_scores
-            avg = sum(span) / len(span) if span else 0.5
-            wspan = whisper_words[i1:i2]
-            for offset, k in enumerate(range(j1, j2)):
-                scores_out[k] = avg
-                # Same relative position within the replaced span, where one
-                # exists -- an approximation (span lengths can differ), but
-                # a strictly better guess than always reaching for MFA's
-                # label, and it degrades to that same label below wherever
-                # there's genuinely nothing of WhisperX's own to prefer.
-                if offset < len(wspan):
-                    words_out[k] = wspan[offset]
-        # 'delete': whisper token with no MFA counterpart — contributes nothing.
-        # 'insert': MFA token with no whisper counterpart — both fall back
-        #           to MFA's own values below, since there's nothing of
-        #           WhisperX's to prefer instead.
+    raw_lo = whisperx_words[lo_i].get("end")
+    raw_hi = whisperx_words[hi_i].get("start")
+    usable_shape = (
+        raw_lo is not None and raw_hi is not None and raw_hi > raw_lo
+        and all(
+            whisperx_words[i].get("start") is not None and whisperx_words[i].get("end") is not None
+            for i in gap
+        )
+    )
+    corrected_span = max(corrected_hi - corrected_lo, 0.0)
 
-    overall_avg = sum(whisper_scores) / len(whisper_scores) if whisper_scores else 0.5
-    scores = [s if s is not None else overall_avg for s in scores_out]
-    words = [w if w is not None else mfa_words[idx] for idx, w in enumerate(words_out)]
-    return words, scores
+    if usable_shape:
+        scale = corrected_span / (raw_hi - raw_lo)
+        for i in gap:
+            w = whisperx_words[i]
+            words[i] = {
+                "word":  whisper_words[i],
+                "start": round(corrected_lo + (w["start"] - raw_lo) * scale, 3),
+                "end":   round(corrected_lo + (w["end"]   - raw_lo) * scale, 3),
+                "score": round(whisper_scores[i], 3),
+            }
+        return
+
+    # Evenly-spaced fallback -- still correctly bounded by MFA's two
+    # anchors, just without WhisperX's own within-gap shape to warp.
+    step = corrected_span / len(gap)
+    t = corrected_lo
+    for i in gap:
+        words[i] = {
+            "word":  whisper_words[i],
+            "start": round(t, 3),
+            "end":   round(t + step, 3),
+            "score": round(whisper_scores[i], 3),
+        }
+        t += step
+
+
+def _interpolate_stage2_words(
+    whisper_words: list[str],
+    whisper_scores: list[float],
+    whisperx_words: list[dict],
+    origin_index: list[int],
+    anchors_by_k: dict[int, tuple[float, float]],
+    log: logging.LoggerAdapter,
+) -> list[dict]:
+    """
+    Build the final, same-length-as-whisper_words stage 2 output: MFA's
+    corrected timing at every anchored position, an interpolated estimate
+    everywhere else (see _fill_gap()). Word text and score always come
+    from whisper_words/whisper_scores by direct index — this function has
+    no code path that can substitute either one for anything else.
+
+    anchors_by_k is keyed by position in mfa_input_words (equivalently
+    origin_index) — the space _confident_mfa_anchors() works in, since
+    that's what it compared against MFA's own tier. Re-keyed here to
+    whisper_words-space (anchor_by_i) via origin_index, since that's the
+    space every OTHER list in this function — whisper_words,
+    whisper_scores, whisperx_words — is already in.
+
+    A segment where zero anchors were recoverable degrades to exactly
+    WhisperX's own stage 1 output, unmodified, word for word — not an
+    error case, just the bottom of a continuous scale from "MFA anchored
+    nothing" up to "MFA anchored everything," handled by the same code
+    path throughout rather than a separate cutoff/threshold that would
+    otherwise need its own justification for wherever it was drawn.
+    """
+    n = len(whisper_words)
+
+    stage1_usable = len(whisperx_words) == n
+    if not stage1_usable:
+        log.warning(
+            "  WhisperX's own per-word output (%d words) doesn't line up "
+            "1:1 with the %d words recognized for this segment -- can't "
+            "use it as an interpolation basis. Every word without its own "
+            "confident MFA anchor is left with a null timestamp instead "
+            "(same as an unalignable word has always had), rather than "
+            "risk interpolating against a misaligned reference.",
+            len(whisperx_words), n,
+        )
+
+    anchor_by_i = {origin_index[k]: t for k, t in anchors_by_k.items()}
+    anchored = sorted(anchor_by_i)
+
+    words: list[Optional[dict]] = [None] * n
+    for i in anchored:
+        start, end = anchor_by_i[i]
+        words[i] = {
+            "word":  whisper_words[i],
+            "start": round(start, 3),
+            "end":   round(end, 3),
+            "score": round(whisper_scores[i], 3),
+        }
+
+    bounds = [None] + anchored + [None]
+    for lo, hi in zip(bounds, bounds[1:]):
+        start_i = 0 if lo is None else lo + 1
+        end_i = n if hi is None else hi
+        gap = list(range(start_i, end_i))
+        if not gap:
+            continue
+        if not stage1_usable:
+            for i in gap:
+                words[i] = {
+                    "word": whisper_words[i], "start": None, "end": None,
+                    "score": round(whisper_scores[i], 3),
+                }
+            continue
+        corrected_lo = anchor_by_i[lo][1] if lo is not None else None
+        corrected_hi = anchor_by_i[hi][0] if hi is not None else None
+        _fill_gap(
+            words, gap, whisper_words, whisper_scores, whisperx_words,
+            lo, hi, corrected_lo, corrected_hi,
+        )
+
+    return words  # type: ignore[return-value]
+
+
+def _enforce_monotonic(words: list[dict], log: logging.LoggerAdapter) -> None:
+    """
+    Defensive final pass over the WHOLE word list: nudge any word whose
+    start would precede the previous word's end forward by the minimum
+    amount needed to keep the sequence non-decreasing, in place.
+
+    Should be a no-op in the overwhelming majority of runs — MFA's own
+    tier is monotonic by construction, and the affine warp in _fill_gap()
+    preserves order exactly — but Step 5 (mute) depends on these
+    intervals being sane, and this function is the one place in the
+    pipeline that combines timing from two different sources (MFA anchors
+    and warped/raw WhisperX timing) across gaps of varying width, so this
+    stays cheap, unconditional insurance rather than an assumption argued
+    for instead of checked.
+    """
+    prev_end: Optional[float] = None
+    nudged = 0
+    for w in words:
+        if w["start"] is None or w["end"] is None:
+            continue
+        if prev_end is not None and w["start"] < prev_end:
+            shift = prev_end - w["start"]
+            w["start"] = round(w["start"] + shift, 3)
+            w["end"] = round(w["end"] + shift, 3)
+            nudged += 1
+        if w["end"] < w["start"]:
+            w["end"] = w["start"]
+        prev_end = w["end"]
+    if nudged:
+        log.warning(
+            "  %d word(s) had their timing nudged forward by "
+            "_enforce_monotonic() to preserve chronological order after "
+            "interpolation -- expected to be rare; if this fires often, "
+            "the affine warp's inputs are worth a closer look.",
+            nudged,
+        )

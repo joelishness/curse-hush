@@ -105,6 +105,89 @@ class _StepFormatter(logging.Formatter):
         return f"{ts} [{level}] [{step:<9}] {record.getMessage()}"
 
 
+class _WarningCollectingHandler(logging.Handler):
+    """
+    Silently taps every WARNING-and-above record logged through the
+    'hush' logger for the lifetime of this process, purely as a side
+    channel -- it never formats or emits anything itself, so it has zero
+    effect on what actually reaches the console or the per-job log file
+    (setup_logging() attaches it alongside those, not instead of them).
+
+    Why this exists: pipeline.py's end-of-run summary used to decide
+    what's "notable" enough to surface in the AC_RESULT line (-> hush.sh
+    --batch's own batch log) by checking a small, hand-maintained list of
+    specific state fields -- transcribe.py's mfa_fallback_segments,
+    encode.py's fallback_reason. Each of those is real and still gets its
+    own specific, human-readable entry (see pipeline.py). But that
+    approach silently under-covers by construction: any OTHER
+    log.warning() call anywhere in this pipeline (a step's own edge case,
+    or a new one added later) has no state field wired through to
+    pipeline.py at all, so it scrolled past on the console and into this
+    job's own logs/*.log, but never reached the batch log -- indistinguishable
+    there from a run with nothing to report. This handler catches all of
+    those too, generically, so a new warning shows up in the batch log
+    the same day it starts happening rather than only once someone
+    notices the gap and adds bespoke plumbing for that one case.
+
+    One instance for the module's lifetime (see _WARNING_COLLECTOR
+    below), not reset between jobs -- doesn't need to be, since
+    setup_logging() is itself only ever called once per process, and
+    hush.sh --batch runs each file as a fresh container/process (see
+    hush.sh's own comments on why only stdout, not stderr, is captured
+    per file in that loop). A resumed/skipped segment or step logs
+    nothing new this run, so it correctly contributes nothing here either
+    -- see e.g. transcribe.py's per-segment resume branch.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def summary(self) -> str:
+        """
+        e.g. '5 warning(s) logged (transcribe×4, matching×1) -- see this
+        run's own log file for detail', or '' if nothing was collected.
+        Grouped by step (the same tag _StepFormatter prints as
+        '[transcribe]' etc.), not by exact message text -- this feeds one
+        scannable batch-log line, not a second copy of the messages
+        themselves; those already live in job_dir/logs/*.log (see
+        pipeline.py's own AC_RESULT comment for why the batch log
+        deliberately stays this thin).
+        """
+        if not self.records:
+            return ""
+        by_step: dict[str, int] = {}
+        for r in self.records:
+            step = getattr(r, "step", r.name)
+            by_step[step] = by_step.get(step, 0) + 1
+        breakdown = ", ".join(
+            f"{step}×{n}" for step, n in sorted(by_step.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+        return (
+            f"{len(self.records)} warning(s) logged ({breakdown}) -- "
+            "see this run's own log file for detail"
+        )
+
+
+# Module-level singleton, not one per setup_logging() call -- see
+# _WarningCollectingHandler's own docstring for why process lifetime is
+# exactly the right scope here.
+_WARNING_COLLECTOR = _WarningCollectingHandler()
+
+
+def warning_summary() -> str:
+    """
+    Short, scannable summary of every WARNING-and-above record logged
+    through the 'hush' logger so far this process -- '' if none. See
+    _WarningCollectingHandler's docstring and pipeline.py's end-of-run
+    "notable" comment for the full picture of where this feeds into.
+    """
+    return _WARNING_COLLECTOR.summary()
+
+
 def setup_logging(level_name: str) -> logging.Logger:
     """Configure and return the root 'hush' logger."""
     level = getattr(logging, level_name.upper(), logging.INFO)
@@ -114,6 +197,7 @@ def setup_logging(level_name: str) -> logging.Logger:
     logger.setLevel(level)
     if not logger.handlers:
         logger.addHandler(handler)
+        logger.addHandler(_WARNING_COLLECTOR)
     logger.propagate = False
     return logger
 
