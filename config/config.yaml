@@ -431,16 +431,36 @@ transcript_srt:
   # way to put a text subtitle inside an MP4 container at all) strips
   # every styling tag outright -- so steps/mux.py embeds a plain,
   # one-cue-per-line rendering there instead, regardless of this setting.
-  # Both the job-directory copies and any sidecar copies are unaffected
-  # either way and still get the karaoke version when this is true -- this
-  # limitation is specific to mp4's embedded tracks.
+  #
+  # Applies ONLY to the per-stage comparison SRTs (transcript_1.srt,
+  # transcript_2.srt, ...) -- NEVER the authoritative one (transcript.srt
+  # / its sidecar / its embedded or mp4-fallback text), which is always
+  # the plain, one-cue-per-group rendering regardless of this setting.
+  # Deliberate, not an oversight, and for two independent reasons: the
+  # per-stage SRTs are a debugging aid where precise, glanceable word-by-
+  # word timing is the entire point (see docs/timestamp-drift-
+  # investigation.md); the authoritative one is the track meant for an
+  # actual viewer, where traditional grouped subtitles are the familiar,
+  # comfortable format and flickering per-word color reads as a bug, not
+  # a feature. That's compounded once hush.mode redacts a word there
+  # (see below) -- highlighting a masked "s***" letter-by-letter conveys
+  # nothing a viewer would find useful the way highlighting a real,
+  # recognized word does. This split mirrors the Hushing section's own
+  # final-only/per-stage-never split below, for related but distinct
+  # reasons -- see that section's own comment.
+  # Both the job-directory copies and any sidecar copies of the per-stage
+  # SRTs are unaffected by output.format either way and still get the
+  # karaoke version when this is true -- the mp4 limitation above is
+  # specific to mp4's embedded tracks.
   # false: skip the karaoke rendering everywhere (job directory, sidecar,
-  # and any embed) and only group words like a traditional subtitle track.
+  # and any embed) and only group words like a traditional subtitle track
+  # for the per-stage SRTs too -- the authoritative one already always
+  # does this regardless.
   karaoke: true
 
   # Color applied to the currently-spoken word when karaoke is true.
   # #RRGGBB hex. A bright, saturated color reads best against traditional
-  # white/default subtitle text. Shared by every stage's SRT -- players
+  # white/default subtitle text. Shared by every per-stage SRT -- players
   # show at most one subtitle track at a time by default, so telling them
   # apart by filename/track name (see track_name_prefix below) matters far
   # more than giving each stage a different color would.
@@ -450,8 +470,13 @@ transcript_srt:
   # AUTHORITATIVE SRT's own text (transcript.srt / its sidecar / its
   # embedded or mp4-fallback text) -- NEVER the per-stage comparison SRTs
   # (transcript_1.srt, transcript_2.srt, ...), which always show the
-  # literal recognized word, unmodified, regardless of this section. That
-  # split is deliberate, not an oversight: which words got muted
+  # literal recognized word, unmodified, regardless of this section. karaoke
+  # above draws the same authoritative/per-stage line, for related but
+  # distinct reasons (see that setting's own comment) -- the two splits
+  # aren't a coincidence: the per-stage SRTs are consistently the raw,
+  # unedited debugging view, and the authoritative one is consistently the
+  # one shaped for an actual viewer. That split is deliberate, not an
+  # oversight: which words got muted
   # (censor_log.json -- Step 5's own final, post-review/post-correction
   # record) is only ever computed against transcript.json's own word
   # timing (steps/matching.py's find_matches()), and

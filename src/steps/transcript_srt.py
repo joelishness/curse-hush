@@ -154,6 +154,17 @@ _ALIGNMENT_STAGES registry is: a future stage 3 (a different aligner
 entirely) needs no changes here — job.json's own "alignment_stages"
 legend is read fresh each run, so a new stage number just starts showing
 up as one more SRT the moment steps/transcribe.py starts producing it.
+
+That same authoritative/per-stage split governs two more things below,
+for related but distinct reasons documented at each: karaoke rendering
+(transcript_srt.karaoke — a per-stage debugging aid, never applied to
+the authoritative SRT, which stays traditional grouped subtitles
+regardless of that setting; see _export_one_source()) and hush
+redaction (transcript_srt.hush — the reverse: applied only to the
+authoritative SRT's own text, never to a per-stage one; see
+_apply_hush()). Both consistently treat the per-stage SRTs as the raw,
+unedited debugging view and the authoritative one as the track shaped
+for an actual viewer.
 """
 
 import json
@@ -338,6 +349,16 @@ def _export_one_source(
     Returns None if transcript_path has no word with usable alignment
     timing at all (nothing to place on a timeline either way) — logged,
     not an error.
+
+    Karaoke rendering (transcript_srt.karaoke) is only ever considered
+    for a per-stage source (key != "final") — the authoritative SRT is
+    always the plain, one-cue-per-group rendering, regardless of that
+    setting's own value. See config.yaml's karaoke comment for why: in
+    short, the authoritative track is the one meant for an actual viewer
+    (and, per the hush section below, the one whose text can already
+    read "s***" instead of the real word) — flickering per-word color on
+    every line reads as a debugging aid there, not a viewing feature; the
+    per-stage tracks are the debugging aid, and keep the precision.
     """
     srt_out = job_dir / f"transcript{suffix}.srt"
 
@@ -414,7 +435,11 @@ def _export_one_source(
             sidecar_path.write_text(srt_out.read_text(encoding="utf-8"), encoding="utf-8")
         return SrtSource(key, label, srt_out, sidecar_path, plain_text, track_name)
 
-    karaoke_enabled = bool(cfg_get(cfg, "transcript_srt", "karaoke"))
+    # Karaoke only ever applies to a per-stage comparison source (key !=
+    # "final") -- see config.yaml's karaoke comment for the full
+    # rationale. The authoritative SRT is always plain_text, computed
+    # above, regardless of transcript_srt.karaoke's own value.
+    karaoke_enabled = key != "final" and bool(cfg_get(cfg, "transcript_srt", "karaoke"))
     chosen_text = (
         _render_srt(prepared, karaoke=True, color=color) if karaoke_enabled else plain_text
     )
