@@ -445,7 +445,7 @@ def transcribe(
             if target_stage >= 2 or dual_output:
                 try:
                     t_stage = time.monotonic()
-                    stage_words[2] = align_with_mfa(dialog, segs_out, stage_words[1], cfg, log)
+                    stage_words[2] = align_with_mfa(dialog, dur_sec, segs_out, stage_words[1], cfg, log)
                     log.debug(
                         "    Stage 2 (MFA) alignment: %d words in %.1fs for %s.",
                         len(stage_words[2]), time.monotonic() - t_stage, dialog.name,

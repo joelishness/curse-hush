@@ -1,21 +1,172 @@
 """
 Word-level alignment via Montreal Forced Aligner (MFA) — the default
 alignment engine as of this version (config.yaml's alignment.backend: mfa).
-Falls back to whisperx.align()'s wav2vec2/CTC alignment per-segment on
+Falls back to whisperx.align()'s wav2vec2/CTC alignment per-segment (and,
+as of this version, per-chunk within a segment — see CHUNKING below) on
 failure; see that file for the reasoning behind the switch. Short version:
 whisperx.align() aligns *within* whatever segment boundary WhisperX's own
 transcribe() pass already committed to, so a chunk-boundary timing error
 upstream (see docs/timestamp-drift-investigation.md) propagates straight
-through it uncorrected. MFA aligns the whole audio handed to it against the
-whole recognized text in one pass, with no dependency on WhisperX's internal
-~30s decode chunks at all, so it has nothing to inherit a chunk-boundary
-error from in the first place. Validated directly, not just reasoned about
-— see the same doc for the before/after numbers.
+through it uncorrected. MFA's forced-alignment search is given known text
+and told to find it somewhere in the audio it's handed — it never *trusts*
+a WhisperX-reported timestamp to decide where to look, so it has nothing to
+inherit a chunk-boundary error from. Validated directly, not just reasoned
+about — see the same doc for the before/after numbers on the original,
+whole-segment-per-call design.
 
 Imported unconditionally at the top of transcribe.py (not behind a
 conditional "only if backend == mfa" guard) — this module's own top-level
 imports are stdlib + utils only, so there's no cost to importing it even on
 a job that ends up using whisperx for every segment.
+
+CHUNKING — why, and why it doesn't undo the paragraph above:
+The original version of this function handed align_one one entire ~30-
+*minute* job-segment as a single utterance, on the reasoning that MFA's
+whole-file search is what makes it drift-immune in the first place, so
+splitting it seemed like exactly the wrong direction. That held for
+correctness, but not for runtime: align_one's beam search cost scales with
+how long the given audio is, not just with beam width, and a real job hit
+this directly — a single segment's align_one call ran past a 1800s subprocess
+timeout without finishing (confirmed reproducible: two independent attempts,
+different temp dirs, both ran ~2600s total before being killed, agreeing to
+within 5s). MFA's own docs are explicit that individual alignment units
+should generally stay under ~30s, and that align_one/single-file alignment
+specifically isn't really intended for long files at all.
+
+So this now runs align_one once per short chunk (target
+alignment.mfa.chunk_target_sec, built from consecutive whisper_segments —
+see _build_alignment_chunks()) instead of once for the whole job-segment.
+The risk that raises: whisper_segments' own start/end timestamps are
+*exactly* the untrusted signal this whole module exists to not depend on
+(see the paragraph above, and docs/timestamp-drift-investigation.md's own
+worked example — a skipped line leaves every subsequent WhisperX segment
+timestamped several seconds to tens of seconds early, growing further
+across a repetitive stretch before a real silence resets it). Naively
+slicing dialog_wav at a chunk's claimed [start, end] and asking MFA to
+search *only* that narrow slice would silently reintroduce that same
+dependency one level down.
+
+FIRST ATTEMPT AT A FIX, AND WHY IT WAS WRONG:
+The first version of this padded each chunk's slice well past its claimed
+boundaries (more room after than before — every confirmed drift case in
+docs/timestamp-drift-investigation.md ran the same direction, offset
+always negative, WhisperX's claimed time consistently earlier than real
+time) and handed align_one that whole padded window directly, on the
+assumption that forced alignment fits the *given* text to its best span
+and doesn't spread it across whatever extra room it's offered. That
+assumption was wrong, and re-validating against Independence Day (which
+already has 17 hand-confirmed drift cases with known-correct timestamps
+from the original investigation) caught it directly rather than leaving it
+undiscovered: MFA does not reliably stop at the true end of speech when
+the given audio has a lot of trailing silence in it. A single word was
+observed smeared to over 25 seconds. Mechanically, this isn't MFA
+misbehaving so much as it is Viterbi decoding doing what it does when
+asked to explain an entire given audio span using only the given phones —
+if there's no strong reason to transition into (and pay the cost of
+sitting in) a silence model trained on ordinary pause lengths, extending
+the last phone's own self-loop across the padding is often the
+higher-likelihood path. A cross-chunk plausibility check (comparing a
+chunk's anchors against where the previous chunk's own accepted anchors
+ended) was added to catch the fallout, but it was compensating for the
+smearing's downstream effects — inflated chunk-boundary times, cascading
+false rejections of otherwise-correct neighbouring chunks, corrupted
+bracketing anchors for _interpolate_stage2_words()'s affine warp — rather
+than removing its cause, and measured against the same 17 known cases,
+the result was *worse* than plain whisperx.align(), not better (median
+timing offset against a reference SRT went from 0.27s at stage 1 to
+6.93s at stage 2).
+
+SECOND ATTEMPT, AND WHY IT WAS *ALSO* WRONG:
+Kept the padded window but stopped handing it to align_one directly —
+ran ffmpeg's own silencedetect filter over it first and sliced down to
+just the detected non-silent span before aligning, on the reasoning that
+real, purpose-built silence detection wouldn't have the first attempt's
+problem, since MFA would never see the padding at all. That fixed the
+trailing-smear mechanism specifically, but missed a second, different one
+on a real (shorter) test file: silencedetect finds *any* non-silent
+audio in the padded window, with no way to know whether it belongs to
+THIS chunk or to whatever precedes/follows it. On a chunk near the start
+of a file, with generous chunk_pad_before_sec reaching close to (or
+clamped at) position 0, and without a clean, long-enough silence gap
+between this chunk's real content and whatever came before it (dense,
+fast-paced dialogue has little reason to leave one) — confirmed directly,
+not hypothetical — the detected envelope reached back roughly 3 seconds
+into unrelated preceding audio. MFA then had to explain the given text
+across that whole (too-wide, wrong-content) span: one word's end matched
+truth to within 2ms (the chunk's real trailing boundary, correctly
+found), while the chunk's detected start was 3.1 seconds early, and two
+of the chunk's own words absorbed the gap (0.24s of real duration
+inflated to 2.35s; 0.70s inflated to 2.02s).
+
+Two attempts, two different mechanisms, both traceable to the same root
+decision: searching a generously padded window and trusting *anything*
+found in it — MFA's own alignment search in the first case, real silence
+detection in the second — to reliably isolate just this chunk's real
+audio. Neither did, reliably. Left both here as a record of what was
+tried and ruled out, same as this project's own
+docs/timestamp-drift-investigation.md does for its six earlier MFA
+integration problems — worth knowing before generous padding is tempting
+to reach for a third time.
+
+THE ACTUAL FIX — stop trying to search for it at all:
+[slice_start, slice_end) is now the chunk's own claimed [start, end] from
+WhisperX plus a small, FIXED edge margin (alignment.mfa.chunk_edge_margin_sec,
+default well under a second) — not a generously padded search window, and
+nothing tries to find real audio beyond it. A chunk affected by genuine
+WhisperX timestamp drift will generally fail to align in a window this
+tight (align_one can't find the given text where it isn't), and degrades
+to stage 1 (WhisperX) timing for that chunk's own words via the same
+non-fatal per-chunk path described below — which is not a regression:
+it's exactly the timing those words would have had before MFA was
+introduced at all. The trade being made explicitly: MFA no longer
+attempts to rescue the ~1% of content genuinely affected by WhisperX
+drift (17 of 1,538 lines in the original Independence Day count) — both
+attempts at rescuing it corrupted a much larger fraction of otherwise-fine
+content instead, in two different ways, so the safer default is to let
+those specific words fall back to no-worse-than-baseline rather than risk
+a third, cleverer way to search for them.
+
+The cross-chunk plausibility check (align_with_mfa()'s monotonicity
+comparison against the previous chunk's accepted anchors) is kept as a
+cheap backstop regardless — a tight slice removes the room for either
+padding failure mode to occur, but doesn't guarantee every chunk aligns
+perfectly, and the check costs nothing to keep.
+
+This tight-slicing version has NOT yet been re-run against a real MFA
+install — same lack of a network path to conda-forge from where this was
+written, see docs/timestamp-drift-investigation.md for what "validated
+directly, not just reasoned about" has meant everywhere else in this file.
+The re-validation path is the same one that caught both earlier attempts'
+failures and should be trusted more than this docstring's own reasoning:
+re-run against Independence Day's 17 hand-confirmed drift cases and the
+reference SRT, AND against whatever shorter/denser-dialogue file exposed
+the second attempt's failure, and check the resulting transcript's own
+word-duration distribution directly (no word should come back multiple
+seconds long) and specifically inspect chunks near the very start of each
+job-segment and near tightly-packed dialogue with little pause between
+lines — those are exactly the conditions that exposed problems in both
+earlier attempts, and a design change motivated by one file's failure
+mode needs checking against the file that surfaced it, not only the one
+that surfaced the first. Checking only the aggregate offset number was
+what let the first attempt's rejection-rate statistic look plausible
+before the SRT comparison showed otherwise; don't repeat that shortcut
+here either. Expect this version's aggregate offset to be closer to
+stage 1's own (rather than better than stage 1 everywhere) precisely
+because it deliberately stops trying to rescue the drift-affected
+minority — the 17 known cases are the direct measure of what, if
+anything, was given up by no longer padding.
+
+A per-chunk MFA failure (timeout, bad exit, a discarded out-of-sequence
+result) is NOT fatal to the whole segment the way it was before chunking —
+it degrades just that chunk's words to stage 1 timing and moves on to the
+next chunk, via the same _interpolate_stage2_words() path a chunk with no
+alignable text already falls through today. alignment.mfa.fallback_to_whisperx
+still controls the coarser, whole-segment case (MFA fundamentally unusable
+right now — no conda, models not downloaded, G2P grapheme lookup failing —
+see align_with_mfa()'s early checks): those are environment problems every
+chunk would hit identically, so there's no reason to pay for N failed
+attempts before giving up, and that setting's meaning is unchanged from
+before chunking.
 
 WHAT THIS FIXES vs. WHAT IT DOESN'T:
 MFA can only place words that WhisperX's transcribe() pass already
@@ -79,16 +230,16 @@ import json
 import logging
 import os
 import re
-import shutil
 import string
 import subprocess
 import tempfile
 import difflib
 import math
+import time
 from pathlib import Path
 from typing import Optional
 
-from utils import cfg_get
+from utils import cfg_get, run_cmd
 
 
 class MFAError(RuntimeError):
@@ -197,7 +348,10 @@ def _ensure_mfa_ready(acoustic_model: str, dictionary: str, g2p_model: Optional[
         root,
     )
 
-    proc = subprocess.run(_mfa_cmd("server", "init"), capture_output=True, text=True, timeout=300)
+    try:
+        proc = subprocess.run(_mfa_cmd("server", "init"), capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        raise MFAError("mfa server init did not finish within 300s.")
     if proc.returncode != 0:
         raise MFAError(
             f"mfa server init failed (exit {proc.returncode}).\n"
@@ -217,10 +371,13 @@ def _ensure_mfa_ready(acoustic_model: str, dictionary: str, g2p_model: Optional[
     ):
         if not name:
             continue
-        proc = subprocess.run(
-            _mfa_cmd("model", "download", model_type, name),
-            capture_output=True, text=True, timeout=1800,
-        )
+        try:
+            proc = subprocess.run(
+                _mfa_cmd("model", "download", model_type, name),
+                capture_output=True, text=True, timeout=1800,
+            )
+        except subprocess.TimeoutExpired:
+            raise MFAError(f"mfa model download {model_type} {name} did not finish within 1800s.")
         if proc.returncode != 0:
             raise MFAError(
                 f"mfa model download {model_type} {name} failed "
@@ -234,6 +391,7 @@ def _ensure_mfa_ready(acoustic_model: str, dictionary: str, g2p_model: Optional[
 
 def align_with_mfa(
     dialog_wav: Path,
+    dialog_duration_sec: float,
     whisper_segments: list[dict],
     whisperx_words: list[dict],
     cfg: dict,
@@ -246,11 +404,20 @@ def align_with_mfa(
     whisperx.align() produces in transcribe.py — a drop-in replacement at
     that call site, not a new data shape downstream needs to know about.
 
+    dialog_duration_sec — this job-segment's own duration, i.e. what
+        transcribe.py already computed as dur_sec for its own log line at
+        this segment's call site. Needed here only to clamp padded chunk
+        slices to a valid range (see CHUNKING below); not re-probed from
+        dialog_wav itself since the caller already has it.
+
     whisper_segments — result["segments"] from wx_model.transcribe(), i.e.
         WhisperX's *pre-alignment* output: text (+ usually avg_logprob) per
-        internally-decoded chunk, no word-level breakdown yet. That
-        breakdown is exactly what this function produces, via MFA instead
-        of whisperx.align().
+        internally-decoded chunk, no word-level breakdown yet, PLUS that
+        chunk's own (WhisperX-claimed, not-fully-trusted) start/end — used
+        here only to decide how to group chunks and how wide a search
+        window to hand MFA, never as the actual final timing for anything;
+        see CHUNKING below and this module's own docstring for why that
+        distinction matters.
 
     whisperx_words — transcribe.py's own stage_words[1]: whisperx.align()'s
         per-word output for this SAME segment (same words, same order —
@@ -264,16 +431,28 @@ def align_with_mfa(
         module's own docstring for why word text never comes from MFA at
         all, at any stage.
 
-    Raises MFAError if alignment fails and
-    alignment.mfa.fallback_to_whisperx is false. If true (the default),
-    the caller (transcribe.py) is expected to catch MFAError and retry that
-    segment through the whisperx.align() path instead — this function
-    itself does not know how to do that fallback, since it has no access to
-    the whisperx align model/metadata transcribe.py is holding. Note this
-    is about the MFA *subprocess* failing outright (bad G2P composition,
-    a crash, etc.) — a segment that runs fine but can't be confidently
-    reconciled word-for-word does NOT raise this; see
-    _confident_mfa_anchors() for why that's a different, non-fatal case.
+    CHUNKING: rather than one align_one call for this whole (typically
+    ~30-minute) job-segment, this runs one call per short chunk of
+    consecutive whisper_segments (_build_alignment_chunks(),
+    alignment.mfa.chunk_target_sec) — see this module's own docstring for
+    why, and for the padding + cross-chunk monotonicity check that keeps
+    this from silently reintroducing a dependency on WhisperX's own
+    (sometimes drift-affected) segment timestamps. A single chunk's MFA
+    call failing — timeout, bad exit, or a result discarded by the
+    monotonicity check — degrades only that chunk's words to stage 1
+    (WhisperX) timing and continues with the rest; it does not raise and
+    does not affect any other chunk. See _align_chunk()'s own docstring.
+
+    Raises MFAError only for problems that would affect every chunk
+    identically — no conda install, MFA's models/database not ready, the
+    G2P model's grapheme set unreadable — checked once, up front, before
+    any chunk is attempted, since there would be no point discovering the
+    same environment problem N times over. If
+    alignment.mfa.fallback_to_whisperx is true (the default), the caller
+    (transcribe.py) is expected to catch MFAError and retry this segment
+    through the whisperx.align() path entirely instead — this function
+    itself does not know how to do that fallback, since it has no access
+    to the whisperx align model/metadata transcribe.py is holding.
     """
     if not whisper_segments:
         return []
@@ -289,13 +468,18 @@ def align_with_mfa(
     g2p_model      = cfg_get(cfg, "alignment", "mfa", "g2p_model", allow_null=True)
     beam           = int(cfg_get(cfg, "alignment", "mfa", "beam"))
     retry_beam     = int(cfg_get(cfg, "alignment", "mfa", "retry_beam"))
+    fallback_allowed = bool(cfg_get(cfg, "alignment", "mfa", "fallback_to_whisperx"))
+    chunk_target_sec = float(cfg_get(cfg, "alignment", "mfa", "chunk_target_sec"))
+    chunk_edge_margin_sec = float(cfg_get(cfg, "alignment", "mfa", "chunk_edge_margin_sec"))
+    chunk_timeout_sec    = float(cfg_get(cfg, "alignment", "mfa", "chunk_timeout_sec"))
 
     # Checked here, before _ensure_mfa_ready() (which is otherwise the first
-    # thing to shell out) rather than only right before the align_one call
-    # below -- a missing conda install should fail once, fast, with this
-    # specific message. Left where it was, it wouldn't fire until after
-    # _ensure_mfa_ready() had already tried and failed to run `conda run ...`
-    # itself, surfacing as a much less clear raw FileNotFoundError instead.
+    # thing to shell out) rather than only right before the first align_one
+    # call -- a missing conda install should fail once, fast, with this
+    # specific message, before any chunk is even built. Left where it was,
+    # it wouldn't fire until after _ensure_mfa_ready() had already tried and
+    # failed to run `conda run ...` itself, surfacing as a much less clear
+    # raw FileNotFoundError instead.
     conda_exe = os.environ.get("MFA_CONDA_EXE", "/opt/conda/bin/conda")
     if not Path(conda_exe).exists():
         raise MFAError(
@@ -318,43 +502,7 @@ def align_with_mfa(
     graphemes = _get_g2p_graphemes(g2p_model, log) if g2p_model else None
 
     whisper_words, whisper_scores = _flatten_whisper_words(whisper_segments)
-
-    # See _sanitize_for_mfa()'s docstring for why this exists: align_one's
-    # own text-tokenization path has no equivalent of it, so an un-sanitized
-    # word (capital letters, attached punctuation, a stray digit or symbol,
-    # or -- as it turned out -- even a plain apostrophe/hyphen, if the real
-    # model's alphabet doesn't include them) can crash G2P and take the
-    # entire segment down. whisper_words itself is left untouched -- it's
-    # always whisper_words' own text that ends up in transcript.json, at
-    # every position, anchored or interpolated alike (see
-    # _interpolate_stage2_words()); this sanitized copy exists purely to
-    # ask MFA where things are, never what they are.
-    #
-    # origin_index[k] records which position in whisper_words produced
-    # mfa_input_words[k] -- sanitization drops some words outright (see
-    # _sanitize_for_mfa()'s docstring: numerals, foreign words outside the
-    # G2P model's grapheme set, tokens over _MAX_MFA_TOKEN_LEN, ...), so the
-    # two lists aren't always the same length and a plain positional zip
-    # isn't safe. Tracking the real correspondence here, once, is what lets
-    # _confident_mfa_anchors() below map MFA's output back onto WhisperX's
-    # original word positions by direct index in the common case, and what
-    # lets _interpolate_stage2_words() translate its anchors from
-    # mfa_input_words-space back into whisper_words-space afterward.
-    mfa_input_words: list[str] = []
-    origin_index: list[int] = []
-    for i, w in enumerate(whisper_words):
-        s = _sanitize_for_mfa(w, graphemes)
-        if s:
-            mfa_input_words.append(s)
-            origin_index.append(i)
-    if not mfa_input_words:
-        raise MFAError(
-            "no alignable text remained after sanitizing for MFA's input "
-            "alphabet -- every recognized word in this segment fell outside "
-            "the G2P model's own grapheme set. Falling back to "
-            "whisperx.align() for this segment."
-        )
-    transcript_text = " ".join(mfa_input_words)
+    chunks = _build_alignment_chunks(whisper_segments, chunk_target_sec, log)
 
     tmp_ctx = None
     if work_dir is None:
@@ -362,107 +510,102 @@ def align_with_mfa(
         work_dir = Path(tmp_ctx.name)
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    # Same roles origin_index/anchors played before chunking existed --
+    # origin_index[k] is still "which whisper_words position produced the
+    # k'th sanitized token sent to MFA", anchors is still keyed the same
+    # way -- just built up across many chunks' own local versions of both
+    # instead of in one pass, so _interpolate_stage2_words() below needs no
+    # changes at all: from where it sits, this looks exactly like it did
+    # before chunking, just assembled differently.
+    origin_index: list[int] = []
+    anchors: dict[int, tuple[float, float]] = {}
+    word_offset = 0        # whisper_words consumed by chunks processed so far
+    mfa_word_offset = 0    # sanitized tokens sent to MFA by chunks so far
+    last_accepted_end = 0.0
+    n_ok = n_degraded = n_rejected = 0
+    t_start = time.monotonic()
+
     try:
-        wav_in  = work_dir / "utt.wav"
-        txt_in  = work_dir / "utt.txt"
-        out_dir = work_dir / "out"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        # Passed as the exact target FILE path, not a bare directory --
-        # align_one handles exactly one input, unlike corpus-mode `align`
-        # (which needs a directory since it's writing one file per input
-        # across many). A previous version of this passed just out_dir and
-        # assumed align_one would place a conventionally-named file inside
-        # it, matching `align`'s own convention -- that assumption produced
-        # "MFA reported success but no .TextGrid found", confirmed against
-        # a real run where align_one's exit code was 0 (a real success,
-        # not one of the earlier root/PATH/passwd failures) but nothing
-        # existed at the path this code was looking in. This is the more
-        # likely correct reading of OUTPUT_PATH for a single-utterance
-        # command, not a confirmed one -- see _find_output_textgrid's
-        # fallback search and the error it raises if this guess is ALSO
-        # wrong; that error is now rich enough to settle it either way
-        # from one more run, rather than needing a third guess blind.
-        tg_target = out_dir / f"{wav_in.stem}.TextGrid"
-        _prepare_input_pair(dialog_wav, transcript_text, wav_in, txt_in)
+        for c_idx, chunk_segments in enumerate(chunks):
+            c_start = chunk_segments[0].get("start")
+            c_end = chunk_segments[-1].get("end")
+            if c_start is None or c_end is None:
+                # _build_alignment_chunks() only produces this when start/end
+                # were missing for the WHOLE segment (see its own docstring)
+                # -- reduces to the pre-chunking whole-file behaviour.
+                slice_start, slice_end = 0.0, dialog_duration_sec
+                label = f"chunk {c_idx + 1}/{len(chunks)}"
+            else:
+                slice_start = max(0.0, c_start - chunk_edge_margin_sec)
+                slice_end = min(dialog_duration_sec, c_end + chunk_edge_margin_sec)
+                label = f"chunk {c_idx + 1}/{len(chunks)} [{c_start:.1f}s-{c_end:.1f}s]"
 
-        # Two attempts, not one: _sanitize_for_mfa() now drops (rather than
-        # partially mangles) any word with a character outside the G2P
-        # model's real alphabet -- see that function's docstring for the
-        # concrete case that caught (genuine foreign-language dialogue,
-        # confirmed against a real transcript, not a hypothetical). But a
-        # word can be built *entirely* from valid characters and still be
-        # a novel-enough grapheme sequence for the compiled FST to fail on
-        # -- an irreducible risk of any G2P system, which is exactly why
-        # MFA's own batch tooling (PyniniGenerator.generate_pronunciations)
-        # wraps its rewriter call in try/except rewrite.Error and just
-        # skips that one word, rather than assuming sanitization alone
-        # makes success guaranteed. align_one has no such per-word net, so
-        # if this still happens, retry the whole segment once with G2P
-        # switched off entirely (dictionary + <unk> for genuine OOV words,
-        # already a case _parse_textgrid_words() handles) before paying the
-        # much larger cost of losing MFA's whole-file alignment altogether
-        # to the whisperx.align() fallback for this segment.
-        attempts = [("with G2P", g2p_model)] if g2p_model else [("dictionary-only", None)]
-        if g2p_model:
-            attempts.append(("dictionary-only retry (G2P disabled)", None))
-
-        proc = None
-        for attempt_label, attempt_g2p_model in attempts:
-            if tg_target.exists():
-                tg_target.unlink()
-            cmd = _mfa_cmd(
-                "align_one",
-                str(wav_in), str(txt_in), dictionary, acoustic_model, str(tg_target),
-                "--beam", str(beam),
-                "--retry_beam", str(retry_beam),
-                "--clean",
-                "--single_speaker",
-            )
-            if attempt_g2p_model:
-                cmd += ["--g2p_model_path", attempt_g2p_model]
-
-            log.debug("    MFA (%s): %s", attempt_label, " ".join(cmd))
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-            if proc.returncode == 0:
-                break
-            if "Composition failure" not in proc.stderr:
-                break  # a different failure (e.g. beam size) -- retrying without G2P won't help
-            log.warning(
-                "    MFA G2P composition failure surviving sanitization on %s "
-                "(%s) -- retrying this segment with G2P disabled before "
-                "falling back to whisperx.align().",
-                dialog_wav.name, attempt_label,
+            local_words, local_origin, local_anchors = _align_chunk(
+                dialog_wav, chunk_segments, slice_start, slice_end,
+                dictionary, acoustic_model, g2p_model, graphemes,
+                beam, retry_beam, chunk_timeout_sec, fallback_allowed,
+                work_dir / f"chunk_{c_idx:04d}", label, log,
             )
 
-        if proc.returncode != 0:
-            hint = ""
-            if "Composition failure" in proc.stderr:
-                # However this got here, it survived BOTH sanitization and
-                # the dictionary-only retry above -- i.e. it happened on the
-                # dictionary-only attempt itself, which doesn't call G2P at
-                # all. That points at something other than a bad OOV word
-                # entirely (a corrupt/mismatched dictionary file, most
-                # likely) -- worth a fresh look rather than assuming this
-                # is the same class of problem again.
-                hint = (
-                    " (G2P composition failure that persisted even on the "
-                    "dictionary-only retry with G2P disabled -- see the "
-                    "comment just above this one in align_mfa.py; this "
-                    "suggests something other than a single bad OOV word.)"
+            if local_anchors:
+                # See this module's docstring for why this check exists and
+                # what it's specifically defending against: a chunk whose
+                # audio slice, despite generous padding, still ended up
+                # containing the wrong stretch of dialogue -- MFA will
+                # confidently fit the given text somewhere in whatever
+                # it's given, so a clean exit code alone doesn't rule that
+                # out. Genuinely correct neighbouring chunks should show
+                # negligible overlap regardless of how much padding either
+                # one has, since MFA fits the given text to its best span
+                # rather than spreading it across all the room on offer.
+                chunk_min_start = min(s for s, _ in local_anchors.values())
+                if chunk_min_start < last_accepted_end - _CHUNK_OVERLAP_TOLERANCE_SEC:
+                    log.warning(
+                        "  %s: MFA anchors land %.1fs before the previous "
+                        "chunk's own anchors ended -- discarding as an "
+                        "implausible result (likely a mis-slice, not a real "
+                        "alignment); this chunk's words will use stage 1 "
+                        "(WhisperX) timing instead.",
+                        label, last_accepted_end - chunk_min_start,
+                    )
+                    local_anchors = {}
+                    n_rejected += 1
+                else:
+                    last_accepted_end = max(last_accepted_end, max(e for _, e in local_anchors.values()))
+                    n_ok += 1
+            elif local_origin:
+                n_degraded += 1
+            # else: chunk had no alignable text at all -- not a failure,
+            # nothing to count (see _align_chunk()'s docstring).
+
+            origin_index.extend(word_offset + i for i in local_origin)
+            for k, (s, e) in local_anchors.items():
+                anchors[mfa_word_offset + k] = (s, e)
+            word_offset += len(local_words)
+            mfa_word_offset += len(local_origin)
+
+            if (c_idx + 1) % 10 == 0 or c_idx == len(chunks) - 1:
+                log.info(
+                    "    MFA: %d/%d chunk(s) done (%d ok, %d degraded, %d "
+                    "rejected), %.1fs elapsed.",
+                    c_idx + 1, len(chunks), n_ok, n_degraded, n_rejected,
+                    time.monotonic() - t_start,
                 )
-            raise MFAError(
-                f"mfa align_one exited {proc.returncode} on {dialog_wav.name}:"
-                f"{hint} {proc.stderr.strip()[-2000:]}"
-            )
-
-        textgrid_path = _find_output_textgrid(out_dir, tg_target, wav_in.stem, proc, work_dir)
-        mfa_words = _parse_textgrid_words(textgrid_path)
-
     finally:
         if tmp_ctx is not None:
             tmp_ctx.cleanup()
 
-    anchors = _confident_mfa_anchors(mfa_input_words, mfa_words, log)
+    if chunks and n_ok == 0:
+        log.warning(
+            "    MFA anchored nothing at all for %s across %d chunk(s) -- "
+            "this segment's timing will be entirely stage 1 (WhisperX). "
+            "Not raised as a failure (fallback_to_whisperx's whole-segment "
+            "meaning is unchanged, but a zero-anchor result already "
+            "degrades safely through the same interpolation path a partial "
+            "one does -- see this module's docstring).",
+            dialog_wav.name, len(chunks),
+        )
+
     words = _interpolate_stage2_words(
         whisper_words, whisper_scores, whisperx_words, origin_index, anchors, log,
     )
@@ -491,6 +634,23 @@ _TYPOGRAPHIC_TO_ASCII = str.maketrans({
 # cheap to detect, and not a real word MFA could ever place correctly
 # regardless of sanitization.
 _MAX_MFA_TOKEN_LEN = 20
+
+# How far a chunk's earliest MFA anchor is allowed to land before the
+# previous chunk's own accepted anchors ended, on dialog_wav's shared
+# absolute timeline, before align_with_mfa() discards the whole chunk as
+# an implausible (likely mis-sliced) result rather than trusting it -- see
+# that function's own comment at the check itself, and this module's
+# docstring, for what this is specifically defending against. Deliberately
+# generous relative to normal word-boundary jitter (sub-second) and even
+# genuinely overlapping dialogue between two speakers (low single-digit
+# seconds at most) -- a real mis-slice, per the drift magnitudes
+# docs/timestamp-drift-investigation.md observed directly, should miss by
+# much more than this, not hover right at the edge of it. An internal
+# tuning constant rather than a config.yaml knob: unlike chunk_target_sec
+# or the padding amounts, there's no real-world signal (audio length,
+# observed drift range) a person configuring this pipeline would use to
+# pick a different value for their own library.
+_CHUNK_OVERLAP_TOLERANCE_SEC = 3.0
 
 # Only used as a last resort when no g2p_model is configured at all (see
 # _sanitize_for_mfa()) -- there's no model to ask for a real grapheme set
@@ -687,25 +847,292 @@ def _flatten_whisper_words(whisper_segments: list[dict]) -> tuple[list[str], lis
     return words, scores
 
 
-def _prepare_input_pair(dialog_wav: Path, transcript_text: str, wav_out: Path, txt_out: Path) -> None:
+def _build_alignment_chunks(
+    whisper_segments: list[dict], chunk_target_sec: float, log: logging.LoggerAdapter,
+) -> list[list[dict]]:
     """
-    mfa align_one takes exactly one sound file + one text file — no corpus
-    directory/speaker-folder structure needed (that's `mfa align`, for
-    multi-file datasets; see docs/timestamp-drift-investigation.md for why
-    align_one is the right subcommand here, not align).
+    Group whisper_segments into runs no longer than chunk_target_sec,
+    splitting only BETWEEN segments, never within one -- so every chunk
+    boundary this produces falls exactly where WhisperX's own segmentation
+    already found a natural break, without this function needing any
+    VAD/silence logic of its own. This decides how to group the TEXT only;
+    see align_with_mfa() and this module's docstring for why the AUDIO
+    each chunk is actually aligned against is deliberately not a tight
+    slice at these same boundaries.
+
+    Defensive fallback: whisper_segments are expected to carry "start" and
+    "end" (standard Whisper/WhisperX segment fields; this codebase has
+    just never had a reason to read them before now, since the whole-file
+    design didn't need them) -- but that's never been directly confirmed
+    against every whisperx version this pipeline might run against, the
+    way e.g. avg_logprob's presence is discussed in
+    _flatten_whisper_words()'s own docstring. If ANY segment is missing
+    either one, this doesn't guess -- it logs once and returns everything
+    as a single chunk, i.e. exactly the pre-chunking whole-segment
+    behaviour, rather than silently mis-grouping some segments correctly
+    and others not.
     """
-    shutil.copy(dialog_wav, wav_out)
-    txt_out.write_text(transcript_text, encoding="utf-8")
+    if any(seg.get("start") is None or seg.get("end") is None for seg in whisper_segments):
+        log.warning(
+            "    whisper_segments missing start/end on at least one entry -- "
+            "can't chunk by natural boundaries safely, sending this whole "
+            "segment to MFA as one chunk (the pre-chunking behaviour). If "
+            "this shows up routinely, check what your installed whisperx "
+            "version's transcribe() actually returns per segment."
+        )
+        return [list(whisper_segments)]
+
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    current_start = 0.0
+    for seg in whisper_segments:
+        if not current:
+            current = [seg]
+            current_start = seg["start"]
+        elif seg["end"] - current_start <= chunk_target_sec:
+            current.append(seg)
+        else:
+            chunks.append(current)
+            current = [seg]
+            current_start = seg["start"]
+    if current:
+        chunks.append(current)
+
+    oversized = [c for c in chunks if len(c) == 1 and c[0]["end"] - c[0]["start"] > chunk_target_sec]
+    if oversized:
+        longest = max(c[0]["end"] - c[0]["start"] for c in oversized)
+        log.warning(
+            "    %d whisper segment(s) individually exceed the %.0fs MFA "
+            "chunk target and couldn't be split further (no word-level "
+            "timing exists yet to split on) -- sent to MFA as their own, "
+            "larger-than-usual chunk. Longest: %.1fs.",
+            len(oversized), chunk_target_sec, longest,
+        )
+    return chunks
+
+
+def _slice_wav(src: Path, start_sec: float, end_sec: float, out: Path, log: logging.LoggerAdapter) -> None:
+    """
+    Extract [start_sec, end_sec) from src into out. Same approach and same
+    reasoning as steps/segment.py's own _split(): -ss before -i for fast,
+    exact input-side seeking on PCM WAV, -c copy since no re-encoding is
+    needed or wanted -- MFA gets exactly dialog_wav's own sample
+    rate/channel layout, just a short span of it (a chunk's own claimed
+    boundaries plus a small fixed edge margin -- see align_with_mfa() and
+    this module's docstring for why that margin is small and fixed rather
+    than a generous, searched window).
+    """
+    run_cmd([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", str(start_sec),
+        "-i", str(src),
+        "-t", str(max(end_sec - start_sec, 0.0)),
+        "-c", "copy",
+        str(out),
+    ], log)
+
+
+def _align_chunk(
+    dialog_wav: Path,
+    chunk_segments: list[dict],
+    slice_start: float,
+    slice_end: float,
+    dictionary: str,
+    acoustic_model: str,
+    g2p_model: Optional[str],
+    graphemes: Optional[frozenset[str]],
+    beam: int,
+    retry_beam: int,
+    timeout_sec: float,
+    fallback_allowed: bool,
+    chunk_dir: Path,
+    label: str,
+    log: logging.LoggerAdapter,
+) -> tuple[list[str], list[int], dict[int, tuple[float, float]]]:
+    """
+    Run one chunk's worth of alignment: sanitize its own text, slice
+    [slice_start, slice_end) of dialog_wav, invoke align_one, parse and
+    reconcile the result -- everything align_with_mfa() used to do once
+    for a whole segment, scoped to one chunk instead.
+
+    slice_start/slice_end are the chunk's own claimed boundaries plus a
+    small, fixed edge margin (alignment.mfa.chunk_edge_margin_sec) -- NOT
+    a generously padded search window. Two earlier versions of this tried
+    generous padding, once handed to align_one directly and once trimmed
+    first via real silence detection; both were validated against real
+    audio and found to make timing worse than plain whisperx.align(), via
+    two DIFFERENT mechanisms (a chunk's last word smeared across trailing
+    padding; a chunk's search window reaching past its real content into
+    unrelated preceding audio with no clean silence gap to stop it). See
+    this module's own docstring for the full account of both. A chunk
+    affected by genuine WhisperX timestamp drift will generally fail to
+    align in this tight a window -- and correctly degrade to stage 1
+    (WhisperX) timing for its own words via the same non-fatal path any
+    other per-chunk failure uses, rather than risk a confidently-wrong
+    result from a window generous enough to search but not sure what it
+    might find.
+
+    Returns (local_words, local_origin_index, local_anchors):
+      local_words        -- this chunk's own flattened word tokens, in
+                             order (_flatten_whisper_words(chunk_segments)).
+      local_origin_index -- local_origin_index[k] is the position in
+                             local_words that the k'th sanitized,
+                             sent-to-MFA token came from -- same role
+                             align_with_mfa()'s own origin_index used to
+                             play for the whole segment, scoped to this
+                             chunk; the caller shifts these into global
+                             whisper_words-space.
+      local_anchors       -- {k: (start, end)}, keyed the same way as
+                              local_origin_index. start/end are already
+                              converted to dialog_wav's own absolute
+                              timeline (slice_start already added back in
+                              -- the caller does NOT need to offset these
+                              again, only re-key them into the global
+                              mfa_input_words-position space). Empty ({})
+                              whenever this chunk contributed nothing --
+                              no alignable text, or align_one's own
+                              attempts were all exhausted and
+                              fallback_allowed is true -- which is not an
+                              error: a position with no anchor already
+                              means "use stage 1 timing here" regardless
+                              of WHY it has none, so a degraded chunk needs
+                              no separate signal beyond an empty dict.
+
+    Raises MFAError only when fallback_allowed is False and this chunk's
+    own align_one attempts were all exhausted -- i.e. only when config
+    says a chunk-level failure should be fatal rather than degrade to
+    stage 1 timing for just this chunk's words. Never raises for "chunk
+    had no alignable text" -- MFA was never going to be asked to do
+    anything for zero input, so there's nothing that failed.
+    """
+    local_words, _local_scores = _flatten_whisper_words(chunk_segments)
+
+    local_mfa_input_words: list[str] = []
+    local_origin_index: list[int] = []
+    for i, w in enumerate(local_words):
+        s = _sanitize_for_mfa(w, graphemes)
+        if s:
+            local_mfa_input_words.append(s)
+            local_origin_index.append(i)
+    if not local_mfa_input_words:
+        log.debug("    %s: no alignable text after sanitizing -- skipped.", label)
+        return local_words, local_origin_index, {}
+
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    wav_in = chunk_dir / "utt.wav"
+    txt_in = chunk_dir / "utt.txt"
+    out_dir = chunk_dir / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # See _find_output_textgrid()'s own docstring for why this exact path,
+    # not just out_dir, is passed as align_one's OUTPUT_PATH -- unchanged
+    # reasoning from before chunking, just per-chunk now.
+    tg_target = out_dir / f"{wav_in.stem}.TextGrid"
+
+    _slice_wav(dialog_wav, slice_start, slice_end, wav_in, log)
+    txt_in.write_text(" ".join(local_mfa_input_words), encoding="utf-8")
+
+    # Same two-attempt shape align_with_mfa() used before chunking (see
+    # git history for that version) -- G2P first if configured, one
+    # dictionary-only retry on a Composition failure. A timeout is now
+    # ALSO treated as retry-worthy rather than an immediately-fatal,
+    # uncaught subprocess.TimeoutExpired: a timeout doesn't tell us WHY a
+    # chunk was slow, and disabling G2P is a real (if not guaranteed) way
+    # a retry could come in faster, at the bounded cost of at most one
+    # more timeout_sec before giving up on this one chunk.
+    attempts = [("with G2P", g2p_model)] if g2p_model else [("dictionary-only", None)]
+    if g2p_model:
+        attempts.append(("dictionary-only retry (G2P disabled)", None))
+
+    returncode: Optional[int] = None
+    stdout = stderr = ""
+    timed_out = False
+    for attempt_label, attempt_g2p_model in attempts:
+        if tg_target.exists():
+            tg_target.unlink()
+        cmd = _mfa_cmd(
+            "align_one",
+            str(wav_in), str(txt_in), dictionary, acoustic_model, str(tg_target),
+            "--beam", str(beam),
+            "--retry_beam", str(retry_beam),
+            "--clean",
+            "--single_speaker",
+        )
+        if attempt_g2p_model:
+            cmd += ["--g2p_model_path", attempt_g2p_model]
+
+        log.debug("    MFA (%s, %s): %s", label, attempt_label, " ".join(cmd))
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            returncode, stdout, stderr, timed_out = proc.returncode, proc.stdout, proc.stderr, False
+        except subprocess.TimeoutExpired:
+            returncode, stdout, stderr, timed_out = None, "", "", True
+
+        if returncode == 0:
+            break
+        if not timed_out and "Composition failure" not in stderr:
+            break  # a different, non-G2P failure -- retrying without G2P won't help
+        if timed_out:
+            log.debug(
+                "    %s: %s attempt didn't finish within %.0fs.",
+                label, attempt_label, timeout_sec,
+            )
+        else:
+            log.warning(
+                "    %s: MFA G2P composition failure surviving sanitization "
+                "(%s) -- retrying with G2P disabled.", label, attempt_label,
+            )
+
+    if returncode != 0:
+        if timed_out:
+            reason = f"align_one did not finish within {timeout_sec:.0f}s (alignment.mfa.chunk_timeout_sec)"
+        else:
+            hint = ""
+            if "Composition failure" in stderr:
+                hint = (
+                    " (G2P composition failure that persisted even on the "
+                    "dictionary-only retry with G2P disabled -- suggests "
+                    "something other than a single bad OOV word.)"
+                )
+            reason = f"align_one exited {returncode}:{hint} {stderr.strip()[-1000:]}"
+        if not fallback_allowed:
+            raise MFAError(f"{label}: {reason}")
+        log.warning(
+            "  %s: MFA alignment failed -- this chunk's words will use "
+            "stage 1 (WhisperX) timing instead. Reason: %s", label, reason,
+        )
+        return local_words, local_origin_index, {}
+
+    try:
+        textgrid_path = _find_output_textgrid(out_dir, tg_target, wav_in.stem, stdout, stderr, chunk_dir)
+        mfa_words = _parse_textgrid_words(textgrid_path)
+    except MFAError as exc:
+        if not fallback_allowed:
+            raise
+        log.warning(
+            "  %s: %s -- this chunk's words will use stage 1 (WhisperX) "
+            "timing instead.", label, exc,
+        )
+        return local_words, local_origin_index, {}
+
+    local_anchors_relative = _confident_mfa_anchors(local_mfa_input_words, mfa_words, log)
+    # +slice_start here, once, is what lets the caller treat every chunk's
+    # anchors as already being on dialog_wav's own shared absolute
+    # timeline -- see this function's own docstring.
+    local_anchors = {k: (s + slice_start, e + slice_start) for k, (s, e) in local_anchors_relative.items()}
+    return local_words, local_origin_index, local_anchors
 
 
 def _find_output_textgrid(
-    out_dir: Path, tg_target: Path, stem: str, proc: "subprocess.CompletedProcess", work_dir: Path,
+    out_dir: Path, tg_target: Path, stem: str, stdout: str, stderr: str, work_dir: Path,
 ) -> Path:
     """
     Locate align_one's output TextGrid, without full confidence about
     exactly where a given MFA version puts it for a single-utterance call
-    (see the comment at this function's call site for why). Checked in
-    order, most-likely-correct first:
+    (see the comment at this function's call site for why). stdout/stderr
+    are passed as plain strings rather than a CompletedProcess so this can
+    be called uniformly regardless of whether the caller has a real
+    subprocess.CompletedProcess to hand it (a timed-out attempt never
+    produces one at all). Checked in order, most-likely-correct first:
 
       1. tg_target -- the exact file path passed as align_one's own
          OUTPUT_PATH argument, on the theory that it's read as a literal
@@ -744,8 +1171,8 @@ def _find_output_textgrid(
     raise MFAError(
         f"align_one exited 0 (reported success) but no .TextGrid was found at the "
         f"expected path ({tg_target}) or anywhere under {out_dir} or {work_dir}.\n"
-        f"align_one's own stdout (tail):\n{proc.stdout.strip()[-2000:]}\n"
-        f"align_one's own stderr (tail):\n{proc.stderr.strip()[-2000:]}\n"
+        f"align_one's own stdout (tail):\n{stdout.strip()[-2000:]}\n"
+        f"align_one's own stderr (tail):\n{stderr.strip()[-2000:]}\n"
         f"Contents of {work_dir}:\n{_listing(work_dir)}"
     )
 

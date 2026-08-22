@@ -86,20 +86,52 @@ alignment:
   #              this version, after whisperx.align() was found to silently
   #              drift several seconds following a segment WhisperX's own
   #              transcribe() pass mis-timed internally (full case history
-  #              in docs/timestamp-drift-investigation.md). MFA aligns the
-  #              *entire* audio handed to it against the *entire* recognized
-  #              text in one pass — it isn't scoped to WhisperX's internal
-  #              ~30s decode chunks at all, so it can't inherit a
-  #              chunk-boundary timing error the way whisperx.align() can.
-  #              Validated directly against Independence Day (1996), not
-  #              just reasoned about: of the 17 individually-confirmed
-  #              drift cases from the original investigation, 14 landed
-  #              correctly once MFA actually ran end-to-end; SRT-line
-  #              coverage went from 90 fully-missed lines (whisperx) to 11
-  #              (mfa) on the same film. See that doc for what's still
-  #              unresolved — it's a WhisperX *recognition* gap on densely
-  #              repetitive dialogue, not an alignment problem, and no
-  #              alignment backend fixes it on its own.
+  #              in docs/timestamp-drift-investigation.md). MFA is given
+  #              known text and searches for it in the audio it's handed —
+  #              it never trusts a WhisperX-reported timestamp to decide
+  #              WHERE to look, so it can't inherit a chunk-boundary timing
+  #              error the way whisperx.align() can.
+  #              Validated directly against Independence Day (1996) in its
+  #              original, whole-segment-per-call form, not just reasoned
+  #              about: of the 17 individually-confirmed drift cases from
+  #              the original investigation, 14 landed correctly once MFA
+  #              actually ran end-to-end; SRT-line coverage went from 90
+  #              fully-missed lines (whisperx) to 11 (mfa) on the same
+  #              film. See that doc for what's still unresolved — it's a
+  #              WhisperX *recognition* gap on densely repetitive dialogue,
+  #              not an alignment problem, and no alignment backend fixes
+  #              it on its own.
+  #              Now runs as many short chunks per segment instead (see
+  #              mfa.chunk_* below and steps/align_mfa.py's module
+  #              docstring for the full account) — a whole-segment call
+  #              could run past any reasonable timeout on hard content.
+  #              Getting the chunk boundaries right took three attempts,
+  #              the first two both confirmed (against real audio, not
+  #              just reasoned about) to make timing WORSE than plain
+  #              whisperx: padding each chunk's slice and handing it to
+  #              align_one directly made MFA smear a chunk's last word
+  #              across trailing silence (median offset vs. a reference
+  #              SRT went from 0.27s at stage 1 to 6.93s); trimming that
+  #              same padded window down via real silence detection first
+  #              fixed that specific mechanism but exposed a second one on
+  #              a different, shorter test file — the detected envelope
+  #              swept in unrelated audio from before the chunk's real
+  #              content when there wasn't a clean silence gap to stop at
+  #              (dense dialogue with little pause between lines). Both
+  #              attempts tried to search a generously padded window for a
+  #              chunk's real audio when WhisperX's claimed boundary might
+  #              be drift-affected; neither did so reliably. The current
+  #              version doesn't search at all — chunk_edge_margin_sec is
+  #              a small, fixed margin, not a search window, and a chunk
+  #              affected by genuine drift is expected to fail to align
+  #              and fall back to stage 1 timing for its own words rather
+  #              than risk a third, cleverer way to go looking for it.
+  #              That fix has NOT yet been re-validated against a real MFA
+  #              install; do that (Independence Day's 17 known cases AND
+  #              whatever shorter file exposed the second attempt's
+  #              failure, checking the resulting transcript's own
+  #              word-duration distribution directly, not just the
+  #              aggregate offset) before trusting this on a real library.
   #              Requires the `montreal-forced-aligner` conda package (see
   #              Dockerfile) — NOT pip-installable; it depends on `kalpy`
   #              (compiled Kaldi bindings), which conda-forge ships as a
@@ -170,25 +202,79 @@ alignment:
     # not something picked arbitrarily here -- but its docs are explicit
     # that those defaults target utterances under 30 seconds, and that
     # longer sequences need both raised, giving 400/1000 as its own
-    # example figure for "much longer sequences." Every segment this
-    # pipeline hands to `align_one` is an entire ~30-*minute* dialog
-    # segment treated as one utterance -- far past what 100/400 is tuned
-    # for, and confirmed directly against a real run: segment 5 of
-    # Independence Day failed with "Could not align the file with the
-    # current beam size (100), please try increasing the beam size."
-    # Widening trades alignment time for success rate (MFA's own
-    # documentation: "the higher the beam value, the slower alignment
-    # will be") -- if this value ever needs raising further, the error
-    # message reports whatever beam size actually failed, so retry_beam
-    # a few times that number is a reasonable next step, not a guess.
+    # example figure for "much longer sequences." These were raised to
+    # 400/1000 back when every call handed align_one an entire ~30-*minute*
+    # segment as one utterance -- confirmed directly against a real run:
+    # segment 5 of Independence Day failed at 100/400 with "Could not align
+    # the file with the current beam size (100), please try increasing the
+    # beam size," and widening fixed it (~24 minutes at 400/1000, the
+    # direct cost of the wider search per MFA's own docs: "the higher the
+    # beam value, the slower alignment will be").
+    # Now that chunk_target_sec below keeps each individual align_one call
+    # under MFA's own <30s sweet spot, these two are probably wider than
+    # needed and could likely come back down toward MFA's real defaults for
+    # a further speed win -- left at their proven-safe values for THIS
+    # release rather than changing two things (chunking AND beam) in the
+    # same pass with no way here to validate either in isolation. Worth
+    # trying lower once chunk timing is visible from a real run's logs
+    # (see the "N/M chunk(s) done" line align_with_mfa() now emits).
     beam: 400
     retry_beam: 1000
 
-    # If MFA fails outright on a segment (model/dictionary missing, the
-    # `mfa` binary not on PATH, a segment it can't align at all), fall back
-    # to the whisperx.align() path for that segment rather than failing the
-    # whole job. Logged clearly either way so a silent fallback is never
-    # actually silent in the logs.
+    # Target duration (seconds) for one align_one call. Chunks are built
+    # from consecutive whisper_segments (never splitting one) up to this
+    # length -- see steps/align_mfa.py's _build_alignment_chunks() and its
+    # module docstring for why chunking exists at all (a real job's
+    # segment ran past a 1800s subprocess timeout at the old
+    # one-call-per-segment design) and why staying under MFA's own
+    # documented ~30s-per-utterance guidance is "using it as intended"
+    # rather than the wide-beam workaround the paragraph above describes.
+    # Kept a little under MFA's own ~30s guidance to leave room for the
+    # padding below without every chunk's audio slice creeping much past
+    # it.
+    chunk_target_sec: 25
+
+    # Small, FIXED margin added on each side of a chunk's own claimed
+    # [start, end] before slicing -- just enough to not clip the very
+    # first/last phone of real speech at an imprecise boundary, nothing
+    # more. This is NOT a search window; nothing tries to find real audio
+    # beyond it. Two earlier, more generous designs were tried and both
+    # were confirmed (against real audio, not just reasoned about) to
+    # make timing worse than plain whisperx.align(), via two different
+    # mechanisms -- see steps/align_mfa.py's module docstring for the
+    # full account of both. A chunk affected by genuine WhisperX
+    # timestamp drift will generally fail to align in a window this
+    # tight, and correctly falls back to stage 1 (WhisperX) timing for
+    # its own words -- not a regression, exactly what those words would
+    # have had before MFA was introduced. That's a deliberate trade: MFA
+    # no longer attempts to rescue the small fraction of content (~1% in
+    # the original Independence Day count) affected by genuine drift,
+    # because both attempts at rescuing it corrupted a much larger
+    # fraction of otherwise-correct content instead.
+    chunk_edge_margin_sec: 0.3
+
+    # Per-CALL timeout, replacing the old flat 1800s that was sized for one
+    # call covering an entire ~30-minute segment. A chunk this small should
+    # finish in low single-digit seconds even at the beam widths above --
+    # this is deliberately much more generous than that expectation rather
+    # than tuned tight, since a chunk timing out just degrades that one
+    # chunk to stage 1 timing (see fallback_to_whisperx below) rather than
+    # failing anything, so there's little upside to shaving this down and
+    # real downside (a merely-slow-not-stuck chunk losing MFA's timing
+    # unnecessarily) to setting it too tight.
+    chunk_timeout_sec: 120
+
+    # If an individual chunk's own align_one attempts are all exhausted
+    # (bad exit, timeout, or its result discarded by the cross-chunk
+    # plausibility check in align_with_mfa() -- see that function and this
+    # module's docstring), fall back to whisperx.align()'s timing for just
+    # that chunk's words rather than failing the whole segment. Separately,
+    # this ALSO still controls the coarser, whole-segment case it always
+    # did -- MFA fundamentally unusable right now (no conda, models not
+    # downloaded, G2P grapheme lookup failing) -- since those are
+    # environment problems every chunk would hit identically, not a
+    # per-chunk content problem. Logged clearly either way so a silent
+    # fallback is never actually silent in the logs.
     fallback_to_whisperx: true
 
 

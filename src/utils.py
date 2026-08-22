@@ -604,11 +604,13 @@ def cfg_get(cfg: dict, *keys: str, default: Any = _UNSET, allow_null: bool = Fal
     return node
 
 
-# The one setting where an explicit `null` is a real value rather than
-# "missing" -- kept in sync with the one actual allow_null=True call site
-# (steps/transcribe.py), so validate_config() below checks each leaf the
+# The settings where an explicit `null` is a real value rather than
+# "missing" -- kept in sync with the actual allow_null=True call sites
+# (steps/transcribe.py's whisperx.language; steps/align_mfa.py's
+# alignment.mfa.g2p_model, to disable G2P fallback entirely and rely on
+# the dictionary alone), so validate_config() below checks each leaf the
 # same way its real reader will.
-_ALLOW_NULL_KEYS = {("whisperx", "language")}
+_ALLOW_NULL_KEYS = {("whisperx", "language"), ("alignment", "mfa", "g2p_model")}
 
 
 def validate_config(cfg: dict) -> None:
