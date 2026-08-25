@@ -90,6 +90,41 @@ RUN pip install --no-cache-dir \
         pyyaml \
         praatio
 
+# ── CrisperWhisper (stage 3, comparison-only, see config.yaml's own
+#    alignment.crisperwhisper and steps/transcribe_crisperwhisper.py) ───────
+# [ct2] extra, not [transformers]: this is crisperwhisper's own preferred
+# backend (its backend="auto" resolution tries ct2 first, falling back to
+# transformers only if ct2 isn't installed at all -- confirmed by reading
+# model.py's _resolve_backend() directly), typically faster on CPU (that's
+# CTranslate2's whole purpose -- it's the same engine faster-whisper above
+# is built on), and gives full float32 precision with no quality tradeoff
+# when compute_type is set explicitly (see config.yaml's own comment on
+# alignment.crisperwhisper.compute_type) -- confirmed by reading
+# converter.py: float32 is a first-class supported quantization option,
+# not a fallback/workaround.
+#
+# Real risk, confirmed rather than assumed: crisperwhisper[ct2] depends on
+# ctranslate2-crisperwhisper (a fork, confirmed against its actual PyPI
+# metadata) which installs under the SAME `import ctranslate2` name as the
+# plain ctranslate2 faster-whisper already pulled in above (confirmed by
+# reading engine.py's own `import ctranslate2` line) -- both write to
+# site-packages/ctranslate2/, so whichever installs LAST wins on disk.
+# Installed here, after faster-whisper above, specifically so the fork's
+# files win. If a future change to this Dockerfile's install order
+# accidentally reverses that: this does not fail silently. CrisperWhisper's
+# own CT2Engine calls a fail-fast check (_check_fork_apis()) immediately
+# after loading the ctranslate2 module and raises a clearly-named error if
+# the fork's required methods are missing -- confirmed by reading
+# engine.py directly -- so a wrong install order surfaces as a specific,
+# diagnosable exception at model-load time, not a silent quality problem.
+#
+# Model weights (downloaded at runtime, not here -- same lazy-init
+# reasoning as MFA's own models below) are under a non-commercial research
+# license, NOT MIT the way this inference code is -- see
+# steps/transcribe_crisperwhisper.py's own module docstring before
+# enabling alignment.crisperwhisper.enabled in config.yaml.
+RUN pip install --no-cache-dir "crisperwhisper[ct2]"
+
 # ── Montreal Forced Aligner (default alignment.backend, see config.yaml) ───
 # Used in place of whisperx.align() to fix a real, confirmed failure mode:
 # whisperx's wav2vec2/CTC aligner faithfully aligns words *within whatever
@@ -195,6 +230,10 @@ ENV MFA_CONDA_ENV=mfa
 ENV TORCH_HOME=/cache/torch
 # faster-whisper + wav2vec2 alignment models (via huggingface_hub) → /cache/huggingface
 ENV HF_HOME=/cache/huggingface
+# CrisperWhisper's own model weights are also HuggingFace-hosted (per its
+# repo), so this same HF_HOME should already cover them without a separate
+# entry here -- expected from how huggingface_hub resolves its cache dir
+# globally, not directly confirmed against a real download from this image.
 # NLTK punkt tokenizer (used by whisperx internally)
 ENV NLTK_DATA=/cache/nltk_data
 # Catch-all for any other XDG-respecting cache users

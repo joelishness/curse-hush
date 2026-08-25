@@ -1,84 +1,112 @@
-# MFA chunking, third pass — apply notes
+# CrisperWhisper stage 3 — apply notes
 
-Supersedes both previous `profanity-hush-mfa-chunking` deliveries. Applying
-this replaces the padding-and-search approach entirely — don't layer this on
-top of either previous version; it removes `_detect_speech_envelope()` and
-the `chunk_pad_before_sec`/`chunk_pad_after_sec`/`chunk_silence_noise_db`/
-`chunk_silence_min_dur_sec` config keys, replacing all of it with one small
-fixed margin.
+Adds `transcript_3_NN.json` as a third, **independently-sourced** transcript
+from a separately-trained model — not a re-timing of stages 1 (WhisperX) or
+2 (MFA) the way they re-time each other. Updated from an earlier version of
+this delivery: `alignment.backend` **can** be set to `"crisperwhisper"` (it
+was wrongly hard-blocked before), and the recommended backend is now `ct2`,
+not `transformers` — see both sections below for why.
 
-## What happened, plainly
+## Applying
 
-Two different attempts at generous, searched padding were each validated
-against real data and each found to make timing worse than plain
-`whisperx.align()` — via two *different* mechanisms:
+Same pattern as previous deliveries: `patches/*.patch` are unified diffs
+against the original upload; `src/`, `config/`, and `Dockerfile` here mirror
+your repo layout for direct copy. `tests/test_transcribe_crisperwhisper.py`
+is new — copy to your `tests/`. **This changes `Dockerfile`** — a real
+image rebuild is needed, not just a code drop-in.
 
-1. **Padding handed to `align_one` directly** — MFA smeared a chunk's last
-   word across trailing silence rather than stopping cleanly (one word
-   measured over 25 seconds). Median offset vs. a reference SRT: 0.27s
-   (stage 1) → 6.93s (stage 2).
-2. **Padding trimmed via real silence detection first** — fixed mechanism
-   #1, but on a shorter test file with denser dialogue, the detected
-   envelope reached ~3 seconds back into unrelated audio before the
-   chunk's real content, because there was no clean silence gap for
-   silence detection to stop at. One word's true 0.24s duration became
-   2.35s; another's true 0.70s became 2.02s.
+If you applied the earlier version of this delivery (`[transformers]`,
+comparison-only): this supersedes it. The Dockerfile now installs
+`crisperwhisper[ct2]` instead, and `alignment.backend: crisperwhisper` is
+now a valid, if optional, choice.
 
-Both failures trace to the same decision: searching a generously padded
-window and trusting whatever's found in it — MFA's own alignment search in
-the first case, real silence detection in the second — to reliably isolate
-just one chunk's real audio. Neither did, reliably, in two different ways.
+## Can `alignment.backend` be `crisperwhisper`? Yes — here's the real tradeoff
 
-## The fix this time: stop searching
+Stages 1 and 2 both re-time WhisperX's own recognized *text*, so falling
+from stage 2 to stage 1 changes only a segment's timing, never its words.
+Stage 3 transcribes independently, so its words can genuinely differ
+(casing, punctuation, verbatim disfluencies WhisperX's style doesn't
+capture). The pipeline's authoritative-resolution cascade turns out not to
+actually depend on shared text at the mechanism level, though — it just
+picks the highest-numbered stage that produced *any* data for a segment, it
+doesn't interpolate between stages word-by-word. So there's no structural
+reason to block the choice.
 
-`chunk_edge_margin_sec` (default `0.3`) replaces all four removed config
-keys. It's a small, **fixed** margin added to a chunk's own claimed
-`[start, end]` before slicing — not a search window, and nothing tries to
-find real audio beyond it. A chunk affected by genuine WhisperX drift will
-generally fail to align in a window this tight, and falls back to stage 1
-(WhisperX) timing for its own words — the same non-fatal path any other
-per-chunk failure already uses. That's not a regression: it's exactly the
-timing those words would have had before MFA was introduced.
+The real, narrower consequence: if stage 3 fails for one specific segment,
+that segment falls back to stage 2/1's own text while its neighbors stay
+CrisperWhisper-sourced — a possible style seam at that one boundary, not a
+break. `alignment.crisperwhisper.enabled: true` is required alongside
+`alignment.backend: crisperwhisper` (checked explicitly, raises a clear
+error if you set one without the other) — otherwise stage 3 never runs at
+all and every segment silently cascades to stage 2/1, which defeats the
+point without telling you.
 
-**The explicit trade:** MFA no longer attempts to rescue the ~1% of content
-genuinely affected by WhisperX drift (17 of 1,538 lines in the original
-Independence Day count). Both attempts at rescuing that 1% corrupted a much
-larger fraction of otherwise-correct content instead, twice, in two
-different ways — so the safer default now is to let that specific content
-fall back to no-worse-than-baseline rather than keep searching for a third,
-cleverer way to reach it.
+## Backend: `ct2`, not `transformers` — checked, not assumed, this time
 
-The cross-chunk monotonicity check from the first version is kept as a
-cheap backstop regardless (costs nothing, and a tight slice removes the
-room for either padding failure mode but doesn't guarantee perfection).
+An earlier version of this recommended `transformers`, reasoning that
+`crisperwhisper[ct2]`'s dependency on a forked `ctranslate2-crisperwhisper`
+package was too much unconfirmed risk. Checked more thoroughly this round
+by reading the actual installed package source:
 
-## Tests
+| | `transformers` | `ct2` |
+|---|---|---|
+| The package's own default preference | No — only used if `ct2` isn't installed | **Yes** — `backend="auto"` tries this first (confirmed in `model.py`) |
+| CPU support | Yes | Yes — confirmed `device="auto"` resolves to `"cpu"` cleanly |
+| Speed on CPU | Slower — raw PyTorch/HF | **Faster** — CTranslate2 is purpose-built for this; it's the same engine `faster-whisper` (already in this image) is built on |
+| Quality at `compute_type: float32` | Full precision | **Full precision, confirmed** — `float32` is a first-class supported quantization option in `converter.py`, not a fallback |
+| Dependency risk | None — reuses this image's existing `torch` | Real, confirmed: `ctranslate2-crisperwhisper` installs under the same `import ctranslate2` name as the plain package `faster-whisper` already needs. Mitigated by install order (this Dockerfile installs it *after* `faster-whisper`) **and** defended in code — `CrisperWhisperModel` calls a fail-fast check (`_check_fork_apis()`, confirmed in `engine.py`) right after loading, raising a specifically-named error if the wrong package won. A bad install order surfaces as a clear exception at model-load time, not silent bad output. |
 
-`tests/test_align_mfa_chunking.py` — the four envelope-detection tests are
-gone (that function no longer exists). Two new ones replace them, including
-a **direct regression test for the reported bug**: a chunk placed right
-next to unrelated audio with no silence gap between them, confirming the
-tight-margin slice never reaches back into it — proof by construction that
-the second attempt's specific failure mode is now structurally impossible,
-not just less likely.
+Given `ct2` is the tool's own default, typically faster, and has no quality
+cost when `compute_type` is set explicitly (which this config always does,
+on both backends — see below), it's the better choice here. The earlier
+`transformers` recommendation was more conservative than the evidence
+actually supported.
 
-All 9 tests pass: `PYTHONPATH=src python3 tests/test_align_mfa_chunking.py`
-(needs `ffmpeg` on `PATH`).
+**`compute_type: float32` is still set explicitly on `ct2` too** — its own
+model-conversion step defaults to `float16` (a real, if smaller, precision
+cost than the `transformers` backend's CPU-unsafe `float16` default), so
+this config pins full precision on both backends rather than trusting
+either one's own default.
 
-## Validated vs. not — same standard, same gap
+## Facts worth knowing before enabling
 
-Still not run against a real MFA install (no path to conda-forge from
-here). The re-validation path is the same one that caught both previous
-failures: re-run against Independence Day's 17 known cases **and** whatever
-shorter/denser file exposed the second attempt's problem, check the
-resulting transcript's own word-duration distribution directly (not just
-whether the aggregate number moved), and specifically look at chunks near
-the start of each job-segment and near tightly-packed dialogue — those are
-exactly the conditions that broke both earlier attempts.
+- **License**: inference code is MIT; model **weights are not** — standard
+  models (what this config defaults to: `large`) are under a non-commercial
+  research license. `_pro` variants are commercial-license-only. Confirm
+  this fits your use.
+- **No per-word confidence score** — `WordTimestamp` doesn't have one, so
+  `transcript_3_NN.json` (and, if `crisperwhisper` is authoritative,
+  `transcript.json` for those segments) carries `score: None`.
+  `matching.py` already handles that gracefully (confirmed by reading it:
+  `float(w["score"]) if w.get("score") is not None else 0.0`).
 
-One thing worth expecting going in, so it doesn't read as a new problem:
-the aggregate SRT-offset number for this version should land close to
-stage 1's own (not dramatically better everywhere), because it deliberately
-stops trying to improve on the drift-affected minority. The 17 known cases
-are the direct, specific measure of what — if anything — was given up by no
-longer padding.
+## What I actually verified vs. what I couldn't
+
+**Verified directly** (installed the real `crisperwhisper==2.0.2` wheel and
+read the actual source, both backends): the public API shape, the longform
+continuation mechanism's fixed-stride timing offset, both backends' CPU
+dtype defaults and gotchas, `backend="auto"`'s real preference order, and
+the `ctranslate2-crisperwhisper` fork's exact import-collision mechanics
+and its own defensive fail-fast check. This pipeline's own conversion/
+validation logic is tested in `tests/test_transcribe_crisperwhisper.py`.
+
+**Not verified, and can't be from here** (no GPU, disk-constrained for a
+full model download in this sandbox): actual transcription/timing quality
+on real audio, actual CPU throughput, and whether the install-order
+mitigation for the `ctranslate2` collision holds up in your actual image
+build (rather than just in this Dockerfile's stated ordering). Same
+standard as everything else in this project: re-run against Independence
+Day's 17 known drift cases and the reference SRT before drawing any
+conclusion about quality, and check your real build log for the
+`_check_fork_apis` error to confirm the right `ctranslate2` package won.
+
+## Enabling it
+
+```yaml
+alignment:
+  backend: crisperwhisper   # or leave at mfa/whisperx and just enable below for comparison only
+  crisperwhisper:
+    enabled: true
+```
+
+Rebuild the image first — the package isn't there until you do.

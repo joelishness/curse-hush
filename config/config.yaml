@@ -142,7 +142,7 @@ alignment:
   #              Set backend to this directly only if you don't want the
   #              conda/MFA install at all and are fine with the drift
   #              behavior documented above.
-  backend: mfa
+  backend: crisperwhisper
 
   # Runs a numbered pipeline of alignment stages, not a fixed choice
   # between two named tools -- see steps/transcribe.py's _ALIGNMENT_STAGES
@@ -276,6 +276,69 @@ alignment:
     # per-chunk content problem. Logged clearly either way so a silent
     # fallback is never actually silent in the logs.
     fallback_to_whisperx: true
+
+  # Stage 3 -- an independently-trained model that transcribes each
+  # segment's dialog stem itself, rather than re-timing WhisperX's own
+  # recognized text the way stages 1/2 do. CAN be alignment.backend's
+  # value like stage 2 (also requires enabled: true below, or startup
+  # validation raises -- see transcribe.py) -- but since it doesn't share
+  # stage 1/2's own recognized text, a segment where it fails falls back
+  # to stage 2/1's own words for just that segment, which can read
+  # differently (casing, punctuation, disfluency handling) than its
+  # CrisperWhisper-sourced neighbours. Real but narrow -- see
+  # transcribe.py's own "Which stages actually run" and
+  # steps/transcribe_crisperwhisper.py's module docstring for the full
+  # account. Has its own enabled switch rather than riding along with
+  # dual_output above regardless of alignment.backend's value, since
+  # unlike stage 2's comparison run this is a whole separate multi-minute
+  # model load plus a full transcription pass per segment, not a
+  # lightweight re-timing of work already done.
+  #
+  # READ steps/transcribe_crisperwhisper.py's module docstring before
+  # turning this on -- in particular: the model weights are under a
+  # non-commercial research license (the inference code is MIT, the
+  # weights are not -- confirm this fits your use before enabling), and
+  # this has not been validated against real audio the way stages 1/2
+  # have been (see docs/timestamp-drift-investigation.md) -- it's being
+  # tried specifically because every attempt so far at a *second*
+  # alignment stage searching for where drifted audio actually is has
+  # proven fragile, and this one's longform design avoids the specific
+  # mechanism responsible (each chunk's timing offset is fixed by its
+  # position in a sliding window, not inferred from how much of any
+  # earlier chunk's audio was successfully recognized) -- reasoned
+  # through, not yet confirmed on a real episode.
+  crisperwhisper:
+    enabled: true
+
+    # large/turbo/medium/small -- NOT the _pro variants, which are under a
+    # separate commercial-only license this config doesn't assume you have.
+    model: large
+
+    # ct2 (CTranslate2) -- crisperwhisper's own default preference
+    # (backend="auto" tries this first, confirmed by reading model.py's
+    # own resolution logic), typically faster on CPU than the alternative
+    # (transformers, raw HuggingFace/torch), and no quality cost vs.
+    # transformers when compute_type below is set explicitly, since
+    # float32 is a first-class option on both -- see
+    # steps/transcribe_crisperwhisper.py's own module docstring
+    # (BACKEND CHOICE) for the real tradeoff, including a confirmed (not
+    # hypothetical) dependency-naming risk and why it isn't a reason to
+    # avoid this.
+    backend: ct2
+
+    device: cpu
+
+    # ALWAYS float32 on a CPU device, on EITHER backend -- deliberately
+    # not left at either one's own default. Confirmed by reading
+    # crisperwhisper's actual source (not just its README): the
+    # transformers backend's compute_type maps directly to a torch dtype
+    # with no CPU-aware adjustment (float16 on CPU is unreliable/slow on
+    # many kernels), and ct2's own model-conversion step defaults its
+    # quantization to float16 too (a smaller but real precision cost).
+    # float32 is a genuinely first-class, fully-supported option on both
+    # backends, not a fallback -- see
+    # steps/transcribe_crisperwhisper.py's own docstring.
+    compute_type: float32
 
 
 # ── Audio handling (Steps 1a / 1b) ──────────────────────────────────────────

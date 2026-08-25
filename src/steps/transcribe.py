@@ -35,6 +35,20 @@ Pipeline (run in sequence, per segment):
        authoritative stage (alignment.backend: mfa) or purely for
        comparison (alignment.dual_output: true, alignment.backend:
        whisperx) — see "Which stages actually run" below.
+    3. CrisperWhisper (steps/transcribe_crisperwhisper.py) — a separately
+       trained model that transcribes the audio itself, independent of
+       WhisperX's own stage-1 recognition, rather than re-timing it. Can
+       be alignment.backend's value like any other registered stage (the
+       walk-down cascade below is generic over stage number, not
+       hardcoded to stages 1-2), but requires
+       alignment.crisperwhisper.enabled: true as well — see
+       "Which stages actually run" below for what happens if you set the
+       former without the latter, and for the real, narrow tradeoff worth
+       knowing about before choosing this stage as authoritative. Runs
+       (when enabled) via its own switch, not tied to
+       alignment.dual_output, since unlike stage 2 it's a whole separate
+       model load and transcription pass, not a re-timing of work stage 1
+       already did.
 
   Deliberately never tied to a specific tool's name in any FILENAME this
   pipeline writes (transcript_1_NN.json, transcript_2_NN.json, ... — see
@@ -42,56 +56,93 @@ Pipeline (run in sequence, per segment):
   job.json's own "alignment_stages" block (written once, at the end of
   this function) records which tool a given number actually was on a
   given job; every other step (steps/merge.py, steps/transcript_srt.py,
-  steps/mux.py) reads that rather than importing this registry, so a
-  future stage 3 — a different aligner entirely — only ever requires
-  changes in this one file: one more entry in _ALIGNMENT_STAGES, plus
-  the actual code to run it, appended to the per-segment loop below.
-  Nothing about job.json's shape, merge.py's merging, transcript_srt.py's
-  SRT export, or mux.py's embedding needs to change to pick it up.
+  steps/mux.py) reads that rather than importing this registry, so
+  another future stage only ever requires changes in this one file: one
+  more entry in _ALIGNMENT_STAGES, plus the actual code to run it,
+  appended to the per-segment loop below. Nothing about job.json's shape,
+  merge.py's merging, transcript_srt.py's SRT export, or mux.py's
+  embedding needs to change to pick it up.
 
-  Neither stage changes what text was recognized — both take Whisper's
-  own output as given and only refine *when* each word occurs. For stage
-  2 specifically this is a structural guarantee, not just a design intent
-  that happens to hold today: MFA's own output never reaches
-  transcript.json as word text under any code path, including its
-  fallback ones — see steps/align_mfa.py's module docstring for why that
-  needed to be said explicitly (it wasn't always true here). Fixing what
-  gets recognized in the first place (WhisperX's decoder skipping a
+  Stages 1 and 2 never change what text was recognized — both take
+  Whisper's own output as given and only refine *when* each word occurs.
+  For stage 2 specifically this is a structural guarantee, not just a
+  design intent that happens to hold today: MFA's own output never
+  reaches transcript.json as word text under any code path, including
+  its fallback ones — see steps/align_mfa.py's module docstring for why
+  that needed to be said explicitly (it wasn't always true here). Fixing
+  what gets recognized in the first place (WhisperX's decoder skipping a
   stretch of dense, repetitive dialogue outright — see the same
-  investigation doc) is a separate, still-open recall problem, not
-  something any alignment stage can address.
+  investigation doc) is a separate, still-open recall problem that no
+  stage sharing WhisperX's own recognized text can address by
+  construction. Stage 3 is the one exception to "shares WhisperX's own
+  recognized text" in this registry — see "Which stages actually run"
+  below for what that means in practice if it's chosen as authoritative.
 
 ── Which stages actually run ─────────────────────────────────────────────
 
   alignment.backend (config.yaml) selects the AUTHORITATIVE stage number
   — the one whose result becomes transcript_NN.json (this segment's
   contribution to the canonical, censoring-relevant transcript.json) —
-  via the tool→number lookup below: "mfa" → 2, "whisperx" → 1.
+  via the tool→number lookup below: "mfa" → 2, "whisperx" → 1,
+  "crisperwhisper" → 3. Choosing "crisperwhisper" also requires
+  alignment.crisperwhisper.enabled: true (checked explicitly, raises
+  otherwise) — without it stage 3 never runs at all, and every segment
+  would silently cascade straight to stage 2/1 instead, which is almost
+  certainly not what was intended by choosing it.
+
+  Worth understanding before choosing alignment.backend: crisperwhisper —
+  stages 1/2 both re-time WhisperX's own recognized text, so falling from
+  stage 2 to stage 1 changes only a segment's TIMING, never its words.
+  Stage 3 transcribes independently (see "Alignment stages" above) — if
+  it fails for a specific segment and the cascade below falls to stage
+  2/1 for just that segment, that segment's WORDS come from a different
+  source than its CrisperWhisper-sourced neighbours (possibly different
+  casing, punctuation, or disfluency handling at that one boundary). Not
+  a structural problem — each segment's own transcript is still fully
+  coherent on its own — just a real, narrow style-consistency tradeoff,
+  not something to discover by surprise in the output. Logged once, at
+  INFO, whenever this backend is chosen, so it isn't a silent
+  possibility.
 
   A stage runs when EITHER of these holds:
     - its number is <= the authoritative stage number (needed to resolve
       the authoritative result at all, with cascade-down — see below), or
-    - alignment.dual_output is true (run every registered stage
-      regardless, purely so steps/transcript_srt.py can offer a
-      side-by-side comparison track for each — see that module and
-      config.yaml's own documentation of this setting).
+    - alignment.dual_output is true, for stages 1-2 (run every
+      TEXT-SHARING registered stage regardless, purely so
+      steps/transcript_srt.py can offer a side-by-side comparison track
+      for each — see that module and config.yaml's own documentation of
+      this setting). Stage 3 has its own, separate switch
+      (alignment.crisperwhisper.enabled) rather than being covered by
+      dual_output, for the "whole separate model load" reason above —
+      but note that switch, not dual_output, is also what makes stage 3
+      run at all when it IS the authoritative backend.
 
-  Resolving the authoritative transcript_NN.json for a segment: walk
-  DOWN from the authoritative stage number, use the first one that
-  actually produced data for THIS segment. Exactly today's "MFA,
-  falling back to WhisperX on failure" rule (alignment.mfa.
-  fallback_to_whisperx) — generalized so it isn't hardcoded to exactly
-  two named stages, and so a future stage 3 slots into the same cascade
-  automatically, highest-registered-number first. Stage 1 always having
-  already run (see below) is what makes this cascade unconditionally
-  available rather than a reactive, only-on-failure fallback path.
+  Resolving the authoritative transcript_NN.json for a segment: walk DOWN
+  from the authoritative stage number, use the first stage that actually
+  produced data for THIS segment. Exactly today's "MFA, falling back to
+  WhisperX on failure" rule (alignment.mfa.fallback_to_whisperx) —
+  generalized so it isn't hardcoded to exactly two named stages. This
+  cascade is agnostic to whether a stage shares another's recognized text
+  or not — it just picks the highest-numbered stage (up to
+  target_stage) that has data — which is exactly how stage 3 can safely
+  participate despite "Alignment stages" above describing it as the one
+  exception to the shared-text property: the cascade doesn't depend on
+  that property, only stage 2's own internal chunk-level interpolation
+  (steps/align_mfa.py) does. Stage 1 always having already run (see
+  below) is what makes this cascade unconditionally available rather than
+  a reactive, only-on-failure fallback path.
 
   A stage that fails for a segment it wasn't required for (e.g. MFA
-  purely for comparison, backend: whisperx) never raises — logged, and
-  that segment just has no data for that stage's own transcript. A
-  stage that fails where it WAS required for the authoritative result
-  (MFA, backend: mfa) raises only if alignment.mfa.fallback_to_whisperx
-  is false; otherwise it cascades to stage 1, same as always.
+  purely for comparison, backend: whisperx; or stage 3 when it isn't the
+  authoritative backend) never raises — logged, and that segment just has
+  no data for that stage's own transcript. A stage that fails where it
+  WAS required for the authoritative result raises only if its own
+  fallback is disallowed (alignment.mfa.fallback_to_whisperx for stage 2;
+  stage 3 has no equivalent setting — a stage-3 failure always cascades
+  when it's authoritative, since falling back to stage 2/1's own text for
+  just that segment is a better outcome than no transcript at all for it,
+  and the style-consistency tradeoff above is exactly the documented cost
+  of that choice); otherwise it cascades down, same as always.
 
 ── Why stage 1 always runs ───────────────────────────────────────────────
 
@@ -115,20 +166,29 @@ Pipeline (run in sequence, per segment):
   alignment is a single wav2vec2/CTC forward pass, not a search the way
   MFA's beam-search alignment is — meaningfully cheaper than MFA either
   way — so this adds a bounded, comparatively small amount of time per
-  segment rather than approaching MFA's own cost.
+  segment rather than approaching MFA's own cost. Stage 3, when enabled,
+  is a genuinely separate cost on top of this — a whole independent
+  model load and transcription pass, not a lightweight re-timing — which
+  is exactly why it has its own opt-in switch rather than riding along
+  with dual_output the way stage 2's comparison runs do.
 
 ── Per-segment output files ──────────────────────────────────────────────
 
   transcript_NN.json          — authoritative (see resolution above);
                                  unchanged in name and role from every
-                                 earlier version of this pipeline.
+                                 earlier version of this pipeline. Never
+                                 stage 3's own words — see resolution
+                                 above.
   transcript_{stage}_NN.json  — one per stage that actually produced
                                  words for this segment (see "Which
                                  stages actually run" above) — e.g.
-                                 transcript_1_01.json, transcript_2_01.json.
-  All three (when all exist) share the same {"language",
-  "segment_index", "segment_start_offset", "words"} shape — see
-  _write_transcript_variant().
+                                 transcript_1_01.json, transcript_2_01.json,
+                                 transcript_3_01.json.
+  All (when they exist) share the same {"language", "segment_index",
+  "segment_start_offset", "words"} shape — see _write_transcript_variant()
+  — but transcript_3's own "words" is an independently-recognized text,
+  not a re-timing of transcript_1/transcript_2's (see "Alignment stages"
+  above); comparing them is a text-level diff, not just a timing one.
 
 The Whisper model (and the whisperx align model, loaded for stage 1
 every run now that it's unconditional) are loaded once for the whole
@@ -201,16 +261,42 @@ from utils import (
     write_job,
 )
 from steps.align_mfa import align_with_mfa, MFAError
+from steps.transcribe_crisperwhisper import load_crisperwhisper_model, transcribe_with_crisperwhisper
 
 
 # ── Alignment stage registry ─────────────────────────────────────────────────
 # See this module's own docstring ("Alignment stages") for the full
-# rationale. Adding a stage 3 means one more entry here, plus the actual
+# rationale. Adding a stage means one more entry here plus the actual
 # code to run it in the per-segment loop below — nothing else in this
 # pipeline needs to change to pick it up (see that same docstring section).
+#
+# alignment.backend may be set to any tool name registered here,
+# including "crisperwhisper" — the walk-down cascade below is generic
+# over stage NUMBER, not hardcoded to a specific pair of named stages, so
+# it already resolves target_stage=3 correctly (3 -> 2 -> 1, first with
+# data) with no special-casing needed. The one real requirement, checked
+# explicitly below: alignment.crisperwhisper.enabled must ALSO be true if
+# it's the authoritative backend, since otherwise stage 3 never runs at
+# all and every segment would silently cascade straight to stage 2/1 --
+# a config that would produce transcript.json but not the one the person
+# configuring it almost certainly meant to get.
+#
+# Worth understanding before choosing alignment.backend: crisperwhisper --
+# stages 1/2 both re-time WhisperX's own recognized text, so falling from
+# stage 2 to stage 1 for a given segment changes only that segment's
+# TIMING, never its words. Stage 3 is an independently-trained model that
+# transcribes the audio itself (see steps/transcribe_crisperwhisper.py's
+# own docstring) -- if it fails for a specific segment and the cascade
+# falls to stage 2/1, that segment's WORDS come from a different source
+# than its CrisperWhisper-sourced neighbours: possibly different casing,
+# punctuation, or disfluency handling at that one segment's boundary. Not
+# a structural problem -- each segment's own transcript is still fully
+# coherent on its own -- just a real, narrow style-consistency tradeoff
+# worth knowing about rather than discovering by surprise in the output.
 _ALIGNMENT_STAGES = (
     {"number": 1, "tool": "whisperx", "label": "WhisperX"},
     {"number": 2, "tool": "mfa",      "label": "MFA"},
+    {"number": 3, "tool": "crisperwhisper", "label": "CrisperWhisper"},
 )
 _STAGE_BY_TOOL = {s["tool"]: s for s in _ALIGNMENT_STAGES}
 
@@ -270,22 +356,39 @@ def transcribe(
     align_backend        = cfg_get(cfg, "alignment", "backend")
     mfa_fallback_allowed = bool(cfg_get(cfg, "alignment", "mfa", "fallback_to_whisperx"))
     dual_output          = bool(cfg_get(cfg, "alignment", "dual_output"))
+    crisperwhisper_enabled = bool(cfg_get(cfg, "alignment", "crisperwhisper", "enabled"))
     if align_backend not in _STAGE_BY_TOOL:
         raise ValueError(
             f"alignment.backend must be one of {sorted(_STAGE_BY_TOOL)}, "
             f"got {align_backend!r}"
         )
+    if align_backend == "crisperwhisper" and not crisperwhisper_enabled:
+        raise ValueError(
+            "alignment.backend is 'crisperwhisper' but "
+            "alignment.crisperwhisper.enabled is false -- stage 3 would "
+            "never run, so every segment would silently cascade to "
+            "stage 2/1 instead, which is almost certainly not what's "
+            "intended. Set alignment.crisperwhisper.enabled: true too."
+        )
     target_stage = _STAGE_BY_TOOL[align_backend]["number"]
+    if align_backend == "crisperwhisper":
+        log.info(
+            "  alignment.backend=crisperwhisper: a segment where stage 3 "
+            "fails will use stage 2/1's own recognized text for that "
+            "segment instead, which can differ in casing/punctuation/"
+            "style from CrisperWhisper's -- see _ALIGNMENT_STAGES' own "
+            "comment above for why that's a real, if narrow, tradeoff."
+        )
 
     n = len(stem_pairs)
     log.info("Step 3 — WhisperX transcription")
     log.info(
         "  model=%s  language=%s  batch_size=%d  beam_size=%d"
         "  device=%s  compute_type=%s  segments=%d  align_backend=%s"
-        "  (stage %d)  dual_output=%s",
+        "  (stage %d)  dual_output=%s  crisperwhisper=%s",
         model_name, language or "auto",
         batch_size, beam_size, device, compute_type, n, align_backend,
-        target_stage, dual_output,
+        target_stage, dual_output, crisperwhisper_enabled,
     )
 
     # ── Import whisperx ───────────────────────────────────────────────────────
@@ -310,6 +413,14 @@ def transcribe(
         vad_method="silero",
     )
     log.info("  ✓  Model loaded in %.1f s.", time.monotonic() - t_load)
+
+    # ── Load CrisperWhisper model (once for all segments, only if enabled) ────
+    # See steps/transcribe_crisperwhisper.py's own docstring for what this
+    # is, why it's never authoritative, and the licensing/backend caveats
+    # worth reading before turning this on.
+    cw_model = None
+    if crisperwhisper_enabled:
+        cw_model = load_crisperwhisper_model(cfg, log)
 
     # ── Alignment model cache (per language) ──────────────────────────────────
     # Reload only if detected language changes across segments (rare in practice
@@ -474,6 +585,45 @@ def transcribe(
                         exc,
                     )
 
+        # Stage 3 (CrisperWhisper) -- deliberately outside the segs_out
+        # if/else above: unlike stages 1/2, this doesn't re-time WhisperX's
+        # own recognized text, it transcribes the audio independently (see
+        # steps/transcribe_crisperwhisper.py's own docstring), so a segment
+        # where WhisperX found nothing is still worth running through it --
+        # whether the two disagree on THAT is itself part of what this
+        # comparison is for. Runs whenever cw_model was loaded (i.e.
+        # alignment.crisperwhisper.enabled), regardless of target_stage --
+        # unlike stage 2, there's no separate "only if authoritative or
+        # dual_output" gate, since stage 3 has no cheaper always-on
+        # sibling the way stage 2 has stage 1; its own enabled switch
+        # already is that gate.
+        if cw_model is not None:
+            try:
+                t_stage = time.monotonic()
+                stage_words[3] = transcribe_with_crisperwhisper(
+                    cw_model, dialog, detected_lang if segs_out else language, cfg, log,
+                )
+                log.debug(
+                    "    Stage 3 (CrisperWhisper) transcription: %d words in %.1fs for %s.",
+                    len(stage_words[3]), time.monotonic() - t_stage, dialog.name,
+                )
+            except Exception as exc:  # noqa: BLE001 -- always cascades, never fatal, see below
+                # Unlike stage 2, never raises even when it WAS the
+                # authoritative stage (target_stage == 3) -- falling back
+                # to stage 2/1's own text for just this one segment is a
+                # better outcome than no transcript at all for it (see
+                # "Which stages actually run" in the module docstring for
+                # the style-consistency tradeoff that implies).
+                log.warning(
+                    "  [%d/%d] Stage 3 (CrisperWhisper) failed for %s%s. "
+                    "Reason: %s",
+                    seg_idx, n, dialog.name,
+                    " -- cascading to stage 2/1 for the authoritative "
+                    "result" if target_stage >= 3 else " -- no stage 3 "
+                    "data for this segment's comparison transcript",
+                    exc,
+                )
+
         # Release the numpy audio array before the next segment loads its own.
         del audio
         gc.collect()
@@ -524,6 +674,8 @@ def transcribe(
     del wx_model
     if align_model is not None:
         del align_model, align_metadata
+    if cw_model is not None:
+        del cw_model
     gc.collect()
 
     # ── Persist metadata and mark done ────────────────────────────────────────
@@ -554,6 +706,7 @@ def transcribe(
         "align_backend": align_backend,
         "target_stage":  target_stage,
         "dual_output":   dual_output,
+        "crisperwhisper_enabled": crisperwhisper_enabled,
         # Aggregate, not just per-segment detail -- so callers that only
         # care about "did anything notable happen" (pipeline.py's own
         # end-of-run summary, and via that, hush.sh's --batch log) can
