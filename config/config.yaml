@@ -142,6 +142,33 @@ alignment:
   #              Set backend to this directly only if you don't want the
   #              conda/MFA install at all and are fine with the drift
   #              behavior documented above.
+  #   crisperwhisper — an independently-trained model that transcribes
+  #              each segment's audio directly, rather than re-timing
+  #              WhisperX's own recognized text the way mfa/whisperx
+  #              above do — see steps/transcribe_crisperwhisper.py's own
+  #              module docstring for the full reasoning (short version:
+  #              every fix above works by searching, after the fact, for
+  #              where WhisperX's drifted audio actually is, and that has
+  #              proven fragile three times over; this instead never
+  #              depends on WhisperX's own segment timing in the first
+  #              place). Also requires alignment.crisperwhisper.enabled:
+  #              true below, or startup validation raises — see that
+  #              block for why, and for the real, narrow tradeoff worth
+  #              knowing before choosing this: since it doesn't share
+  #              mfa/whisperx's own recognized text, a segment where it
+  #              fails falls back to mfa/whisperx's own words for just
+  #              that segment, which can read differently (casing,
+  #              punctuation, disfluency handling) than its
+  #              CrisperWhisper-sourced neighbours. Model weights are
+  #              under a non-commercial research license, not MIT the way
+  #              the inference code is — confirm this fits your use
+  #              before choosing this. NOT yet validated against real
+  #              audio the way mfa above has been
+  #              (docs/timestamp-drift-investigation.md) — reasoned
+  #              through, not confirmed; re-validate the same way (same
+  #              17 known cases, same reference SRT, checking the
+  #              resulting transcript's own text against them, not just
+  #              timing) before trusting this in production.
   backend: crisperwhisper
 
   # Runs a numbered pipeline of alignment stages, not a fixed choice
