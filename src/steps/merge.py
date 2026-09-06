@@ -14,24 +14,33 @@ Transcript merge:
   The output transcript.json has no segment_index or segment_start_offset
   at the top level — only the flat words array with global timestamps.
 
-Alignment-stage transcript merge (alignment.dual_output — see config.yaml):
+Per-engine transcript merge:
   Same offset-and-concatenate logic (_merge_transcript_source(), shared
   with the primary merge above), applied independently to whichever
-  transcript_{N}_NN.json files steps/transcribe.py actually produced, for
-  each stage number in job.json's own "alignment_stages" legend (also
-  written by that step), into transcript_{N}.json — present only when at
-  least one segment has that stage's data. Reacts to per-segment file
-  existence rather than reading alignment.dual_output itself, so it's
-  correct whether that setting was on for the whole job, part of it, or
-  off entirely (in which case whichever stage matches alignment.backend
-  still gets its own numbered file here — redundant with transcript.json
-  in that case, but deliberately so; see steps/transcript_srt.py, the
-  only consumer of these files, which only ever looks for them by
-  stage-numbered name and never reads the generic transcript.json at
-  all). A future stage 3 needs no changes here: it appears in
-  alignment_stages the moment steps/transcribe.py starts writing one, and
-  is merged the same way as stages 1 and 2 today. Never affects
-  transcript.json itself or what Steps 4–7 do with it.
+  transcript_<engine>_NN.json files steps/transcribe.py actually
+  produced, for each ENABLED engine in job.json's own "alignment_engines"
+  list (also written by that step), into transcript_<engine>.json —
+  present only when at least one segment has that engine's data. Reacts
+  to per-segment file existence rather than re-reading
+  alignment.engines.*.enabled itself, so it's correct whether an engine
+  was enabled for the whole job, part of it, or its data only exists
+  because it was the final (authoritative) one. transcript_<engine>.json
+  for the final engine therefore ends up produced even with
+  debug_subtitle off for that engine (redundant with transcript.json's
+  own content in that case, but deliberately so: steps/transcript_srt.py
+  only ever looks for these engine-named files, never the generic
+  transcript.json, so it doesn't need its own separate "which engine was
+  final" logic — see that module's docstring). A future engine needs no
+  changes here: it appears in alignment_engines the moment
+  steps/transcribe.py starts writing one, and is merged the same way as
+  every other engine today.
+
+  The existence check against each engine's OUTPUT path first, before
+  looking at per-segment sources, matters for the same reason it already
+  does for transcript.json above: this job's own per-segment
+  transcript_<engine>_NN.json sources are deleted once this merge
+  succeeds (see cleanup below), so a resumed run must recognize
+  "already merged" without depending on those sources still existing.
 
 Audio stem merge (multi-segment only):
   Uses the ffmpeg concat demuxer with a temporary file list for reliable
@@ -52,10 +61,11 @@ Intermediate cleanup:
     resume artifact for future per-channel reprocessing, §13.3)
   - dialog_NN.wav, score_sfx_NN.wav — deleted only for multi-segment runs,
     only if not keep_intermediates (canonical versions now exist)
-  - transcript_NN.json, and every alignment stage's own
-    transcript_{N}_NN.json (whichever numbers job.json's
-    "alignment_stages" lists) — deleted under the same keep_intermediates
-    condition as the files above (see "Correction" note below)
+  - transcript_NN.json, and every enabled engine's own
+    transcript_<engine>_NN.json (whichever names job.json's own
+    "alignment_engines" list has enabled: true) — deleted under the same
+    keep_intermediates condition as the files above (see "Correction"
+    note below)
   See utils.keep_intermediate() — the single source of truth for this
   policy, shared with steps/mute.py, steps/recombine.py, and steps/mux.py
   so it can't drift between steps the way it could when each one
@@ -76,14 +86,14 @@ rather than being kept forever.
 
 Marks '3b_merge' done.  Writes the canonical filenames into job.json's
 "merge" block ("files": {"transcript", "dialog", "score_sfx"}, plus
-"transcript_{N}" for each alignment stage number actually produced),
+"transcript_<engine>" for each engine that actually produced data),
 alongside the segment/word_count stats it already recorded.
 Returns (transcript.json, dialog.wav, score_sfx.wav) as a 3-tuple --
 unchanged in shape from every earlier version of this pipeline.
-transcript_{N}.json files are NOT part of this return value; callers
+transcript_<engine>.json files are NOT part of this return value; callers
 (pipeline.py) discover them the same way they're discovered here --
-checking for job_dir / f"transcript_{N}.json" directly -- since they're
-always at those exact, fixed names when present at all, the same
+checking for job_dir / f"transcript_{name}.json" directly -- since
+they're always at those exact, fixed names when present at all, the same
 discoverability transcript.json/dialog.wav/score_sfx.wav already have on
 pipeline.py's own "Steps 1a-3b already complete" fast path.
 """
@@ -150,39 +160,24 @@ def merge(
     # ── 1. Merge transcripts ───────────────────────────────────────────────────
     total_words = _merge_transcript_source(transcript_paths, segments, transcript_out, state, n, log)
 
-    # ── 1b. Merge each alignment stage's own transcript ─────────────────────────
-    # Reacts to job.json's own "alignment_stages" legend (written by Step 3
-    # -- see steps/transcribe.py) for WHICH stage numbers to look for, and
-    # to whatever per-segment transcript_{N}_NN.json files actually exist
-    # for WHETHER a given stage has anything to merge -- both correct
-    # whether alignment.dual_output was on for the whole job, part of it,
-    # or a stage's data only exists because it was the authoritative one
-    # (see steps/transcribe.py's own docstring). A future stage 3 needs no
-    # changes here at all: it shows up in alignment_stages the moment
-    # steps/transcribe.py starts writing one, and is merged the same way.
-    #
-    # transcript_{N}.json for the authoritative stage therefore ends up
-    # produced even with dual_output off (redundant with transcript.json's
-    # own content in that case, but deliberately so: steps/transcript_srt.py
-    # only ever looks for these stage-numbered files, never the generic
-    # transcript.json, so it doesn't need its own separate "which stage was
-    # authoritative" logic -- see that module's docstring).
-    #
-    # The existence check against each stage's OUTPUT path first, before
-    # looking at per-segment sources, matters for the same reason it
-    # already does for transcript.json above: this job's own per-segment
-    # transcript_{N}_NN.json sources are deleted once this merge succeeds
-    # (see cleanup below), so a resumed run must recognize "already merged"
-    # without depending on those sources still existing.
-    stage_outputs: dict[int, Path] = {}
-    for stage in state.get("alignment_stages", []):
-        number   = stage["number"]
-        out_path = job_dir / f"transcript_{number}.json"
-        seg_paths = [job_dir / f"transcript_{number}_{i+1:02d}.json" for i in range(n)]
+    # ── 1b. Merge each enabled engine's own transcript ───────────────────────
+    # See module docstring's "Per-engine transcript merge" section for the
+    # full reasoning -- keyed by engine NAME (job.json's own
+    # "alignment_engines" list, written by steps/transcribe.py), not a
+    # numbered stage. Only engines that actually ran this job (enabled:
+    # true) are worth checking at all; a disabled engine never wrote any
+    # transcript_<name>_NN.json in the first place.
+    stage_outputs: dict[str, Path] = {}
+    for engine in state.get("alignment_engines", []):
+        if not engine.get("enabled"):
+            continue
+        name      = engine["engine"]
+        out_path  = job_dir / f"transcript_{name}.json"
+        seg_paths = [job_dir / f"transcript_{name}_{i+1:02d}.json" for i in range(n)]
         seg_paths = [p if p.exists() else None for p in seg_paths]
         if out_path.exists() or any(p is not None for p in seg_paths):
             _merge_transcript_source(seg_paths, segments, out_path, state, n, log)
-            stage_outputs[number] = out_path
+            stage_outputs[name] = out_path
 
     # ── 2. Merge audio stems ───────────────────────────────────────────────────
     dialogs    = [d for (d, _) in stem_pairs]
@@ -297,16 +292,18 @@ def merge(
         for t_path in transcript_paths:
             _unlink_if(t_path, log)
 
-        # Same reasoning, same policy, for each alignment stage's own
-        # per-segment files -- transcript_{N}.json above (for whichever
-        # numbers stage_outputs has) is the merged, canonical version;
-        # nothing downstream ever reads the _NN per-segment sources again
-        # either. Harmless no-ops for any segment/stage combination that
-        # never had one (dual_output off, or that stage wasn't
-        # attempted/failed for that specific segment).
-        for stage in state.get("alignment_stages", []):
+        # Same reasoning, same policy, for each enabled engine's own
+        # per-segment files -- transcript_<engine>.json above (for
+        # whichever names stage_outputs has) is the merged, canonical
+        # version; nothing downstream ever reads the _NN per-segment
+        # sources again either. Harmless no-ops for any segment/engine
+        # combination that never had one (that engine wasn't enabled, or
+        # it was attempted and failed for that specific segment).
+        for engine in state.get("alignment_engines", []):
+            if not engine.get("enabled"):
+                continue
             for i in range(n):
-                _unlink_if(job_dir / f"transcript_{stage['number']}_{i+1:02d}.json", log)
+                _unlink_if(job_dir / f"transcript_{engine['engine']}_{i+1:02d}.json", log)
 
     # ── 4. Persist metadata and mark done ─────────────────────────────────────
     state = read_job(job_dir)
@@ -315,13 +312,13 @@ def merge(
         "dialog":     dialog_out.name,
         "score_sfx":  score_sfx_out.name,
     }
-    for number, path in stage_outputs.items():
-        files[f"transcript_{number}"] = path.name
+    for name, path in stage_outputs.items():
+        files[f"transcript_{name}"] = path.name
     # Present only when produced -- same "field present only when notable"
     # shape used elsewhere in this pipeline (e.g. transcribe.py's own
     # mfa_fallback_segments) -- so a job with no comparison data at all
-    # (dual_output never on for this job) doesn't carry keys pointing at
-    # files that don't exist.
+    # (no engine had debug_subtitle on for this job) doesn't carry keys
+    # pointing at files that don't exist.
     state["merge"] = {
         "segments":   n,
         "word_count": total_words,
@@ -354,17 +351,18 @@ def _merge_transcript_source(
     Merge one alignment source's per-segment transcript files (offset-
     adjusted, concatenated in segment order) into one canonical file at
     out_path. Shared by the primary transcript.json merge and the
-    alignment.dual_output comparison merges (transcript_mfa.json /
-    transcript_whisperx.json) in merge() above -- identical offset-
-    application logic either way, just parameterized by which
-    per-segment files to read and where to write the result.
+    per-engine comparison merges (transcript_mfa.json /
+    transcript_whisperx.json / transcript_crisperwhisper.json) in merge()
+    above -- identical offset-application logic either way, just
+    parameterized by which per-segment files to read and where to write
+    the result.
 
     A None entry in per_segment_paths means this segment has no data for
-    this particular source (see steps/transcribe.py's dual_output
-    comparison logic, which can leave a segment's comparison file
-    genuinely absent when that backend wasn't attempted, or was attempted
-    and failed, rather than writing an empty one) -- contributes zero
-    words for that segment's span: a real, correctly-reported gap in that
+    this particular source (see steps/transcribe.py's per-engine
+    dispatch, which can leave a segment's comparison file genuinely
+    absent when that engine wasn't attempted, or was attempted and
+    failed, rather than writing an empty one) -- contributes zero words
+    for that segment's span: a real, correctly-reported gap in that
     source's transcript, not a merge failure.
 
     Guarded by an out_path existence check for the same reason the

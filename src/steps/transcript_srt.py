@@ -2,26 +2,29 @@
 profanity-hush — Step 6c: export aligned transcripts as SRT subtitles
 
 Why this exists: figuring out *why* a word got muted at the wrong moment,
-or why two alignment stages disagree, normally means cross-referencing
-the output video against a transcript against the original audio by
-hand, across three separate tools — exactly the tedious process
+or why two engines disagree, normally means cross-referencing the output
+video against a transcript against the original audio by hand, across
+three separate tools — exactly the tedious process
 docs/timestamp-drift-investigation.md's whole worked example walks
 through. This step makes that a "turn a subtitle track on" problem
-instead: each available transcript — every alignment stage's own, plus
-the authoritative/censoring-relevant result — becomes its own subtitle
-track showing every word recognized there, at exactly the timestamp it
-gives it, so a mistimed mute — or a disagreement between stages — is
-immediately visible as a mismatch between what the track says is being
-spoken and what's actually audible.
+instead: each configured engine's own transcript (alignment.engines.
+<name>.debug_subtitle — see config.yaml), plus the authoritative/
+censoring-relevant result, becomes its own subtitle track showing every
+word recognized there, at exactly the timestamp it gives it, so a
+mistimed mute — or a disagreement between engines — is immediately
+visible as a mismatch between what the track says is being spoken and
+what's actually audible.
 
-Input  : transcript_{N}.json for each alignment stage number job.json's
-         "alignment_stages" legend lists (steps/transcribe.py,
-         steps/merge.py), plus transcript.json, the authoritative one.
-Output : transcript_{N}.srt for each stage, plus transcript.srt for the
-         authoritative result — saved in the job directory, and —
-         transcript_srt.write_sidecar — a copy of each next to the output
-         video too. Also returned in memory (see export_srt()'s
-         docstring) for steps/mux.py to embed.
+Input  : transcript_<engine>.json for each engine job.json's own
+         "alignment_engines" list (steps/transcribe.py, steps/merge.py)
+         marks enabled + debug_subtitle, plus transcript.json for the
+         final engine if it has final_subtitle: true.
+Output : transcript_<engine>.srt for each debug source, plus
+         transcript.srt for the authoritative result — saved in the job
+         directory, and — transcript_srt.write_sidecar — a copy of each
+         next to the output video too. Also returned in memory (see
+         export_srt()'s docstring) for steps/mux.py to embed, per each
+         source's own alignment.engines.<name>.embed_subtitle.
 Marks '6c_transcript_srt' done.
 
 Does this belong in the --skip-index/--add-interval/--redo-review
@@ -31,10 +34,10 @@ authoritative source specifically: hushing needs censor_log.json, which
 is exactly what those corrections change, so the authoritative SRT can
 now go stale on one the same way 5_mute/6_recombine/6b_encode/7_mux's own
 outputs can. (Before hush existed, this step read only transcript.json/
-transcript_{N}.json — what was recognized, never what got muted — so it
-genuinely couldn't go stale on a content correction; per-stage sources
-still only ever read transcript_{N}.json and are still exactly as
-stale-proof as before.) See pipeline.py's own docstring and
+transcript_<engine>.json — what was recognized, never what got muted —
+so it genuinely couldn't go stale on a content correction; a debug
+source still only ever reads transcript_<engine>.json and is still
+exactly as stale-proof as before.) See pipeline.py's own docstring and
 _cascade_steps() for the unmark list itself.
 
 Failure handling is deliberately NOT the same as every other step's: an
@@ -134,35 +137,42 @@ actual censored film would never want burned in permanently in the first
 place. Soft-embedding (a selectable, non-default track) is the only
 option consistent with that guarantee — see steps/mux.py.
 
-── Why one SRT per stage, plus one more for the authoritative result ────
+── Why one SRT per engine, plus one more for the authoritative result ───
 
 Earlier versions of this step read a single, generic transcript.json —
 whatever alignment.backend happened to produce, per segment, including
-any per-segment fallback baked invisibly into the same file (see
-steps/transcribe.py's cascade). That's still exactly what transcript.json
-is for matching/muting (steps/matching.py, steps/mute.py) — unchanged.
-But it makes a poor comparison tool on its own: there's no way to tell,
-from transcript.json alone, whether a given word's timing came from the
-authoritative stage or a fallback, which is precisely the distinction
-someone troubleshooting a disagreement between stages needs to see.
-Stage-numbered sources (transcript_1.json, transcript_2.json, ... — see
-steps/merge.py) fix that: each is a clean, honestly-gapped view of what
-one specific stage actually produced, independent of which one was
-authoritative for censoring purposes. Numbered, not named after a
-specific tool, for the same reason steps/transcribe.py's own
-_ALIGNMENT_STAGES registry is: a future stage 3 (a different aligner
-entirely) needs no changes here — job.json's own "alignment_stages"
-legend is read fresh each run, so a new stage number just starts showing
-up as one more SRT the moment steps/transcribe.py starts producing it.
+any per-segment fallback baked invisibly into the same file. That's
+still exactly what transcript.json is for matching/muting
+(steps/matching.py, steps/mute.py) — unchanged. But it makes a poor
+comparison tool on its own: there's no way to tell, from transcript.json
+alone, whether a given word's timing came from the final (authoritative)
+engine or a fallback, which is precisely the distinction someone
+troubleshooting a disagreement between engines needs to see.
+Engine-named sources (transcript_whisperx.json, transcript_mfa.json,
+transcript_crisperwhisper.json — see steps/merge.py) fix that: each is a
+clean, honestly-gapped view of what one specific engine actually
+produced, independent of which one was final for censoring purposes. A
+future engine needs no changes here at all: it appears in job.json's own
+"alignment_engines" list (steps/transcribe.py) the moment that module
+starts writing one, and is exported the same way every other engine's
+own debug_subtitle-gated source is today.
 
-That same authoritative/per-stage split governs two more things below,
-for related but distinct reasons documented at each: karaoke rendering
-(transcript_srt.karaoke — a per-stage debugging aid, never applied to
+Which engine(s) actually get a debug SRT, and whether the final engine
+also gets the plain/hushed "final" one, is entirely config-driven —
+alignment.engines.<name>.debug_subtitle and alignment.engines.<name>.
+final_subtitle (see config.yaml's own alignment.engines comment) — this
+module has no opinion of its own about which engines are worth exporting;
+it just reacts to job.json's own "alignment_engines" list, written once
+per run by steps/transcribe.py from those exact settings.
+
+That authoritative/per-engine split governs two more things below, for
+related but distinct reasons documented at each: karaoke rendering
+(transcript_srt.karaoke — a per-engine debugging aid, never applied to
 the authoritative SRT, which stays traditional grouped subtitles
 regardless of that setting; see _export_one_source()) and hush
 redaction (transcript_srt.hush — the reverse: applied only to the
-authoritative SRT's own text, never to a per-stage one; see
-_apply_hush()). Both consistently treat the per-stage SRTs as the raw,
+authoritative SRT's own text, never to a per-engine one; see
+_apply_hush()). Both consistently treat the per-engine SRTs as the raw,
 unedited debugging view and the authoritative one as the track shaped
 for an actual viewer.
 """
@@ -211,20 +221,21 @@ class SrtSource:
     needs to embed it, and everything pipeline.py needs to log it as a
     kept output.
 
-    key                 — "1", "2", ... for one alignment stage's own
-                           transcript (see job.json's "alignment_stages"
-                           legend, steps/transcribe.py), or "final" for
-                           the authoritative/censoring-relevant one. Used
-                           for logging and job.json bookkeeping only --
-                           not part of any filename this module writes
-                           (see job_dir_path/sidecar_path below).
-    label               — human-readable, e.g. "Stage 2 (MFA)" or
-                           "Final (authoritative)".
-    job_dir_path        — job_dir/transcript_{N}.srt for a stage, or
-                           job_dir/transcript.srt for the authoritative
-                           one. Always written (in whichever style
-                           transcript_srt.karaoke selects) whenever this
-                           source exists at all.
+    key                 — the engine name ("whisperx", "mfa",
+                           "crisperwhisper", ...) for one engine's own
+                           debug-subtitle transcript (see job.json's
+                           "alignment_engines" list, steps/transcribe.py),
+                           or "final" for the authoritative/censoring-
+                           relevant one. Used for logging and job.json
+                           bookkeeping only -- not part of any filename
+                           this module writes (see job_dir_path/
+                           sidecar_path below).
+    label               — human-readable, e.g. "MFA" or "Final".
+    job_dir_path        — job_dir/transcript_<engine>.srt for a debug
+                           source, or job_dir/transcript.srt for the
+                           authoritative one. Always written (in
+                           whichever style transcript_srt.karaoke
+                           selects) whenever this source exists at all.
     sidecar_path        — a copy of the same content next to the output
                            video, named per config.yaml's convention.
                            None when transcript_srt.write_sidecar is false.
@@ -237,6 +248,14 @@ class SrtSource:
     track_name          — transcript_srt.track_name_prefix plus this
                            source's own label, for steps/mux.py's
                            embedded-track metadata.
+    embed               — this source's own alignment.engines.<name>.
+                           embed_subtitle (a debug source) or the final
+                           engine's own embed_subtitle (the "final"
+                           source) -- steps/mux.py embeds exactly the
+                           sources with this set to True, and leaves
+                           every other source as a job-directory/sidecar
+                           file only. See config.yaml's own comment on
+                           alignment.engines for what this toggle means.
     """
     key:                str
     label:              str
@@ -244,6 +263,7 @@ class SrtSource:
     sidecar_path:       Optional[Path]
     mp4_fallback_text:  str
     track_name:         str
+    embed:              bool
 
 
 def export_srt(
@@ -253,24 +273,41 @@ def export_srt(
     log: Optional[logging.LoggerAdapter] = None,
 ) -> list[SrtSource]:
     """
-    Step 6c: render each available transcript into its own SRT — every
-    alignment stage job.json's "alignment_stages" legend (steps/
-    transcribe.py) lists a transcript_{N}.json for (steps/merge.py), plus
-    transcript.json, the authoritative/censoring-relevant one.
+    Step 6c: render each configured transcript into its own SRT.
+
+    Candidates come from job.json's own "alignment_engines" list
+    (steps/transcribe.py) -- which already reflects exactly which
+    engines ran and what this run's own alignment.engines.* toggles
+    were, the same "record what was actually used" pattern
+    steps/mute.py's own job.json block follows elsewhere in this
+    pipeline -- not from re-reading config.yaml directly:
+
+      - every ENABLED engine with debug_subtitle: true gets its own
+        raw, unedited comparison SRT (transcript_<engine>.srt) --
+        karaoke-highlighted per transcript_srt.karaoke below, never
+        hushed. See "Why one SRT per engine..." above.
+      - the engine marked final: true, if it ALSO has final_subtitle:
+        true, additionally gets the authoritative SRT (transcript.srt)
+        -- plain one-cue-per-group, hushed per transcript_srt.hush
+        below, never karaoke.
+
+    Each returned SrtSource carries its own `embed` flag (that engine's
+    own alignment.engines.<name>.embed_subtitle) -- steps/mux.py embeds
+    exactly the sources with embed=True and leaves the rest as
+    job-directory/sidecar files only.
 
     output_video_path — the final output video's path (e.g. from
     steps.mux._output_path(), called early by pipeline.py for exactly
     this purpose). Used only to derive sidecar filenames
-    (<output_video_path.stem>.<language>.<N-or-nothing>.srt, written next
-    to it) — the file itself need not exist yet when this runs, since
-    Step 6c always runs before Step 7 actually produces it.
+    (<output_video_path.stem>.<language>.<engine-or-nothing>.srt,
+    written next to it) — the file itself need not exist yet when this
+    runs, since Step 6c always runs before Step 7 actually produces it.
 
-    Returns one SrtSource per stage that had a transcript_{N}.json with
-    at least one word with usable alignment timing, in ascending stage
-    order, followed by one more for transcript.json if it qualifies too
-    — so anywhere from 0 to (number of registered stages + 1) entries.
-    Empty whenever transcript_srt.enabled is false, or nothing at all
-    had any usable timing.
+    Returns one SrtSource per candidate above that actually has a
+    transcript file with at least one word with usable alignment timing.
+    Empty whenever transcript_srt.enabled is false, no engine has
+    debug_subtitle/final_subtitle turned on, or nothing at all had any
+    usable timing.
     """
     if log is None:
         log = step_logger("srt")
@@ -284,29 +321,39 @@ def export_srt(
         mark_step_done(job_dir, "6c_transcript_srt")
         return []
 
-    # Discovered from job.json's own "alignment_stages" legend (written
-    # by steps/transcribe.py), not a hardcoded list here -- see this
-    # module's own docstring ("Why one SRT per stage...") for why: a
-    # future stage 3 just starts appearing the moment that legend lists
-    # it, with nothing in this function needing to change.
-    candidates: list[tuple[str, str, Path, str]] = [
-        (
-            str(stage["number"]),
-            f"Stage {stage['number']} ({stage['label']})",
-            job_dir / f"transcript_{stage['number']}.json",
-            f"_{stage['number']}",
-        )
-        for stage in state.get("alignment_stages", [])
-    ]
-    candidates.append(("final", "Final", job_dir / "transcript.json", ""))
+    engines = state.get("alignment_engines", [])
+
+    candidates: list[dict] = []
+    for engine in engines:
+        if not engine.get("enabled") or not engine.get("debug_subtitle"):
+            continue
+        name = engine["engine"]
+        candidates.append({
+            "key":      name,
+            "label":    engine.get("label", name),
+            "path":     job_dir / f"transcript_{name}.json",
+            "suffix":   f"_{name}",
+            "is_final": False,
+            "embed":    bool(engine.get("embed_subtitle")),
+        })
+
+    final_engine_entry = next((e for e in engines if e.get("final")), None)
+    if final_engine_entry is not None and final_engine_entry.get("final_subtitle"):
+        candidates.append({
+            "key":      "final",
+            "label":    "Final",
+            "path":     job_dir / "transcript.json",
+            "suffix":   "",
+            "is_final": True,
+            "embed":    bool(final_engine_entry.get("embed_subtitle")),
+        })
 
     sources: list[SrtSource] = []
-    for key, label, transcript_path, suffix in candidates:
-        if not transcript_path.exists():
+    for c in candidates:
+        if not c["path"].exists():
             continue
         source = _export_one_source(
-            job_dir, output_video_path, key, label, suffix,
-            transcript_path, already_done, cfg, log,
+            job_dir, output_video_path, c, already_done, cfg, log,
         )
         if source is not None:
             sources.append(source)
@@ -315,9 +362,10 @@ def export_srt(
 
     if not sources:
         log.warning(
-            "Step 6c — no transcript (any alignment stage, or the "
-            "authoritative transcript.json) had any word with usable "
-            "alignment timing — nothing to export."
+            "Step 6c — no configured transcript (any engine's own "
+            "debug_subtitle, or the final engine's own final_subtitle) "
+            "had any word with usable alignment timing, or nothing was "
+            "configured for export at all — nothing to export."
         )
     log.info("  ✓  Step 6c complete.")
     return sources
@@ -326,40 +374,47 @@ def export_srt(
 def _export_one_source(
     job_dir: Path,
     output_video_path: Path,
-    key: str,
-    label: str,
-    suffix: str,
-    transcript_path: Path,
+    candidate: dict,
     already_done: bool,
     cfg: dict,
     log: logging.LoggerAdapter,
 ) -> Optional[SrtSource]:
     """
-    Process one transcript (one alignment stage's own, or the
-    authoritative one) into an SrtSource — shared logic for every source
-    export_srt() finds, called once per candidate.
+    Process one candidate (one engine's own debug transcript, or the
+    authoritative "final" one) into an SrtSource — shared logic for
+    every candidate export_srt() builds, called once per candidate.
 
-    suffix is the job_dir_path filename tag: "" for the authoritative
-    transcript.json (→ transcript.srt), or f"_{N}" for stage N (→
-    transcript_N.srt). The sidecar filename (<video>.eng.N.srt /
-    <video>.eng.srt) uses a dot-separated variant derived from `key`
-    instead -- see config.yaml's own documentation of write_sidecar for
-    the full naming convention and why the two differ.
+    candidate: {"key", "label", "path", "suffix", "is_final", "embed"} —
+    see export_srt() for how each is built. suffix is the job_dir_path
+    filename tag: "" for the authoritative transcript.json (→
+    transcript.srt), or f"_{engine_name}" for a debug source (→
+    transcript_<engine_name>.srt). The sidecar filename
+    (<video>.eng.<engine>.srt / <video>.eng.srt) uses a dot-separated
+    variant derived from `key` instead -- see config.yaml's own
+    documentation of write_sidecar for the full naming convention and
+    why the two differ.
 
-    Returns None if transcript_path has no word with usable alignment
+    Returns None if candidate["path"] has no word with usable alignment
     timing at all (nothing to place on a timeline either way) — logged,
     not an error.
 
-    Karaoke rendering (transcript_srt.karaoke) is only ever considered
-    for a per-stage source (key != "final") — the authoritative SRT is
-    always the plain, one-cue-per-group rendering, regardless of that
-    setting's own value. See config.yaml's karaoke comment for why: in
-    short, the authoritative track is the one meant for an actual viewer
-    (and, per the hush section below, the one whose text can already
-    read "s***" instead of the real word) — flickering per-word color on
-    every line reads as a debugging aid there, not a viewing feature; the
-    per-stage tracks are the debugging aid, and keep the precision.
+    Karaoke rendering (transcript_srt.karaoke) only ever applies when
+    is_final is False -- the authoritative SRT is always the plain,
+    one-cue-per-group rendering, regardless of that setting. See
+    config.yaml's karaoke comment for why: in short, the authoritative
+    track is the one meant for an actual viewer (and, per the hush
+    section below, the one whose text can already read "s***" instead of
+    the real word) — flickering per-word color on every line reads as a
+    debugging aid there, not a viewing feature; the debug tracks are the
+    debugging aid, and keep the precision.
     """
+    key             = candidate["key"]
+    label           = candidate["label"]
+    transcript_path = candidate["path"]
+    suffix          = candidate["suffix"]
+    is_final        = candidate["is_final"]
+    embed           = candidate["embed"]
+
     srt_out = job_dir / f"transcript{suffix}.srt"
 
     data      = json.loads(transcript_path.read_text())
@@ -381,12 +436,12 @@ def _export_one_source(
     # Only the authoritative source's own words are ever candidates for
     # hushing — censor_log.json's word timing is only ever computed
     # against transcript.json (steps/matching.py's find_matches()), so a
-    # per-stage transcript_N.json (key != "final") is left exactly as
-    # recognized. Done here, before grouping/wrapping below, so a
+    # per-engine transcript_<name>.json (is_final=False) is left exactly
+    # as recognized. Done here, before grouping/wrapping below, so a
     # replacement's actual on-screen length (not the original word's)
     # is what line-wrapping and sentence-boundary detection see — see
     # config.yaml's transcript_srt.hush comment for the full reasoning.
-    if key == "final":
+    if is_final:
         words = _apply_hush(words, job_dir, cfg, log)
 
     track_prefix = str(cfg_get(cfg, "transcript_srt", "track_name_prefix"))
@@ -397,8 +452,9 @@ def _export_one_source(
         track_language = str(cfg_get(cfg, "transcript_srt", "track_language"))
         # Dot-separated, not the underscore job_dir_path uses -- Plex/
         # Kodi's own "<basename>.<language>.<flag>.ext" convention (see
-        # config.yaml's write_sidecar comment) needs the stage number as
-        # its own dot-delimited segment, e.g. ".eng.2.srt", not ".eng_2.srt".
+        # config.yaml's write_sidecar comment) needs the engine name as
+        # its own dot-delimited segment, e.g. ".eng.mfa.srt", not
+        # ".eng_mfa.srt".
         sidecar_suffix = f".{key}" if key != "final" else ""
         sidecar_path = output_video_path.parent / (
             f"{output_video_path.stem}.{track_language}{sidecar_suffix}.srt"
@@ -433,21 +489,21 @@ def _export_one_source(
         # the overall step flag, since it's a cheap copy either way.
         if sidecar_path is not None:
             sidecar_path.write_text(srt_out.read_text(encoding="utf-8"), encoding="utf-8")
-        return SrtSource(key, label, srt_out, sidecar_path, plain_text, track_name)
+        return SrtSource(key, label, srt_out, sidecar_path, plain_text, track_name, embed)
 
-    # Karaoke only ever applies to a per-stage comparison source (key !=
-    # "final") -- see config.yaml's karaoke comment for the full
+    # Karaoke only ever applies to a per-engine comparison source
+    # (is_final=False) -- see config.yaml's karaoke comment for the full
     # rationale. The authoritative SRT is always plain_text, computed
     # above, regardless of transcript_srt.karaoke's own value.
-    karaoke_enabled = key != "final" and bool(cfg_get(cfg, "transcript_srt", "karaoke"))
+    karaoke_enabled = (not is_final) and bool(cfg_get(cfg, "transcript_srt", "karaoke"))
     chosen_text = (
         _render_srt(prepared, karaoke=True, color=color) if karaoke_enabled else plain_text
     )
 
     log.info(
         "Step 6c — exporting %s transcript to SRT  "
-        "(%d word(s) in %d group(s), karaoke=%s)",
-        label, len(words), len(prepared), karaoke_enabled,
+        "(%d word(s) in %d group(s), karaoke=%s, embed=%s)",
+        label, len(words), len(prepared), karaoke_enabled, embed,
     )
 
     tmp = tmp_output_path(srt_out)
@@ -470,13 +526,14 @@ def _export_one_source(
         "groups":  len(prepared),
         "cues":    n_cues,
         "karaoke": karaoke_enabled,
+        "embed":   embed,
         "file":    srt_out.name,
         "sidecar": sidecar_path.name if sidecar_path is not None else None,
     }
     state["transcript_srt"] = per_source
     write_job(job_dir, state)
 
-    return SrtSource(key, label, srt_out, sidecar_path, plain_text, track_name)
+    return SrtSource(key, label, srt_out, sidecar_path, plain_text, track_name, embed)
 
 
 # ── Hushing (redacting censor_log.json's muted words in the authoritative

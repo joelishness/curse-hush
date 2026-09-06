@@ -1,15 +1,18 @@
 """
 Regression tests for steps/transcribe_crisperwhisper.py's schema
-conversion, and for transcribe.py's guard against alignment.backend
-being set to "crisperwhisper" (see both modules' own docstrings for why
-that guard exists at all -- stage 3 doesn't share stage 1/2's "same
-text either way" property, so it must never become authoritative).
+conversion, and for the alignment-engine registry it plugs into (see
+steps/transcribe.py's own module docstring and utils.
+validate_alignment_engines()) -- in particular, that CrisperWhisper is a
+fully ordinary, independent engine that CAN be marked final like any
+other, with no special-casing left over from an earlier version of this
+codebase where it was comparison-only.
 
 Does NOT require the crisperwhisper package to be installed -- the
 model itself is mocked throughout; these tests are about this
-pipeline's own conversion/guard logic, not about crisperwhisper's real
-behavior (which needs a real install and real audio to check at all --
-see transcribe_crisperwhisper.py's own "NOT VALIDATED" section).
+pipeline's own conversion/registry/validation logic, not about
+crisperwhisper's real behavior (which needs a real install and real
+audio to check at all -- see transcribe_crisperwhisper.py's own
+docstring for the validation status).
 
 Run with:  PYTHONPATH=src python3 tests/test_transcribe_crisperwhisper.py
 """
@@ -22,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import logging
 from steps.transcribe_crisperwhisper import transcribe_with_crisperwhisper
 from steps import transcribe
+import utils
 
 log = logging.getLogger("test_transcribe_crisperwhisper")
 log.addHandler(logging.NullHandler())
@@ -41,6 +45,8 @@ class _FakeResult:
     def __init__(self, words):
         self.words = words
 
+
+# ── steps/transcribe_crisperwhisper.py: schema conversion ───────────────
 
 def test_word_schema_conversion():
     """word/start/end preserved as-is, score always None (no such field
@@ -75,9 +81,12 @@ def test_calls_transcribe_with_word_timestamps_true():
 
 def test_language_falls_back_to_english_default():
     """Mirrors the call site's own `language or "en"` -- an empty/None
-    language string (whisperx auto-detect not yet resolved, or no
-    speech detected at all for this segment) shouldn't be passed through
-    as a falsy value crisperwhisper has to guess about."""
+    language string (this engine's own alignment.engines.crisperwhisper.
+    language left null, or not yet resolved) shouldn't be passed through
+    as a falsy value crisperwhisper has to guess about. NOTE: unlike
+    alignment.engines.whisperx.language, null here does NOT mean
+    auto-detect -- this engine's transcribe() call has no such mode; see
+    this function's own docstring."""
     fake_model = MagicMock()
     fake_model.transcribe.return_value = _FakeResult([])
     transcribe_with_crisperwhisper(fake_model, Path("/tmp/fake.wav"), "", {}, log)
@@ -91,64 +100,127 @@ def test_empty_words_list_handled():
     assert words == []
 
 
-# ── transcribe.py: crisperwhisper can never be authoritative ────────────
-
-def test_alignment_stages_registry_includes_stage_3():
-    numbers = {s["number"] for s in transcribe._ALIGNMENT_STAGES}
-    assert numbers == {1, 2, 3}
-    assert transcribe._STAGE_BY_TOOL["crisperwhisper"]["number"] == 3
-
-
-def test_crisperwhisper_is_a_valid_backend_choice():
-    """
-    Reflects the corrected design: crisperwhisper CAN be
-    alignment.backend's value (the cascade is generic over stage number,
-    not hardcoded to stages 1-2 -- see transcribe.py's own docstring) --
-    this is no longer excluded the way an earlier version of this code
-    did. The real constraint is enabled=true, tested separately below.
-    """
-    assert "crisperwhisper" in transcribe._STAGE_BY_TOOL
-    assert transcribe._STAGE_BY_TOOL["crisperwhisper"]["number"] == 3
-
-
-def test_crisperwhisper_backend_requires_enabled_true():
-    """
-    alignment.backend: crisperwhisper without
-    alignment.crisperwhisper.enabled: true would mean stage 3 never runs
-    at all, silently cascading every segment to stage 2/1 instead --
-    transcribe.py raises explicitly rather than allowing that silent
-    footgun. Exercises the actual validation logic by reproducing it
-    exactly as transcribe.py's own module body does (that logic lives
-    inline in the transcribe() function, not in a separately-callable
-    unit, so this mirrors it rather than importing it directly).
-    """
-    align_backend = "crisperwhisper"
-    crisperwhisper_enabled = False
-    try:
-        if align_backend not in transcribe._STAGE_BY_TOOL:
-            raise ValueError("not a registered tool")
-        if align_backend == "crisperwhisper" and not crisperwhisper_enabled:
-            raise ValueError(
-                "alignment.backend is 'crisperwhisper' but "
-                "alignment.crisperwhisper.enabled is false"
-            )
-        raise AssertionError("should have raised")
-    except ValueError as e:
-        assert "enabled" in str(e)
-
-
-def test_transcribe_module_imports_without_crisperwhisper_installed():
+def test_transcribe_crisperwhisper_module_imports_without_crisperwhisper_installed():
     """
     The crisperwhisper import lives inside load_crisperwhisper_model(),
     not at module level -- confirms an existing deployment that never
-    enables alignment.crisperwhisper.enabled is completely unaffected by
-    this feature, including not needing the package installed at all.
-    This test itself is the proof: if the import were module-level, this
-    process (which has NOT installed crisperwhisper) would already have
-    failed just by importing steps.transcribe_crisperwhisper above.
+    enables alignment.engines.crisperwhisper.enabled is completely
+    unaffected by this engine, including not needing the package
+    installed at all. This test itself is the proof: if the import were
+    module-level, this process (which has NOT installed crisperwhisper)
+    would already have failed just by importing
+    steps.transcribe_crisperwhisper above.
     """
     import steps.transcribe_crisperwhisper  # noqa: F401 -- already imported; re-import is a no-op, just documents the assertion
     assert True
+
+
+# ── steps/transcribe.py: the engine registry itself ──────────────────────
+
+def test_engine_registry_has_all_three_engines():
+    """
+    utils.ALIGNMENT_ENGINE_NAMES is the single shared registry
+    steps/transcribe.py's own dispatch and utils.
+    validate_alignment_engines()/alignment_engines_summary() all key off
+    -- confirms transcribe.py imports and re-exposes it as _ENGINES
+    (rather than defining its own, separate list that could drift out of
+    sync), and that every registered engine has a display label.
+    """
+    assert transcribe._ENGINES == utils.ALIGNMENT_ENGINE_NAMES
+    assert set(transcribe._ENGINES) == {"whisperx", "mfa", "crisperwhisper"}
+    for name in transcribe._ENGINES:
+        assert transcribe._engine_label(name), f"{name} has no display label"
+
+
+def test_crisperwhisper_can_be_marked_final_like_any_other_engine():
+    """
+    Reflects the corrected design: any registered engine, including
+    crisperwhisper, CAN be alignment.engines.<name>.final: true -- there
+    is no special-casing that excludes it the way an earlier version of
+    this codebase did (when crisperwhisper was "comparison-only" and
+    could never become authoritative). This is now this config's own
+    DEFAULT (see config.yaml's alignment.engines.crisperwhisper block),
+    following real-world validation against Independence Day (1996)
+    finding it more accurate than both whisperx and mfa.
+    """
+    cfg = {"alignment": {"engines": {
+        "whisperx":       {"enabled": False, "debug_subtitle": False, "final": False, "final_subtitle": False, "embed_subtitle": False},
+        "mfa":            {"enabled": False, "debug_subtitle": False, "final": False, "final_subtitle": False, "embed_subtitle": False},
+        "crisperwhisper": {"enabled": True,  "debug_subtitle": True,  "final": True,  "final_subtitle": True,  "embed_subtitle": False},
+    }}}
+    utils.validate_alignment_engines(cfg)  # must not raise
+
+    toggles = {name: transcribe._engine_toggles(cfg, name) for name in transcribe._ENGINES}
+    final_engines = [name for name in transcribe._ENGINES if toggles[name]["final"]]
+    assert final_engines == ["crisperwhisper"]
+
+
+def test_final_or_debug_subtitle_without_enabled_is_rejected():
+    """
+    alignment.engines.<name>.final: true (or debug_subtitle: true)
+    without that same engine's own enabled: true is caught by
+    utils.validate_alignment_engines() at startup -- an engine that
+    never runs can't be authoritative, and there's nothing to render a
+    debug subtitle from. Exercises the real validation function
+    directly, not a re-derivation of its logic -- unlike an earlier
+    version of this codebase's own tests for the (now-removed)
+    alignment.backend cascade, which had to mirror inline pipeline logic
+    because no standalone, importable check existed yet.
+    """
+    cfg = {"alignment": {"engines": {
+        "whisperx":       {"enabled": False, "debug_subtitle": True, "final": False, "final_subtitle": False, "embed_subtitle": False},
+        "mfa":            {"enabled": False, "debug_subtitle": False, "final": False, "final_subtitle": False, "embed_subtitle": False},
+        "crisperwhisper": {"enabled": True,  "debug_subtitle": True,  "final": True,  "final_subtitle": True,  "embed_subtitle": False},
+    }}}
+    try:
+        utils.validate_alignment_engines(cfg)
+        raise AssertionError("should have raised ConfigError")
+    except utils.ConfigError as e:
+        assert "debug_subtitle" in str(e) and "enabled" in str(e)
+
+
+def test_zero_or_multiple_final_engines_is_rejected():
+    """Exactly one enabled engine must be final -- zero and two-plus are
+    both rejected, each with a message naming the actual problem."""
+    zero_final = {"alignment": {"engines": {
+        "whisperx":       {"enabled": True, "debug_subtitle": False, "final": False, "final_subtitle": False, "embed_subtitle": False},
+        "mfa":            {"enabled": False, "debug_subtitle": False, "final": False, "final_subtitle": False, "embed_subtitle": False},
+        "crisperwhisper": {"enabled": False, "debug_subtitle": False, "final": False, "final_subtitle": False, "embed_subtitle": False},
+    }}}
+    try:
+        utils.validate_alignment_engines(zero_final)
+        raise AssertionError("should have raised ConfigError")
+    except utils.ConfigError as e:
+        assert "none" in str(e).lower()
+
+    two_final = {"alignment": {"engines": {
+        "whisperx":       {"enabled": True, "debug_subtitle": False, "final": True, "final_subtitle": False, "embed_subtitle": False},
+        "mfa":            {"enabled": False, "debug_subtitle": False, "final": False, "final_subtitle": False, "embed_subtitle": False},
+        "crisperwhisper": {"enabled": True,  "debug_subtitle": False, "final": True, "final_subtitle": False, "embed_subtitle": False},
+    }}}
+    try:
+        utils.validate_alignment_engines(two_final)
+        raise AssertionError("should have raised ConfigError")
+    except utils.ConfigError as e:
+        assert "more than one" in str(e).lower()
+
+
+def test_mfa_enabled_without_whisperx_enabled_is_a_valid_configuration():
+    """
+    alignment.engines.mfa.enabled: true with alignment.engines.whisperx.
+    enabled: false is NOT a validation error -- it's the documented,
+    supported shape where WhisperX's own recognition+alignment runs
+    internally as MFA's required input (see steps/transcribe.py's own
+    module docstring) without being separately exposed. This test exists
+    specifically so that invariant doesn't regress into an accidental
+    validation error later.
+    """
+    cfg = {"alignment": {"engines": {
+        "whisperx":       {"enabled": False, "debug_subtitle": False, "final": False, "final_subtitle": False, "embed_subtitle": False},
+        "mfa":            {"enabled": True,  "debug_subtitle": True,  "final": True,  "final_subtitle": True,  "embed_subtitle": False},
+        "crisperwhisper": {"enabled": False, "debug_subtitle": False, "final": False, "final_subtitle": False, "embed_subtitle": False},
+    }}}
+    utils.validate_alignment_engines(cfg)  # must not raise
 
 
 if __name__ == "__main__":
@@ -157,10 +229,12 @@ if __name__ == "__main__":
         test_calls_transcribe_with_word_timestamps_true,
         test_language_falls_back_to_english_default,
         test_empty_words_list_handled,
-        test_alignment_stages_registry_includes_stage_3,
-        test_crisperwhisper_is_a_valid_backend_choice,
-        test_crisperwhisper_backend_requires_enabled_true,
-        test_transcribe_module_imports_without_crisperwhisper_installed,
+        test_transcribe_crisperwhisper_module_imports_without_crisperwhisper_installed,
+        test_engine_registry_has_all_three_engines,
+        test_crisperwhisper_can_be_marked_final_like_any_other_engine,
+        test_final_or_debug_subtitle_without_enabled_is_rejected,
+        test_zero_or_multiple_final_engines_is_rejected,
+        test_mfa_enabled_without_whisperx_enabled_is_a_valid_configuration,
     ]:
         _run(fn)
     print("\nALL TESTS PASSED")

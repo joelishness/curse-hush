@@ -102,15 +102,21 @@ natively via a different mechanism than Matroska, but ffmpeg already
 does this by default for a single input — kept explicit here rather than
 relying on that default).
 
-**Each available aligned-transcript SRT (Step 6c — steps/transcript_srt.py's
-export_srt(), zero to two of them: "mfa" and/or "whisperx") is embedded as
-an ADDITIONAL subtitle track — separate from, and unaffected by, the
-mp4-path limitation just above.** That limitation concerns the *original*
-video's own subtitle tracks (arbitrary formats, some of them the exact
-PGS/bitmap tracks ffmpeg can't reliably parse); these are always plain
-UTF-8 SRT text steps/transcript_srt.py wrote itself, so they hit neither
-problem that motivated skipping subtitle passthrough for mp4 in the first
-place.
+**Each configured transcript SRT (Step 6c — steps/transcript_srt.py's
+export_srt(), zero to (number of debug_subtitle-enabled engines, plus one
+more if the final engine has final_subtitle: true) of them) whose own
+alignment.engines.<name>.embed_subtitle is true gets embedded as an
+ADDITIONAL subtitle track — separate from, and unaffected by, the
+mp4-path limitation just above.** Each SrtSource steps/transcript_srt.py
+returns carries its own `embed` flag already resolved from that setting
+(see that module's own docstring) — this step never reads
+alignment.engines.* itself, it just respects whichever sources arrive
+with embed=True and leaves the rest as job-directory/sidecar files only.
+That limitation concerns the *original* video's own subtitle tracks
+(arbitrary formats, some of them the exact PGS/bitmap tracks ffmpeg can't
+reliably parse); these are always plain UTF-8 SRT text
+steps/transcript_srt.py wrote itself, so they hit neither problem that
+motivated skipping subtitle passthrough for mp4 in the first place.
 
   mkv: each source added as one more mkvmerge input file, with
     --language / --track-name / --default-track-flag scoped to it via
@@ -172,7 +178,9 @@ place.
   Skipped entirely — no subtitle-related flags added to either command —
   whenever subtitle_sources is empty (transcript_srt.enabled is false,
   Step 6c failed, or neither transcript had any word with usable timing —
-  see steps/transcript_srt.py) or transcript_srt.embed_in_output is false.
+  see steps/transcript_srt.py) or none of the sources present have
+  embed=True (i.e. every relevant alignment.engines.<name>.
+  embed_subtitle is false).
 
 Crash safety: the muxed file is written to a temp sibling inside /output
 (utils.tmp_output_path() / finalize_output() — the same write-then-rename
@@ -242,12 +250,14 @@ def mux(
     docstring for why these differ).
 
     subtitle_sources -- steps/transcript_srt.py's export_srt() return
-    value, passed straight through from pipeline.py: zero, one, or two
-    SrtSource entries (one per alignment backend that had a transcript to
-    export). None or an empty list embeds nothing and reproduces this
-    function's exact pre-Step-6c behavior; see the module docstring above
-    for how each entry is used differently for mkv vs mp4 output when
-    there's at least one.
+    value, passed straight through from pipeline.py: zero or more
+    SrtSource entries, each already carrying its own `embed` flag
+    resolved from that engine's alignment.engines.<name>.embed_subtitle
+    (see steps/transcript_srt.py's own docstring). None or an empty list
+    (or a list where every entry has embed=False) embeds nothing and
+    reproduces this function's exact pre-Step-6c behavior; see the
+    module docstring above for how an embeddable entry is used
+    differently for mkv vs mp4 output.
 
     Returns the path to the final output file in /output.
 
@@ -335,10 +345,14 @@ def mux(
     tmp_path.unlink(missing_ok=True)  # leftover from a previous interrupted attempt, if any
 
     subtitle_sources = subtitle_sources or []
-    embed_subtitles = (
-        bool(subtitle_sources)
-        and bool(cfg_get(cfg, "transcript_srt", "embed_in_output"))
-    )
+    # Per-source, not a single global gate any more -- each SrtSource
+    # already carries its own resolved embed flag (that engine's own
+    # alignment.engines.<name>.embed_subtitle -- see
+    # steps/transcript_srt.py's own docstring). This step never reads
+    # alignment.engines.* itself; it just respects whichever sources
+    # arrive with embed=True.
+    embeddable_sources = [s for s in subtitle_sources if s.embed]
+    embed_subtitles = bool(embeddable_sources)
     track_lang = str(cfg_get(cfg, "transcript_srt", "track_language"))
 
     if out_format == "mkv":
@@ -355,7 +369,7 @@ def mux(
         # see _probe_subtitle_tracks()'s own docstring for what changing
         # that setting between runs does to this matching.
         if embed_subtitles:
-            configured_names = {s.track_name for s in subtitle_sources}
+            configured_names = {s.track_name for s in embeddable_sources}
             existing_subs = _probe_subtitle_tracks(video_path, log)
             all_sub_ids = [t["id"] for t in existing_subs]
             replace_ids = [
@@ -378,9 +392,7 @@ def mux(
 
         cmd += ["--no-audio", str(video_path), str(audio_encoded_path)]
 
-        for source in subtitle_sources:
-            if not embed_subtitles:
-                break
+        for source in embeddable_sources:
             # source.job_dir_path as-is -- whatever style
             # transcript_srt.karaoke wrote, mkvmerge preserves it
             # byte-for-byte (S_TEXT/UTF8) -- see module docstring.
@@ -412,13 +424,12 @@ def mux(
         # One code path either way, correct in both cases, and nothing
         # left behind afterward.
         subtitle_tmps: list[Path] = []
-        if embed_subtitles:
-            for i, source in enumerate(subtitle_sources):
-                if not source.mp4_fallback_text:
-                    continue
-                tmp_srt = job_dir / f".transcript_mp4_embed_{source.key}.srt"
-                tmp_srt.write_text(source.mp4_fallback_text, encoding="utf-8")
-                subtitle_tmps.append(tmp_srt)
+        for source in embeddable_sources:
+            if not source.mp4_fallback_text:
+                continue
+            tmp_srt = job_dir / f".transcript_mp4_embed_{source.key}.srt"
+            tmp_srt.write_text(source.mp4_fallback_text, encoding="utf-8")
+            subtitle_tmps.append(tmp_srt)
 
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -435,7 +446,7 @@ def mux(
         if subtitle_tmps:
             cmd += ["-c:s", "mov_text"]
             for i, source in enumerate(
-                s for s in subtitle_sources if s.mp4_fallback_text
+                s for s in embeddable_sources if s.mp4_fallback_text
             ):
                 cmd += [
                     f"-metadata:s:s:{i}", f"language={track_lang}",
@@ -479,9 +490,7 @@ def mux(
         "output_filename": out_path.name,
         "format": out_format,
         "tool":   tool,
-        "subtitles_embedded": (
-            [s.key for s in subtitle_sources] if embed_subtitles else []
-        ),
+        "subtitles_embedded": [s.key for s in embeddable_sources],
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "7_mux")

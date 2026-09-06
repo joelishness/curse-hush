@@ -145,12 +145,12 @@ def test_merge_handles_degraded_and_empty_chunks():
 
 
 def _cfg():
-    return {"alignment": {"mfa": {
+    return {"alignment": {"engines": {"mfa": {
         "acoustic_model": "english_mfa", "dictionary": "english_mfa", "g2p_model": None,
         "beam": 400, "retry_beam": 1000, "fallback_to_whisperx": True,
         "chunk_target_sec": 25, "chunk_edge_margin_sec": 0.3,
         "chunk_timeout_sec": 120,
-    }}}
+    }}}}
 
 
 # ── _slice_wav: real ffmpeg, real audio, sub-ms precision check ─────────

@@ -90,8 +90,9 @@ RUN pip install --no-cache-dir \
         pyyaml \
         praatio
 
-# ── CrisperWhisper (stage 3, comparison-only, see config.yaml's own
-#    alignment.crisperwhisper and steps/transcribe_crisperwhisper.py) ───────
+# ── CrisperWhisper (this config's default final transcription engine,
+#    see config.yaml's own alignment.engines.crisperwhisper and
+#    steps/transcribe_crisperwhisper.py) ─────────────────────────────────────
 # [ct2] extra, not [transformers]: this is crisperwhisper's own preferred
 # backend (its backend="auto" resolution tries ct2 first, falling back to
 # transformers only if ct2 isn't installed at all -- confirmed by reading
@@ -99,7 +100,7 @@ RUN pip install --no-cache-dir \
 # CTranslate2's whole purpose -- it's the same engine faster-whisper above
 # is built on), and gives full float32 precision with no quality tradeoff
 # when compute_type is set explicitly (see config.yaml's own comment on
-# alignment.crisperwhisper.compute_type) -- confirmed by reading
+# alignment.engines.crisperwhisper.compute_type) -- confirmed by reading
 # converter.py: float32 is a first-class supported quantization option,
 # not a fallback/workaround.
 #
@@ -122,10 +123,10 @@ RUN pip install --no-cache-dir \
 # reasoning as MFA's own models below) are under a non-commercial research
 # license, NOT MIT the way this inference code is -- see
 # steps/transcribe_crisperwhisper.py's own module docstring before
-# enabling alignment.crisperwhisper.enabled in config.yaml.
+# enabling alignment.engines.crisperwhisper.enabled in config.yaml.
 RUN pip install --no-cache-dir "crisperwhisper[ct2]"
 
-# ── Montreal Forced Aligner (default alignment.backend, see config.yaml) ───
+# ── Montreal Forced Aligner (see config.yaml's alignment.engines.mfa) ──────
 # Used in place of whisperx.align() to fix a real, confirmed failure mode:
 # whisperx's wav2vec2/CTC aligner faithfully aligns words *within whatever
 # segment boundaries WhisperX's own transcribe() already committed to* --
@@ -152,11 +153,16 @@ RUN pip install --no-cache-dir "crisperwhisper[ct2]"
 # _mfa_cmd()), never by merging them onto one shared PATH -- an earlier
 # version of this tried that and it broke Step 2's own demucs invocation.
 #
-# This block is required for the default config (alignment.backend: mfa).
-# Only skip it (comment this block out and rebuild) if you're setting
-# alignment.backend: whisperx everywhere and deliberately accepting the
-# drift behavior documented above -- nothing else in this image depends on
-# it either way. Adds roughly 300-500MB for the conda env + MFA software
+# This block is OPTIONAL for the default config: alignment.engines.mfa.
+# enabled is false by default (crisperwhisper is this config's default
+# final engine instead -- see config.yaml's own alignment.engines
+# comment), so a build that skips this block (comment it out and rebuild)
+# runs the default config fine with zero impact. It's only actually
+# needed once alignment.engines.mfa.enabled: true is set in config.yaml --
+# at that point this becomes required, since MFA needs the conda env this
+# block creates. Keeping it in the image by default, even unused, means
+# flipping that one config setting later doesn't also require a rebuild.
+# Adds roughly 300-500MB for the conda env + MFA software
 # itself; the larger pretrained-model download (~1-2GB) happens lazily on
 # first real use, into /cache, not here -- see the MFA_ROOT_DIR comment
 # below for why baking it into the image wouldn't actually help anyway.
@@ -203,10 +209,10 @@ RUN /opt/conda/bin/conda create -y -n mfa -c conda-forge montreal-forced-aligner
 #      mean every single job re-downloads and re-initializes from
 #      scratch, since each container gets a fresh copy of the image's own
 #      filesystem layer. Pointing at /cache instead means this cost is
-#      paid once, ever (whenever the first job that uses alignment.backend:
-#      mfa happens to run), exactly matching how whisperx's own models
-#      already behave via TORCH_HOME/HF_HOME below -- not a new pattern,
-#      the same one.
+#      paid once, ever (whenever the first job with alignment.engines.
+#      mfa.enabled: true happens to run), exactly matching how whisperx's
+#      own models already behave via TORCH_HOME/HF_HOME below -- not a
+#      new pattern, the same one.
 ENV MFA_ROOT_DIR=/cache/mfa
 
 # Deliberately NOT adding /opt/conda/envs/mfa/bin to PATH here. A conda env's
@@ -255,7 +261,8 @@ ENV XDG_CACHE_HOME=/cache
 #   3. Every file under /app must actually be *readable*, and every
 #      directory under it *traversable*, by an arbitrary non-root UID/GID —
 #      see the chmod after the COPY instructions below.
-#   4. PostgreSQL's initdb (alignment.backend: mfa's database server) does
+#   4. PostgreSQL's initdb (needed by MFA's database server, whenever
+#      alignment.engines.mfa.enabled is true -- see config.yaml) does
 #      its own getpwuid()-style lookup on startup and refuses outright if it
 #      can't resolve the current UID to a name — confirmed directly against
 #      a real run: "initdb: could not look up effective user ID N: user

@@ -1,9 +1,12 @@
 """
-Word-level alignment via Montreal Forced Aligner (MFA) — the default
-alignment engine as of this version (config.yaml's alignment.backend: mfa).
-Falls back to whisperx.align()'s wav2vec2/CTC alignment per-segment (and,
-as of this version, per-chunk within a segment — see CHUNKING below) on
-failure; see that file for the reasoning behind the switch. Short version:
+Word-level alignment via Montreal Forced Aligner (MFA) — one of three
+independently-toggleable transcription/alignment engines this pipeline
+supports (see config.yaml's alignment.engines.mfa.enabled). Invoked from
+steps/transcribe.py whenever that setting is true, regardless of whether
+MFA is also this job's authoritative (`final: true`) engine. Falls back
+to whisperx.align()'s wav2vec2/CTC alignment per-segment (and, as of this
+version, per-chunk within a segment — see CHUNKING below) on failure; see
+that file for the reasoning behind the switch. Short version:
 whisperx.align() aligns *within* whatever segment boundary WhisperX's own
 transcribe() pass already committed to, so a chunk-boundary timing error
 upstream (see docs/timestamp-drift-investigation.md) propagates straight
@@ -15,9 +18,9 @@ about — see the same doc for the before/after numbers on the original,
 whole-segment-per-call design.
 
 Imported unconditionally at the top of transcribe.py (not behind a
-conditional "only if backend == mfa" guard) — this module's own top-level
+conditional "only if mfa.enabled" guard) — this module's own top-level
 imports are stdlib + utils only, so there's no cost to importing it even on
-a job that ends up using whisperx for every segment.
+a job that never turns MFA on at all.
 
 CHUNKING — why, and why it doesn't undo the paragraph above:
 The original version of this function handed align_one one entire ~30-
@@ -34,7 +37,7 @@ should generally stay under ~30s, and that align_one/single-file alignment
 specifically isn't really intended for long files at all.
 
 So this now runs align_one once per short chunk (target
-alignment.mfa.chunk_target_sec, built from consecutive whisper_segments —
+alignment.engines.mfa.chunk_target_sec, built from consecutive whisper_segments —
 see _build_alignment_chunks()) instead of once for the whole job-segment.
 The risk that raises: whisper_segments' own start/end timestamps are
 *exactly* the untrusted signal this whole module exists to not depend on
@@ -110,7 +113,7 @@ to reach for a third time.
 
 THE ACTUAL FIX — stop trying to search for it at all:
 [slice_start, slice_end) is now the chunk's own claimed [start, end] from
-WhisperX plus a small, FIXED edge margin (alignment.mfa.chunk_edge_margin_sec,
+WhisperX plus a small, FIXED edge margin (alignment.engines.mfa.chunk_edge_margin_sec,
 default well under a second) — not a generously padded search window, and
 nothing tries to find real audio beyond it. A chunk affected by genuine
 WhisperX timestamp drift will generally fail to align in a window this
@@ -160,7 +163,7 @@ A per-chunk MFA failure (timeout, bad exit, a discarded out-of-sequence
 result) is NOT fatal to the whole segment the way it was before chunking —
 it degrades just that chunk's words to stage 1 timing and moves on to the
 next chunk, via the same _interpolate_stage2_words() path a chunk with no
-alignable text already falls through today. alignment.mfa.fallback_to_whisperx
+alignable text already falls through today. alignment.engines.mfa.fallback_to_whisperx
 still controls the coarser, whole-segment case (MFA fundamentally unusable
 right now — no conda, models not downloaded, G2P grapheme lookup failing —
 see align_with_mfa()'s early checks): those are environment problems every
@@ -434,7 +437,7 @@ def align_with_mfa(
     CHUNKING: rather than one align_one call for this whole (typically
     ~30-minute) job-segment, this runs one call per short chunk of
     consecutive whisper_segments (_build_alignment_chunks(),
-    alignment.mfa.chunk_target_sec) — see this module's own docstring for
+    alignment.engines.mfa.chunk_target_sec) — see this module's own docstring for
     why, and for the padding + cross-chunk monotonicity check that keeps
     this from silently reintroducing a dependency on WhisperX's own
     (sometimes drift-affected) segment timestamps. A single chunk's MFA
@@ -448,7 +451,7 @@ def align_with_mfa(
     G2P model's grapheme set unreadable — checked once, up front, before
     any chunk is attempted, since there would be no point discovering the
     same environment problem N times over. If
-    alignment.mfa.fallback_to_whisperx is true (the default), the caller
+    alignment.engines.mfa.fallback_to_whisperx is true (the default), the caller
     (transcribe.py) is expected to catch MFAError and retry this segment
     through the whisperx.align() path entirely instead — this function
     itself does not know how to do that fallback, since it has no access
@@ -457,21 +460,21 @@ def align_with_mfa(
     if not whisper_segments:
         return []
 
-    acoustic_model = cfg_get(cfg, "alignment", "mfa", "acoustic_model")
-    dictionary     = cfg_get(cfg, "alignment", "mfa", "dictionary")
+    acoustic_model = cfg_get(cfg, "alignment", "engines", "mfa", "acoustic_model")
+    dictionary     = cfg_get(cfg, "alignment", "engines", "mfa", "dictionary")
     # allow_null=True (not default=): g2p_model IS a config.yaml schema key
     # (see config.yaml's alignment.mfa block) that may legitimately be set
     # to `null` to disable G2P fallback -- distinct from a key that's
     # absent from the schema entirely, which is what `default=` is for
     # (see utils.cfg_get()'s docstring). Using default= here would also
     # mask a genuine config.yaml typo/omission instead of raising.
-    g2p_model      = cfg_get(cfg, "alignment", "mfa", "g2p_model", allow_null=True)
-    beam           = int(cfg_get(cfg, "alignment", "mfa", "beam"))
-    retry_beam     = int(cfg_get(cfg, "alignment", "mfa", "retry_beam"))
-    fallback_allowed = bool(cfg_get(cfg, "alignment", "mfa", "fallback_to_whisperx"))
-    chunk_target_sec = float(cfg_get(cfg, "alignment", "mfa", "chunk_target_sec"))
-    chunk_edge_margin_sec = float(cfg_get(cfg, "alignment", "mfa", "chunk_edge_margin_sec"))
-    chunk_timeout_sec    = float(cfg_get(cfg, "alignment", "mfa", "chunk_timeout_sec"))
+    g2p_model      = cfg_get(cfg, "alignment", "engines", "mfa", "g2p_model", allow_null=True)
+    beam           = int(cfg_get(cfg, "alignment", "engines", "mfa", "beam"))
+    retry_beam     = int(cfg_get(cfg, "alignment", "engines", "mfa", "retry_beam"))
+    fallback_allowed = bool(cfg_get(cfg, "alignment", "engines", "mfa", "fallback_to_whisperx"))
+    chunk_target_sec = float(cfg_get(cfg, "alignment", "engines", "mfa", "chunk_target_sec"))
+    chunk_edge_margin_sec = float(cfg_get(cfg, "alignment", "engines", "mfa", "chunk_edge_margin_sec"))
+    chunk_timeout_sec    = float(cfg_get(cfg, "alignment", "engines", "mfa", "chunk_timeout_sec"))
 
     # Checked here, before _ensure_mfa_ready() (which is otherwise the first
     # thing to shell out) rather than only right before the first align_one
@@ -483,13 +486,14 @@ def align_with_mfa(
     conda_exe = os.environ.get("MFA_CONDA_EXE", "/opt/conda/bin/conda")
     if not Path(conda_exe).exists():
         raise MFAError(
-            f"alignment.backend is 'mfa' but {conda_exe} doesn't exist. "
-            "MFA is a conda-forge package (needs the compiled `kalpy` Kaldi "
-            "bindings, which aren't on PyPI) — see the Dockerfile's MFA "
-            "install stage. `pip install montreal-forced-aligner` alone is "
-            "not sufficient; it installs but fails at import time with "
-            "`ModuleNotFoundError: No module named '_kalpy'`. If MFA is "
-            "installed at a different location, set MFA_CONDA_EXE."
+            f"alignment.engines.mfa.enabled is true but {conda_exe} doesn't "
+            "exist. MFA is a conda-forge package (needs the compiled "
+            "`kalpy` Kaldi bindings, which aren't on PyPI) — see the "
+            "Dockerfile's MFA install stage. `pip install "
+            "montreal-forced-aligner` alone is not sufficient; it installs "
+            "but fails at import time with `ModuleNotFoundError: No module "
+            "named '_kalpy'`. If MFA is installed at a different location, "
+            "set MFA_CONDA_EXE."
         )
 
     _ensure_mfa_ready(acoustic_model, dictionary, g2p_model, log)
@@ -956,7 +960,7 @@ def _align_chunk(
     for a whole segment, scoped to one chunk instead.
 
     slice_start/slice_end are the chunk's own claimed boundaries plus a
-    small, fixed edge margin (alignment.mfa.chunk_edge_margin_sec) -- NOT
+    small, fixed edge margin (alignment.engines.mfa.chunk_edge_margin_sec) -- NOT
     a generously padded search window. Two earlier versions of this tried
     generous padding, once handed to align_one directly and once trimmed
     first via real silence detection; both were validated against real
@@ -1084,7 +1088,7 @@ def _align_chunk(
 
     if returncode != 0:
         if timed_out:
-            reason = f"align_one did not finish within {timeout_sec:.0f}s (alignment.mfa.chunk_timeout_sec)"
+            reason = f"align_one did not finish within {timeout_sec:.0f}s (alignment.engines.mfa.chunk_timeout_sec)"
         else:
             hint = ""
             if "Composition failure" in stderr:

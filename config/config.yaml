@@ -44,328 +44,269 @@ demucs:
   shifts: 1
 
 
-# ── Speech transcription (Step 3) ───────────────────────────────────────────
-whisperx:
-
-  # Whisper model size.
-  #   large-v2  — recommended; best overall accuracy (default)
-  #   large-v3  — newer but has known regression cases on some audio; use
-  #               with caution
-  #   medium    — faster, lower accuracy; acceptable for clean audio
-  #   small     — for quick sanity-check runs only
-  model: large-v2
-
-  # ISO 639-1 language code.  Set to null for auto-detection.
-  # Auto-detect adds a few seconds of startup overhead.
-  language: en
-
-  # Batch size for inference.  Lower than GPU default; tuned for CPU
-  # memory pressure.  Reduce to 2 if you see OOM errors on low-RAM hosts.
-  batch_size: 4
-
-  # Beam search width.  Higher = more accurate transcription, slower.
-  #   5  — good quality / speed tradeoff (default)
-  #   10 — maximum quality
-  beam_size: 5
-
-  device: cpu
-
-  # Numeric precision for inference.
-  #   int8    — recommended for CPU: lower memory usage, faster inference
-  #   float32 — fallback if int8 causes issues with a specific model build
-  #   float16 — GPU only; ignored on CPU
-  compute_type: int8
-
-
-# ── Word-level alignment (Step 3, after WhisperX's own transcription pass) ──
+# ── Transcription & word-level alignment (Step 3) ───────────────────────────
+#
+# Every engine this pipeline knows how to run, and what to do with each
+# one's output, lives under alignment.engines below. Each engine is fully
+# independent and separately toggled -- there is no "authoritative
+# backend" setting any more, and no implicit "run everything up to the
+# authoritative one" cascade the way earlier versions of this pipeline
+# had (a single alignment.backend value, plus an alignment.dual_output
+# on/off switch that ran a second engine purely for comparison). An
+# engine runs if and only if its own `enabled` is true, full stop, with
+# exactly one narrow, documented exception (alignment.engines.whisperx,
+# below) that's a structural dependency, not a policy choice.
+#
+# See docs/timestamp-drift-investigation.md for why mfa and crisperwhisper
+# exist at all: whisperx's own wav2vec2/CTC alignment was found to
+# silently drift several seconds following a segment WhisperX's own
+# transcribe() pass mis-timed internally, and for the validated
+# comparison between whisperx and mfa on Independence Day (1996).
+# crisperwhisper was tested the same way, directly against the same
+# film, and found more accurate than both -- see
+# steps/transcribe_crisperwhisper.py's own module docstring for the full
+# writeup, which is why it's this config's default final engine below.
+#
+# For each engine, five settings mean the same thing everywhere (see
+# steps/transcribe.py's own module docstring for the full mechanics):
+#
+#   enabled          — Transcribe? Whether this engine runs at all this
+#                       job. false means genuinely zero compute spent on
+#                       it -- with ONE documented exception: see
+#                       alignment.engines.whisperx's own comment below.
+#   debug_subtitle    — Debug subtitle? Export this engine's own,
+#                       unedited transcript as a per-engine comparison
+#                       subtitle track (karaoke-highlighted, per
+#                       transcript_srt.karaoke below) -- see
+#                       steps/transcript_srt.py. Requires enabled: true.
+#   final             — Final transcript? Is THIS engine's transcript
+#                       the authoritative one -- the one Step 4b actually
+#                       flags words against, and Step 5 actually
+#                       mutes/beeps from. Exactly one enabled engine
+#                       must have this set to true (checked at startup,
+#                       before Step 1a runs -- see
+#                       utils.validate_alignment_engines()).
+#   final_subtitle    — Final subtitle? Only consulted on whichever
+#                       engine has final: true. Whether to also export
+#                       that transcript as the "final" subtitle track --
+#                       plain text, no karaoke highlighting, with muted
+#                       words redacted per transcript_srt.hush below.
+#                       You can use an engine for muting without wanting
+#                       a subtitle file out of it at all by leaving this
+#                       false.
+#   embed_subtitle    — Embed subtitle? Whether to mux this engine's own
+#                       subtitle output(s) -- its debug track (if
+#                       debug_subtitle above) and/or the final track (if
+#                       this engine is final and final_subtitle above)
+#                       -- into the delivered output video
+#                       (steps/mux.py), on top of writing it to the job
+#                       directory / sidecar either way (which always
+#                       happens regardless of this setting).
+#
+# Each engine's own model/backend settings follow those five in the same
+# block.
+#
+# Default engine selection (this version): crisperwhisper only --
+# whisperx and mfa are both off, having been superseded by
+# crisperwhisper's own validated accuracy. Both remain fully implemented
+# and one config edit away from being turned back on -- e.g. to
+# re-evaluate a future whisperx/mfa release, to add a second engine's
+# debug_subtitle purely for comparison, or to fall back to either if
+# crisperwhisper ever regresses. Flip enabled (and whichever of
+# debug_subtitle/final/final_subtitle/embed_subtitle you want) back to
+# true; nothing else in this pipeline needs to change.
 alignment:
+  engines:
 
-  # Which forced-alignment engine turns WhisperX's recognized text into
-  # word-level start/end timestamps.
-  #   mfa      — Montreal Forced Aligner (GMM-HMM via Kaldi). Default as of
-  #              this version, after whisperx.align() was found to silently
-  #              drift several seconds following a segment WhisperX's own
-  #              transcribe() pass mis-timed internally (full case history
-  #              in docs/timestamp-drift-investigation.md). MFA is given
-  #              known text and searches for it in the audio it's handed —
-  #              it never trusts a WhisperX-reported timestamp to decide
-  #              WHERE to look, so it can't inherit a chunk-boundary timing
-  #              error the way whisperx.align() can.
-  #              Validated directly against Independence Day (1996) in its
-  #              original, whole-segment-per-call form, not just reasoned
-  #              about: of the 17 individually-confirmed drift cases from
-  #              the original investigation, 14 landed correctly once MFA
-  #              actually ran end-to-end; SRT-line coverage went from 90
-  #              fully-missed lines (whisperx) to 11 (mfa) on the same
-  #              film. See that doc for what's still unresolved — it's a
-  #              WhisperX *recognition* gap on densely repetitive dialogue,
-  #              not an alignment problem, and no alignment backend fixes
-  #              it on its own.
-  #              Now runs as many short chunks per segment instead (see
-  #              mfa.chunk_* below and steps/align_mfa.py's module
-  #              docstring for the full account) — a whole-segment call
-  #              could run past any reasonable timeout on hard content.
-  #              Getting the chunk boundaries right took three attempts,
-  #              the first two both confirmed (against real audio, not
-  #              just reasoned about) to make timing WORSE than plain
-  #              whisperx: padding each chunk's slice and handing it to
-  #              align_one directly made MFA smear a chunk's last word
-  #              across trailing silence (median offset vs. a reference
-  #              SRT went from 0.27s at stage 1 to 6.93s); trimming that
-  #              same padded window down via real silence detection first
-  #              fixed that specific mechanism but exposed a second one on
-  #              a different, shorter test file — the detected envelope
-  #              swept in unrelated audio from before the chunk's real
-  #              content when there wasn't a clean silence gap to stop at
-  #              (dense dialogue with little pause between lines). Both
-  #              attempts tried to search a generously padded window for a
-  #              chunk's real audio when WhisperX's claimed boundary might
-  #              be drift-affected; neither did so reliably. The current
-  #              version doesn't search at all — chunk_edge_margin_sec is
-  #              a small, fixed margin, not a search window, and a chunk
-  #              affected by genuine drift is expected to fail to align
-  #              and fall back to stage 1 timing for its own words rather
-  #              than risk a third, cleverer way to go looking for it.
-  #              That fix has NOT yet been re-validated against a real MFA
-  #              install; do that (Independence Day's 17 known cases AND
-  #              whatever shorter file exposed the second attempt's
-  #              failure, checking the resulting transcript's own
-  #              word-duration distribution directly, not just the
-  #              aggregate offset) before trusting this on a real library.
-  #              Requires the `montreal-forced-aligner` conda package (see
-  #              Dockerfile) — NOT pip-installable; it depends on `kalpy`
-  #              (compiled Kaldi bindings), which conda-forge ships as a
-  #              prebuilt binary and PyPI does not carry at all.
-  #   whisperx — wav2vec2 / CTC alignment via whisperx.align(). Falls back
-  #              to this automatically per-segment if MFA fails and
-  #              mfa.fallback_to_whisperx is true (default) — see below.
-  #              Set backend to this directly only if you don't want the
-  #              conda/MFA install at all and are fine with the drift
-  #              behavior documented above.
-  #   crisperwhisper — an independently-trained model that transcribes
-  #              each segment's audio directly, rather than re-timing
-  #              WhisperX's own recognized text the way mfa/whisperx
-  #              above do — see steps/transcribe_crisperwhisper.py's own
-  #              module docstring for the full reasoning (short version:
-  #              every fix above works by searching, after the fact, for
-  #              where WhisperX's drifted audio actually is, and that has
-  #              proven fragile three times over; this instead never
-  #              depends on WhisperX's own segment timing in the first
-  #              place). Also requires alignment.crisperwhisper.enabled:
-  #              true below, or startup validation raises — see that
-  #              block for why, and for the real, narrow tradeoff worth
-  #              knowing before choosing this: since it doesn't share
-  #              mfa/whisperx's own recognized text, a segment where it
-  #              fails falls back to mfa/whisperx's own words for just
-  #              that segment, which can read differently (casing,
-  #              punctuation, disfluency handling) than its
-  #              CrisperWhisper-sourced neighbours. Model weights are
-  #              under a non-commercial research license, not MIT the way
-  #              the inference code is — confirm this fits your use
-  #              before choosing this. NOT yet validated against real
-  #              audio the way mfa above has been
-  #              (docs/timestamp-drift-investigation.md) — reasoned
-  #              through, not confirmed; re-validate the same way (same
-  #              17 known cases, same reference SRT, checking the
-  #              resulting transcript's own text against them, not just
-  #              timing) before trusting this in production.
-  backend: crisperwhisper
+    whisperx:
+      enabled:         false
+      debug_subtitle:  false
+      final:           false
+      final_subtitle:  false
+      embed_subtitle:  false
 
-  # Runs a numbered pipeline of alignment stages, not a fixed choice
-  # between two named tools -- see steps/transcribe.py's _ALIGNMENT_STAGES
-  # (the registry of stages this pipeline knows how to run; today
-  # 1=WhisperX, 2=MFA) and steps/merge.py (which merges each stage's own
-  # transcript_{N}_NN.json into transcript_{N}.json). `backend` above picks
-  # which stage's result is AUTHORITATIVE for censoring (mfa -> stage 2,
-  # cascading down to stage 1 for any segment stage 2 doesn't cover;
-  # whisperx -> stage 1 only, even if a later stage also ran) -- see
-  # transcribe.py's own docstring for the cascade rule. Stage numbers are
-  # deliberately never tied to a specific tool's name in any filename this
-  # pipeline writes, specifically so a future stage 3 (a different
-  # aligner entirely) slots in without renaming anything already on disk;
-  # job.json's own "alignment_stages" block is always the source of truth
-  # for which tool a given number actually was on this job.
-  #
-  # Stage 1 always runs, for every segment, regardless of this setting --
-  # it's the fallback source `backend: mfa` itself depends on, not
-  # something optional. What this setting actually controls: whether
-  # stage 2+ also run on segments where the authoritative stage (`backend`
-  # above) doesn't already require them -- i.e. purely for
-  # transcript_srt's (Step 6c) side-by-side comparison tracks. A stage
-  # that fails for a given segment (or, for stage 2 specifically, one
-  # that `backend` already knows failed as the authoritative attempt,
-  # making a retry pointless) just has no data for that segment's span in
-  # that stage's own transcript -- logged, never fatal, never a reason to
-  # fail the segment or the run.
-  # Roughly doubles this step's alignment time with today's two stages
-  # (MFA is normally the slower of the two either way, so adding
-  # WhisperX's own align() pass typically costs much less than doubling
-  # in practice) -- defaulting to true FOR NOW, DURING DEVELOPMENT, while
-  # actively troubleshooting alignment discrepancies; turn off once that
-  # settles. Only takes effect for segments transcribed *after* this is
-  # turned on -- like alignment.backend itself, changing this on an
-  # existing job does not retroactively apply to Steps 1a-3b's
-  # already-cached result (see pipeline.py's docstring on why those steps
-  # aren't individually redoable).
-  dual_output: true
+      # wav2vec2/CTC alignment within whatever ~30s decode-chunk boundary
+      # WhisperX's own transcribe() pass already committed to. Cheapest
+      # of the three engines, but the one most exposed to the drift
+      # failure mode documented in docs/timestamp-drift-investigation.md.
+      #
+      # IMPORTANT -- read before assuming "enabled: false" means zero
+      # cost: WhisperX's own recognition + this alignment pass ALSO runs
+      # whenever alignment.engines.mfa.enabled is true below, REGARDLESS
+      # of this enabled value. MFA re-times WhisperX's own recognized
+      # text -- it does not recognize speech itself (see
+      # alignment.engines.mfa's own comment, and
+      # steps/align_mfa.py's module docstring) -- so it structurally
+      # depends on this engine's output existing, whether or not you
+      # also want that output exposed as its own transcript/subtitle.
+      # Setting this to false with mfa.enabled: true does NOT skip that
+      # recognition+alignment work -- it only skips WRITING it out as
+      # its own transcript_whisperx_NN.json / making it selectable as a
+      # debug subtitle or as final. Set both true if you want to see
+      # WhisperX's own result alongside MFA's. With the default config
+      # below (mfa also off), this engine's own recognition genuinely
+      # never runs at all, and the whisperx package is never even
+      # imported.
+      model: large-v2        # large-v2 | large-v3 | medium | small
+      language: en           # ISO 639-1; null for auto-detect
+      batch_size: 4
+      beam_size: 5
+      device: cpu
+      compute_type: int8     # int8 (CPU, recommended) | float32 | float16 (GPU only)
 
-  mfa:
-    # Pretrained acoustic model + pronunciation dictionary name (as known to
-    # `mfa model download`). english_mfa is trained on North American
-    # English and is the model to reach for first for English-language film
-    # dialogue.
-    acoustic_model: english_mfa
-    dictionary: english_mfa
+    mfa:
+      enabled:         false
+      debug_subtitle:  false
+      final:           false
+      final_subtitle:  false
+      embed_subtitle:  false
 
-    # G2P (grapheme-to-phoneme) model used to generate a pronunciation on
-    # the fly for words the dictionary doesn't have an entry for, instead of
-    # silently dropping them. Film dialogue leans heavily on contractions
-    # and dropped-g colloquialisms ("sayin'", "outta", "gonna") that a
-    # standard dictionary won't have every variant of — leave this set
-    # rather than relying on the dictionary alone.
-    g2p_model: english_us_mfa
+      # Montreal Forced Aligner (GMM-HMM via Kaldi). Re-times WhisperX's
+      # own recognized text by searching for it across the WHOLE audio
+      # handed to it, rather than trusting WhisperX's own ~30s
+      # decode-chunk boundaries -- see docs/timestamp-drift-investigation.md
+      # for the validated before/after numbers against whisperx alone,
+      # and steps/align_mfa.py's module docstring for the chunking
+      # design (needed to keep individual align_one calls fast) and the
+      # two earlier chunking attempts that made timing WORSE, not
+      # better. Requires the `montreal-forced-aligner` conda package
+      # (see Dockerfile) -- NOT pip-installable; needs kalpy (compiled
+      # Kaldi bindings), which conda-forge ships prebuilt and PyPI does
+      # not carry at all.
+      #
+      # MFA never performs its own speech recognition -- see the note on
+      # alignment.engines.whisperx above for what that means when this
+      # is enabled but whisperx.enabled is left false.
+      acoustic_model: english_mfa
+      dictionary: english_mfa
 
-    # Kaldi beam widths. 100/400 are MFA's own basic_align.yaml defaults --
-    # not something picked arbitrarily here -- but its docs are explicit
-    # that those defaults target utterances under 30 seconds, and that
-    # longer sequences need both raised, giving 400/1000 as its own
-    # example figure for "much longer sequences." These were raised to
-    # 400/1000 back when every call handed align_one an entire ~30-*minute*
-    # segment as one utterance -- confirmed directly against a real run:
-    # segment 5 of Independence Day failed at 100/400 with "Could not align
-    # the file with the current beam size (100), please try increasing the
-    # beam size," and widening fixed it (~24 minutes at 400/1000, the
-    # direct cost of the wider search per MFA's own docs: "the higher the
-    # beam value, the slower alignment will be").
-    # Now that chunk_target_sec below keeps each individual align_one call
-    # under MFA's own <30s sweet spot, these two are probably wider than
-    # needed and could likely come back down toward MFA's real defaults for
-    # a further speed win -- left at their proven-safe values for THIS
-    # release rather than changing two things (chunking AND beam) in the
-    # same pass with no way here to validate either in isolation. Worth
-    # trying lower once chunk timing is visible from a real run's logs
-    # (see the "N/M chunk(s) done" line align_with_mfa() now emits).
-    beam: 400
-    retry_beam: 1000
+      # G2P (grapheme-to-phoneme) model used to generate a pronunciation
+      # on the fly for words the dictionary doesn't have an entry for,
+      # instead of silently dropping them. Film dialogue leans heavily
+      # on contractions and dropped-g colloquialisms ("sayin'", "outta",
+      # "gonna") that a standard dictionary won't have every variant of
+      # — leave this set rather than relying on the dictionary alone.
+      g2p_model: english_us_mfa
 
-    # Target duration (seconds) for one align_one call. Chunks are built
-    # from consecutive whisper_segments (never splitting one) up to this
-    # length -- see steps/align_mfa.py's _build_alignment_chunks() and its
-    # module docstring for why chunking exists at all (a real job's
-    # segment ran past a 1800s subprocess timeout at the old
-    # one-call-per-segment design) and why staying under MFA's own
-    # documented ~30s-per-utterance guidance is "using it as intended"
-    # rather than the wide-beam workaround the paragraph above describes.
-    # Kept a little under MFA's own ~30s guidance to leave room for the
-    # padding below without every chunk's audio slice creeping much past
-    # it.
-    chunk_target_sec: 25
+      # Kaldi beam widths. 100/400 are MFA's own basic_align.yaml
+      # defaults, tuned for utterances under 30 seconds -- raised here
+      # to 400/1000 (MFA's own documented example figure for "much
+      # longer sequences") back when every call handed align_one an
+      # entire ~30-minute segment as one utterance; now that
+      # chunk_target_sec below keeps each individual align_one call
+      # under MFA's own <30s sweet spot, these are probably wider than
+      # strictly needed but are left at their proven-safe values.
+      beam: 400
+      retry_beam: 1000
 
-    # Small, FIXED margin added on each side of a chunk's own claimed
-    # [start, end] before slicing -- just enough to not clip the very
-    # first/last phone of real speech at an imprecise boundary, nothing
-    # more. This is NOT a search window; nothing tries to find real audio
-    # beyond it. Two earlier, more generous designs were tried and both
-    # were confirmed (against real audio, not just reasoned about) to
-    # make timing worse than plain whisperx.align(), via two different
-    # mechanisms -- see steps/align_mfa.py's module docstring for the
-    # full account of both. A chunk affected by genuine WhisperX
-    # timestamp drift will generally fail to align in a window this
-    # tight, and correctly falls back to stage 1 (WhisperX) timing for
-    # its own words -- not a regression, exactly what those words would
-    # have had before MFA was introduced. That's a deliberate trade: MFA
-    # no longer attempts to rescue the small fraction of content (~1% in
-    # the original Independence Day count) affected by genuine drift,
-    # because both attempts at rescuing it corrupted a much larger
-    # fraction of otherwise-correct content instead.
-    chunk_edge_margin_sec: 0.3
+      # Target duration (seconds) for one align_one call -- chunks are
+      # built from consecutive whisper_segments (never splitting one) up
+      # to this length. See steps/align_mfa.py's module docstring for
+      # why chunking exists at all and why staying under MFA's own
+      # documented ~30s-per-utterance guidance matters.
+      chunk_target_sec: 25
 
-    # Per-CALL timeout, replacing the old flat 1800s that was sized for one
-    # call covering an entire ~30-minute segment. A chunk this small should
-    # finish in low single-digit seconds even at the beam widths above --
-    # this is deliberately much more generous than that expectation rather
-    # than tuned tight, since a chunk timing out just degrades that one
-    # chunk to stage 1 timing (see fallback_to_whisperx below) rather than
-    # failing anything, so there's little upside to shaving this down and
-    # real downside (a merely-slow-not-stuck chunk losing MFA's timing
-    # unnecessarily) to setting it too tight.
-    chunk_timeout_sec: 120
+      # Small, FIXED margin added on each side of a chunk's own claimed
+      # [start, end] before slicing -- just enough to not clip the very
+      # first/last phone of real speech at an imprecise boundary,
+      # nothing more. NOT a search window -- see steps/align_mfa.py's
+      # module docstring for two earlier, more generous designs that
+      # were tried and confirmed (against real audio) to make timing
+      # WORSE than plain whisperx alignment.
+      chunk_edge_margin_sec: 0.3
 
-    # If an individual chunk's own align_one attempts are all exhausted
-    # (bad exit, timeout, or its result discarded by the cross-chunk
-    # plausibility check in align_with_mfa() -- see that function and this
-    # module's docstring), fall back to whisperx.align()'s timing for just
-    # that chunk's words rather than failing the whole segment. Separately,
-    # this ALSO still controls the coarser, whole-segment case it always
-    # did -- MFA fundamentally unusable right now (no conda, models not
-    # downloaded, G2P grapheme lookup failing) -- since those are
-    # environment problems every chunk would hit identically, not a
-    # per-chunk content problem. Logged clearly either way so a silent
-    # fallback is never actually silent in the logs.
-    fallback_to_whisperx: true
+      # Per-call timeout. A chunk this small should finish in low
+      # single-digit seconds even at the beam widths above -- this is
+      # deliberately generous rather than tuned tight, since a chunk
+      # timing out just degrades that one chunk to WhisperX's own timing
+      # (see fallback_to_whisperx below) rather than failing anything.
+      chunk_timeout_sec: 120
 
-  # Stage 3 -- an independently-trained model that transcribes each
-  # segment's dialog stem itself, rather than re-timing WhisperX's own
-  # recognized text the way stages 1/2 do. CAN be alignment.backend's
-  # value like stage 2 (also requires enabled: true below, or startup
-  # validation raises -- see transcribe.py) -- but since it doesn't share
-  # stage 1/2's own recognized text, a segment where it fails falls back
-  # to stage 2/1's own words for just that segment, which can read
-  # differently (casing, punctuation, disfluency handling) than its
-  # CrisperWhisper-sourced neighbours. Real but narrow -- see
-  # transcribe.py's own "Which stages actually run" and
-  # steps/transcribe_crisperwhisper.py's module docstring for the full
-  # account. Has its own enabled switch rather than riding along with
-  # dual_output above regardless of alignment.backend's value, since
-  # unlike stage 2's comparison run this is a whole separate multi-minute
-  # model load plus a full transcription pass per segment, not a
-  # lightweight re-timing of work already done.
-  #
-  # READ steps/transcribe_crisperwhisper.py's module docstring before
-  # turning this on -- in particular: the model weights are under a
-  # non-commercial research license (the inference code is MIT, the
-  # weights are not -- confirm this fits your use before enabling), and
-  # this has not been validated against real audio the way stages 1/2
-  # have been (see docs/timestamp-drift-investigation.md) -- it's being
-  # tried specifically because every attempt so far at a *second*
-  # alignment stage searching for where drifted audio actually is has
-  # proven fragile, and this one's longform design avoids the specific
-  # mechanism responsible (each chunk's timing offset is fixed by its
-  # position in a sliding window, not inferred from how much of any
-  # earlier chunk's audio was successfully recognized) -- reasoned
-  # through, not yet confirmed on a real episode.
-  crisperwhisper:
-    enabled: true
+      # If a whole job-segment's worth of MFA alignment fails outright
+      # (no conda, models not downloaded, G2P grapheme lookup failing --
+      # environment problems every chunk in that segment would hit
+      # identically), fall back to WhisperX's own alignment (already
+      # computed -- see alignment.engines.whisperx's note above) for
+      # that segment's words rather than leaving a gap there. This is
+      # separate from, and in addition to, the PER-CHUNK fallback
+      # steps/align_mfa.py always applies regardless of this setting (a
+      # single failed/rejected chunk degrades to WhisperX timing for
+      # just that chunk and keeps going) -- this one covers the coarser
+      # case where MFA couldn't even get started for the whole segment.
+      # This only ever affects the AUTHORITATIVE transcript when mfa is
+      # the final engine -- MFA's own debug-subtitle transcript (if
+      # enabled) stays an honest, unmodified record of what MFA itself
+      # produced either way, which for a totally-failed segment is
+      # nothing. See steps/transcribe.py's own module docstring.
+      fallback_to_whisperx: true
 
-    # large/turbo/medium/small -- NOT the _pro variants, which are under a
-    # separate commercial-only license this config doesn't assume you have.
-    model: large
+    crisperwhisper:
+      enabled:         true
+      debug_subtitle:  true
+      final:           true
+      final_subtitle:  true
+      embed_subtitle:  false
 
-    # ct2 (CTranslate2) -- crisperwhisper's own default preference
-    # (backend="auto" tries this first, confirmed by reading model.py's
-    # own resolution logic), typically faster on CPU than the alternative
-    # (transformers, raw HuggingFace/torch), and no quality cost vs.
-    # transformers when compute_type below is set explicitly, since
-    # float32 is a first-class option on both -- see
-    # steps/transcribe_crisperwhisper.py's own module docstring
-    # (BACKEND CHOICE) for the real tradeoff, including a confirmed (not
-    # hypothetical) dependency-naming risk and why it isn't a reason to
-    # avoid this.
-    backend: ct2
+      # An independently-trained model that transcribes each segment's
+      # audio directly, rather than re-timing WhisperX's own recognized
+      # text the way whisperx/mfa above do -- see
+      # steps/transcribe_crisperwhisper.py's module docstring for the
+      # full reasoning (short version: every whisperx/mfa fix works by
+      # searching, after the fact, for where WhisperX's own drifted
+      # audio actually is, which has proven fragile more than once in
+      # this project's own history; this instead never depends on
+      # WhisperX's segment timing in the first place, and shares no
+      # computation with either of those two engines at all). Tested
+      # directly against Independence Day (1996) and found more
+      # accurate than both whisperx and mfa on that comparison -- this
+      # is why it's the default final engine here, with whisperx/mfa
+      # both off. A segment where this engine fails has NO other engine
+      # to fall back to unless you've also enabled one (see
+      # alignment.engines.mfa/whisperx above) -- with the default
+      # config (this engine only), a failed segment simply has no data
+      # for that stretch of transcript.json, the same as a genuinely
+      # silent segment already has today.
+      #
+      # Model weights are under a non-commercial research license, not
+      # MIT the way the inference code is -- confirm this fits your use
+      # before enabling.
+      model: large            # large | turbo | medium | small -- NOT the
+                               # _pro variants (separate commercial-only license)
 
-    device: cpu
+      # ISO 639-1. Independent of alignment.engines.whisperx.language --
+      # this engine shares no computation with whisperx, so it has its
+      # own setting rather than implicitly borrowing that one. Unlike
+      # whisperx's own language setting, null here does NOT mean
+      # auto-detect -- this engine's transcribe() call has no such mode;
+      # null/empty just becomes "en" (see
+      # steps/transcribe_crisperwhisper.py's own "language or en"
+      # fallback).
+      language: en
 
-    # ALWAYS float32 on a CPU device, on EITHER backend -- deliberately
-    # not left at either one's own default. Confirmed by reading
-    # crisperwhisper's actual source (not just its README): the
-    # transformers backend's compute_type maps directly to a torch dtype
-    # with no CPU-aware adjustment (float16 on CPU is unreliable/slow on
-    # many kernels), and ct2's own model-conversion step defaults its
-    # quantization to float16 too (a smaller but real precision cost).
-    # float32 is a genuinely first-class, fully-supported option on both
-    # backends, not a fallback -- see
-    # steps/transcribe_crisperwhisper.py's own docstring.
-    compute_type: float32
+      # ct2 (CTranslate2) -- crisperwhisper's own default preference
+      # (backend="auto" tries this first), typically faster on CPU than
+      # the alternative (transformers, raw HuggingFace/torch), and no
+      # quality cost vs. transformers when compute_type below is set
+      # explicitly, since float32 is a first-class option on both -- see
+      # steps/transcribe_crisperwhisper.py's own module docstring
+      # (BACKEND CHOICE) for the real tradeoff, including a confirmed
+      # (not hypothetical) dependency-naming risk and why it isn't a
+      # reason to avoid this.
+      backend: ct2
+
+      device: cpu
+
+      # ALWAYS float32 on a CPU device, on EITHER backend -- deliberately
+      # not left at either one's own default. Confirmed by reading
+      # crisperwhisper's actual source (not just its README): the
+      # transformers backend's compute_type maps directly to a torch dtype
+      # with no CPU-aware adjustment (float16 on CPU is unreliable/slow on
+      # many kernels), and ct2's own model-conversion step defaults its
+      # quantization to float16 too (a smaller but real precision cost).
+      # float32 is a genuinely first-class, fully-supported option on both
+      # backends, not a fallback -- see
+      # steps/transcribe_crisperwhisper.py's own docstring.
+      compute_type: float32
 
 
 # ── Audio handling (Steps 1a / 1b) ──────────────────────────────────────────
@@ -539,55 +480,47 @@ output:
 # ── Transcript SRT export (Step 6c) ─────────────────────────────────────────
 transcript_srt:
 
-  # Render each available alignment stage's transcript -- transcript_1.json,
-  # transcript_2.json, ... (steps/merge.py; see alignment.dual_output and
-  # steps/transcribe.py's _ALIGNMENT_STAGES for what produces which number)
-  # -- plus transcript.json, the authoritative/censoring-relevant one,
-  # regardless of which stage produced it for a given segment -- each into
-  # its own SRT, saved next to the output video and/or in the job
-  # directory. Built as a debugging aid: figuring out *why* a word got
-  # muted at the wrong moment, or why two alignment stages disagree,
-  # normally means cross-referencing the output video against a transcript
-  # against the original audio by hand, across three separate tools (see
-  # docs/timestamp-drift-investigation.md for exactly how tedious that is)
-  # -- with this on, it's "turn a subtitle track on and watch," for any
-  # stage independently, or for the final result.
+  # Master switch for the whole step -- false skips Step 6c entirely,
+  # regardless of any engine's own debug_subtitle/final_subtitle. Which
+  # SPECIFIC engines get a debug subtitle, and whether the final engine
+  # gets one too, is controlled per-engine under alignment.engines above,
+  # not here -- see that section's own comment.
   enabled: true
 
-  # Also mux every available SRT into the final output video as an
-  # additional subtitle track (steps/mux.py) -- on top of write_sidecar
-  # below, not instead of it; the two aren't mutually exclusive. Defaults
-  # to false FOR NOW, DURING DEVELOPMENT: a sidecar file is trivial to
-  # delete or regenerate while grouping/karaoke settings are still being
-  # tuned, where re-muxing the whole container is not. Revisit once
-  # settled. Re-running with this newly turned on for a job whose Step 7
-  # already completed will re-mux once to pick the tracks up (see
-  # pipeline.py's Step-6c/7 migration check) -- and re-running it again
-  # later, after these tracks already exist in the output, REPLACES them
-  # rather than adding duplicates (matched by exact track name -- see
-  # track_name_prefix below and steps/mux.py's module docstring).
-  embed_in_output: false
+  # Also mux every source whose own alignment.engines.<name>.
+  # embed_subtitle is true into the final output video (steps/mux.py) --
+  # on top of write_sidecar below, not instead of it; the two aren't
+  # mutually exclusive. Each source's embed_subtitle defaults to false
+  # FOR NOW, DURING DEVELOPMENT: a sidecar file is trivial to delete or
+  # regenerate while grouping/karaoke settings are still being tuned,
+  # where re-muxing the whole container is not. Revisit per-engine once
+  # settled. Re-running with an engine's embed_subtitle newly turned on
+  # for a job whose Step 7 already completed will re-mux once to pick
+  # the tracks up (see pipeline.py's Step-6c/7 migration check) -- and
+  # re-running it again later, after those tracks already exist in the
+  # output, REPLACES them rather than adding duplicates (matched by
+  # exact track name -- see track_name_prefix below and steps/mux.py's
+  # module docstring).
 
   # Write each available SRT next to the final output video too, using
-  # the same base name as the video plus a language and stage-number tag,
-  # e.g. for "Movie {edition-Hushed}.1080p.hevc.mkv" once two alignment
-  # stages have run:
-  #   Movie {edition-Hushed}.1080p.hevc.eng.1.srt   (stage 1 -- WhisperX)
-  #   Movie {edition-Hushed}.1080p.hevc.eng.2.srt   (stage 2 -- MFA)
-  #   Movie {edition-Hushed}.1080p.hevc.eng.srt     (authoritative/final)
-  # The .eng.<N>.srt tail mirrors Plex/Kodi's own external-subtitle
+  # the same base name as the video plus a language and engine-name tag,
+  # e.g. for "Movie {edition-Hushed}.1080p.hevc.mkv" with crisperwhisper's
+  # debug_subtitle and final_subtitle both on:
+  #   Movie {edition-Hushed}.1080p.hevc.eng.crisperwhisper.srt   (debug)
+  #   Movie {edition-Hushed}.1080p.hevc.eng.srt                  (final)
+  # The .eng.<tail>.srt shape mirrors Plex/Kodi's own external-subtitle
   # convention of "<basename>.<language>.<flag>.ext" (Plex's own documented
-  # flags there are just forced/sdh/cc, so a stage number won't be
+  # flags there are just forced/sdh/cc, so an engine name won't be
   # auto-recognized as anything special) -- keeping .eng. intact and
-  # immediately before the stage number is what keeps this readable at a
+  # immediately before the engine name is what keeps this readable at a
   # glance and still gets picked up by "add subtitle file" style pickers in
-  # any player, which is this setting's actual goal: telling every stage
+  # any player, which is this setting's actual goal: telling every engine
   # apart by filename when selecting one manually, not automatic
   # language-track matching. Independent of, and always on top of, the
-  # job-directory copy (transcript_1.srt, transcript_2.srt, ...,
-  # transcript.srt), which is unconditional whenever a source is available
-  # -- this setting only controls the extra copy placed next to the video
-  # itself.
+  # job-directory copy (transcript_whisperx.srt, transcript_mfa.srt,
+  # transcript_crisperwhisper.srt, transcript.srt, ...), which is
+  # unconditional whenever a source is available -- this setting only
+  # controls the extra copy placed next to the video itself.
   write_sidecar: true
 
   # Karaoke-style highlighting: color the single word actually being
@@ -608,73 +541,71 @@ transcript_srt:
   # every styling tag outright -- so steps/mux.py embeds a plain,
   # one-cue-per-line rendering there instead, regardless of this setting.
   #
-  # Applies ONLY to the per-stage comparison SRTs (transcript_1.srt,
-  # transcript_2.srt, ...) -- NEVER the authoritative one (transcript.srt
-  # / its sidecar / its embedded or mp4-fallback text), which is always
-  # the plain, one-cue-per-group rendering regardless of this setting.
-  # Deliberate, not an oversight, and for two independent reasons: the
-  # per-stage SRTs are a debugging aid where precise, glanceable word-by-
-  # word timing is the entire point (see docs/timestamp-drift-
-  # investigation.md); the authoritative one is the track meant for an
-  # actual viewer, where traditional grouped subtitles are the familiar,
-  # comfortable format and flickering per-word color reads as a bug, not
-  # a feature. That's compounded once hush.mode redacts a word there
-  # (see below) -- highlighting a masked "s***" letter-by-letter conveys
-  # nothing a viewer would find useful the way highlighting a real,
-  # recognized word does. This split mirrors the Hushing section's own
-  # final-only/per-stage-never split below, for related but distinct
-  # reasons -- see that section's own comment.
-  # Both the job-directory copies and any sidecar copies of the per-stage
-  # SRTs are unaffected by output.format either way and still get the
-  # karaoke version when this is true -- the mp4 limitation above is
-  # specific to mp4's embedded tracks.
+  # Applies ONLY to each engine's own debug_subtitle SRT -- NEVER the
+  # authoritative one (transcript.srt / its sidecar / its embedded or
+  # mp4-fallback text), which is always the plain, one-cue-per-group
+  # rendering regardless of this setting. Deliberate, not an oversight,
+  # and for two independent reasons: a debug SRT is a debugging aid where
+  # precise, glanceable word-by-word timing is the entire point (see
+  # docs/timestamp-drift-investigation.md); the authoritative one is the
+  # track meant for an actual viewer, where traditional grouped subtitles
+  # are the familiar, comfortable format and flickering per-word color
+  # reads as a bug, not a feature. That's compounded once hush.mode
+  # redacts a word there (see below) -- highlighting a masked "s***"
+  # letter-by-letter conveys nothing a viewer would find useful the way
+  # highlighting a real, recognized word does. This split mirrors the
+  # Hushing section's own final-only/debug-never split below, for related
+  # but distinct reasons -- see that section's own comment.
+  # Both the job-directory copies and any sidecar copies of a debug SRT
+  # are unaffected by output.format either way and still get the karaoke
+  # version when this is true -- the mp4 limitation above is specific to
+  # mp4's embedded tracks.
   # false: skip the karaoke rendering everywhere (job directory, sidecar,
   # and any embed) and only group words like a traditional subtitle track
-  # for the per-stage SRTs too -- the authoritative one already always
-  # does this regardless.
+  # for debug SRTs too -- the authoritative one already always does this
+  # regardless.
   karaoke: true
 
   # Color applied to the currently-spoken word when karaoke is true.
   # #RRGGBB hex. A bright, saturated color reads best against traditional
-  # white/default subtitle text. Shared by every per-stage SRT -- players
+  # white/default subtitle text. Shared by every debug SRT -- players
   # show at most one subtitle track at a time by default, so telling them
   # apart by filename/track name (see track_name_prefix below) matters far
-  # more than giving each stage a different color would.
+  # more than giving each engine a different color would.
   karaoke_color: "#FFD400"
 
   # ── Hushing: how words the pipeline actually muted are rendered in the
   # AUTHORITATIVE SRT's own text (transcript.srt / its sidecar / its
-  # embedded or mp4-fallback text) -- NEVER the per-stage comparison SRTs
-  # (transcript_1.srt, transcript_2.srt, ...), which always show the
-  # literal recognized word, unmodified, regardless of this section. karaoke
-  # above draws the same authoritative/per-stage line, for related but
-  # distinct reasons (see that setting's own comment) -- the two splits
-  # aren't a coincidence: the per-stage SRTs are consistently the raw,
-  # unedited debugging view, and the authoritative one is consistently the
-  # one shaped for an actual viewer. That split is deliberate, not an
+  # embedded or mp4-fallback text) -- NEVER a per-engine debug SRT, which
+  # always shows the literal recognized word, unmodified, regardless of
+  # this section. karaoke above draws the same authoritative/debug line,
+  # for related but distinct reasons (see that setting's own comment) --
+  # the two splits aren't a coincidence: a debug SRT is consistently the
+  # raw, unedited view, and the authoritative one is consistently the one
+  # shaped for an actual viewer. That split is deliberate, not an
   # oversight: which words got muted
   # (censor_log.json -- Step 5's own final, post-review/post-correction
   # record) is only ever computed against transcript.json's own word
   # timing (steps/matching.py's find_matches()), and
   # docs/timestamp-drift-investigation.md's whole worked example is about
-  # a per-stage transcript's timing for nominally "the same" word
+  # a per-engine transcript's timing for nominally "the same" word
   # disagreeing by several real seconds -- reusing censor_log.json's
   # timing there risks silently redacting the wrong word (or missing the
-  # right one) with no way to tell from the output that it happened. The
-  # per-stage SRTs exist specifically to show what was actually
-  # recognized, unedited, for troubleshooting exactly that kind of
-  # disagreement (see steps/transcript_srt.py's own module docstring) --
-  # hushing them would work against their one purpose. embed_in_output
-  # above is off by default for now regardless, so none of this reaches
-  # the shipped video unless that's turned on.
+  # right one) with no way to tell from the output that it happened. A
+  # debug SRT exists specifically to show what was actually recognized,
+  # unedited, for troubleshooting exactly that kind of disagreement (see
+  # steps/transcript_srt.py's own module docstring) -- hushing it would
+  # work against its one purpose. Every engine's own embed_subtitle
+  # defaults to false regardless, so none of this reaches the shipped
+  # video unless that's turned on.
   hush:
 
-    # keep       — leave every word exactly as WhisperX/MFA recognized
-    #              it, same as if this whole section didn't exist. Mainly
-    #              useful for a one-off debugging pass -- see the
-    #              README's "Reprocessing after a mistake" -- not usually
-    #              what you want in a file you'd actually share or watch
-    #              with subtitles on.
+    # keep       — leave every word exactly as the final engine
+    #              recognized it, same as if this whole section didn't
+    #              exist. Mainly useful for a one-off debugging pass --
+    #              see the README's "Reprocessing after a mistake" -- not
+    #              usually what you want in a file you'd actually share
+    #              or watch with subtitles on.
     # simple     — replace with either a fixed token or a same-length
     #              character mask -- see simple_style below. DEFAULT.
     #              Only needs to know THAT censor_log.json muted a word,
@@ -743,10 +674,10 @@ transcript_srt:
   # line is simply full. (One more rule applies unconditionally, with no
   # setting here: a word ending in '.', '?', or '!' always ends its group
   # -- see steps/transcript_srt.py's _SENTENCE_END_RE.) Applied
-  # independently to each stage's own word list -- different alignment
-  # stages' timing can differ enough that their SRTs end up grouped
-  # slightly differently even for the same stretch of dialogue, which is
-  # exactly the kind of discrepancy this feature exists to make visible.
+  # independently to each engine's own word list -- different engines'
+  # timing can differ enough that their SRTs end up grouped slightly
+  # differently even for the same stretch of dialogue, which is exactly
+  # the kind of discrepancy this feature exists to make visible.
 
   # Maximum words in one group before it's forced to break.
   max_words_per_group: 12
@@ -772,24 +703,25 @@ transcript_srt:
 
   # Embedded subtitle track metadata (steps/mux.py) -- the prefix for
   # what a player's subtitle track picker shows for each track. The full
-  # name is built from this plus each stage's own label from job.json's
-  # "alignment_stages" (see steps/transcribe.py) -- e.g.
-  # "Hushed Transcript -- Stage 2 (MFA)" -- and "Hushed Transcript (Final)"
-  # for the authoritative track, so a new stage 3 gets a sensible track
-  # name automatically, with nothing here to update. This is also the
-  # prefix steps/mux.py matches against to find and replace a track from a
-  # previous run rather than adding a duplicate (see embed_in_output
+  # name is built from this plus each source's own label from job.json's
+  # "alignment_engines" (see steps/transcribe.py) -- e.g.
+  # "Hushed Transcript -- MFA" -- and "Hushed Transcript -- Final" for
+  # the authoritative track, so a new engine gets a sensible track name
+  # automatically, with nothing here to update. This is also the prefix
+  # steps/mux.py matches against to find and replace a track from a
+  # previous run rather than adding a duplicate (see embed_subtitle
   # above) -- change it and a previously-embedded track under the OLD
-  # prefix is no longer recognized as "ours" on the next mux; it's left in
-  # place rather than replaced, and only tracks under the new prefix get
-  # added going forward.
+  # prefix is no longer recognized as "ours" on the next mux; it's left
+  # in place rather than replaced, and only tracks under the new prefix
+  # get added going forward.
   track_name_prefix: "Hushed Transcript"
 
   # ISO 639-2 (3-letter) language code for every embedded track and every
   # sidecar filename. Deliberately a raw string here rather than derived
-  # from whisperx.language (ISO 639-1, 2-letter, and nullable for
-  # auto-detect) -- there's no lookup table to keep in sync with that
-  # setting. Set this directly if your content isn't English.
+  # from any one engine's own language setting (which is ISO 639-1,
+  # 2-letter, and may be null for auto-detect) -- there's no lookup table
+  # to keep in sync with those. Set this directly if your content isn't
+  # English.
   track_language: eng
 
 

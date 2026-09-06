@@ -116,7 +116,7 @@ class _WarningCollectingHandler(logging.Handler):
     Why this exists: pipeline.py's end-of-run summary used to decide
     what's "notable" enough to surface in the AC_RESULT line (-> hush.sh
     --batch's own batch log) by checking a small, hand-maintained list of
-    specific state fields -- transcribe.py's mfa_fallback_segments,
+    specific state fields -- transcribe.py's mfa_fallback_segments, is
     encode.py's fallback_reason. Each of those is real and still gets its
     own specific, human-readable entry (see pipeline.py). But that
     approach silently under-covers by construction: any OTHER
@@ -300,6 +300,21 @@ class ConfigError(RuntimeError):
 # To change a default: edit config/config.yaml and rebuild the image.
 # Nothing in src/*.py should ever need a matching edit again.
 DEFAULT_CONFIG_PATH = Path("/app/defaults/config.yaml")
+
+
+# Every transcription/alignment engine this pipeline knows how to run --
+# the single shared registry utils.py's own validate_alignment_engines()/
+# alignment_engines_summary() below and steps/transcribe.py's per-segment
+# dispatch both key off of, so the two can never drift out of sync about
+# which engines exist. Adding a new engine: one more name here, a branch
+# in steps/transcribe.py's per-segment loop to actually run it, its own
+# alignment.engines.<name> block in config.yaml, and (if it has one) a
+# display label in steps/transcribe.py's own _ENGINE_LABELS. Nothing else
+# needs to change -- steps/merge.py, steps/transcript_srt.py, and
+# steps/mux.py all discover engines from job.json's own "alignment_engines"
+# list (written once, by steps/transcribe.py, at the end of a run), never
+# by importing this tuple directly.
+ALIGNMENT_ENGINE_NAMES = ("whisperx", "mfa", "crisperwhisper")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -517,6 +532,38 @@ def paths_banner(cfg: dict) -> str:
     return f"{input_line}\n{output_line}"
 
 
+def alignment_engines_summary(cfg: dict) -> str:
+    """
+    Multi-line, human-readable summary of the *resolved* alignment engine
+    toggles -- meant to be logged once, at startup, at INFO level. Same
+    motivation as retention_summary()/paths_banner()/censoring_summary()
+    above: which engines actually run this job, which (if any) get
+    exported as debug/comparison subtitles, and which one is
+    authoritative should be visible in the first few lines of output,
+    not something a person has to open job.json to confirm after the
+    fact.
+    """
+    tags: list[str] = []
+    debug_engines: list[str] = []
+
+    for name in ALIGNMENT_ENGINE_NAMES:
+        enabled = bool(cfg_get(cfg, "alignment", "engines", name, "enabled"))
+        final   = bool(cfg_get(cfg, "alignment", "engines", name, "final"))
+        debug   = bool(cfg_get(cfg, "alignment", "engines", name, "debug_subtitle"))
+        tag = "on" if enabled else "off"
+        if final:
+            tag += "(final)"
+        tags.append(f"{name}={tag}")
+        if enabled and debug:
+            debug_engines.append(name)
+
+    debug_str = ", ".join(debug_engines) if debug_engines else "(none)"
+    return (
+        f"Alignment   : {'  '.join(tags)}\n"
+        f"              debug subtitles: {debug_str}"
+    )
+
+
 def censoring_summary(cfg: dict) -> str:
     """
     Two-line, human-readable summary of the *resolved* censoring settings
@@ -606,11 +653,18 @@ def cfg_get(cfg: dict, *keys: str, default: Any = _UNSET, allow_null: bool = Fal
 
 # The settings where an explicit `null` is a real value rather than
 # "missing" -- kept in sync with the actual allow_null=True call sites
-# (steps/transcribe.py's whisperx.language; steps/align_mfa.py's
-# alignment.mfa.g2p_model, to disable G2P fallback entirely and rely on
-# the dictionary alone), so validate_config() below checks each leaf the
-# same way its real reader will.
-_ALLOW_NULL_KEYS = {("whisperx", "language"), ("alignment", "mfa", "g2p_model")}
+# (steps/transcribe.py's alignment.engines.whisperx.language; steps/
+# align_mfa.py's alignment.engines.mfa.g2p_model, to disable G2P fallback
+# entirely and rely on the dictionary alone; steps/transcribe.py's
+# alignment.engines.crisperwhisper.language -- see config.yaml's own
+# comment on that one for why null there means "default to English", not
+# true auto-detection the way it does for whisperx), so validate_config()
+# below checks each leaf the same way its real reader will.
+_ALLOW_NULL_KEYS = {
+    ("alignment", "engines", "whisperx", "language"),
+    ("alignment", "engines", "mfa", "g2p_model"),
+    ("alignment", "engines", "crisperwhisper", "language"),
+}
 
 
 def validate_config(cfg: dict) -> None:
@@ -659,6 +713,93 @@ def validate_config(cfg: dict) -> None:
             f"config.yaml is missing {len(missing)} required setting(s):\n  "
             + "\n  ".join(missing)
             + "\ncheck it against the shipped template at config/config.yaml."
+        )
+
+
+def validate_alignment_engines(cfg: dict) -> None:
+    """
+    Semantic checks validate_config() itself can't do (it only checks
+    presence -- see its own docstring) for alignment.engines.* -- called
+    once from pipeline.py's main(), immediately after validate_config()/
+    validate_hush_config(), for the same "fail in the first second of a
+    run, not hours in at whichever step first reads a bad value" reasoning
+    both of those already use.
+
+    Every engine in ALIGNMENT_ENGINE_NAMES is fully independent and
+    separately toggled (see config.yaml's own alignment.engines comment)
+    -- there is no cascade or implicit "this one depends on that one
+    being on" relationship a person configuring this needs to reason
+    about, with one documented exception that ISN'T a config-validity
+    concern: alignment.engines.mfa.enabled: true always makes WhisperX's
+    own recognition + alignment run internally too (MFA re-times
+    WhisperX's recognized text; it never recognizes speech itself), REGARDLESS
+    of alignment.engines.whisperx.enabled -- see steps/transcribe.py's
+    module docstring. That's a real compute-cost implication worth
+    knowing, but it's not something this function checks or blocks,
+    since alignment.engines.whisperx.enabled: false + alignment.engines.
+    mfa.enabled: true is a perfectly valid, common configuration (MFA
+    without also exposing WhisperX's own raw result).
+
+    What IS checked here, across every registered engine:
+      - exactly one ENABLED engine has final: true -- Step 4b/5 need
+        exactly one authoritative transcript to flag and mute words
+        against; zero means nothing would ever get censored (almost
+        certainly not intended), more than one is ambiguous about which
+        was actually meant.
+      - debug_subtitle: true and final: true both require enabled: true
+        on that SAME engine -- an engine that never runs has nothing to
+        export a subtitle from, and can't be authoritative for anything.
+
+    Does NOT check that a final/debug_subtitle engine's own runtime
+    dependencies are actually satisfiable (crisperwhisper installed, MFA's
+    conda env present, ...) -- those are checked lazily, at first real
+    use, by each engine's own module (steps/transcribe_crisperwhisper.py's
+    load_crisperwhisper_model(), steps/align_mfa.py's align_with_mfa())
+    with its own clear, actionable error either way. This function is
+    only about whether the *configuration itself* is coherent, not
+    whether the environment can deliver on it.
+    """
+    problems: list[str] = []
+    final_engines: list[str] = []
+
+    for name in ALIGNMENT_ENGINE_NAMES:
+        enabled        = bool(cfg_get(cfg, "alignment", "engines", name, "enabled"))
+        debug_subtitle = bool(cfg_get(cfg, "alignment", "engines", name, "debug_subtitle"))
+        final          = bool(cfg_get(cfg, "alignment", "engines", name, "final"))
+
+        if debug_subtitle and not enabled:
+            problems.append(
+                f"alignment.engines.{name}.debug_subtitle is true but "
+                f"alignment.engines.{name}.enabled is false -- there's "
+                "nothing to render a debug subtitle from."
+            )
+        if final and not enabled:
+            problems.append(
+                f"alignment.engines.{name}.final is true but "
+                f"alignment.engines.{name}.enabled is false -- an engine "
+                "that never runs can't be the authoritative one."
+            )
+        if final:
+            final_engines.append(name)
+
+    if not final_engines:
+        problems.append(
+            "none of alignment.engines.{" + ", ".join(ALIGNMENT_ENGINE_NAMES) + "}"
+            ".final is true -- exactly one must be, so Step 4b/5 know "
+            "which transcript to flag and mute words against."
+        )
+    elif len(final_engines) > 1:
+        problems.append(
+            "more than one alignment.engines.*.final is true "
+            f"({', '.join(final_engines)}) -- exactly one must be. Pick one "
+            "engine to be authoritative; the others can still run with "
+            "debug_subtitle: true for comparison."
+        )
+
+    if problems:
+        raise ConfigError(
+            f"config.yaml has {len(problems)} alignment.engines problem(s):\n  "
+            + "\n  ".join(problems)
         )
 
 

@@ -67,6 +67,8 @@ from pathlib import Path
 
 import utils
 from utils import (
+    ALIGNMENT_ENGINE_NAMES,
+    alignment_engines_summary,
     cfg_get,
     compute_job_id,
     find_job_dir,
@@ -80,6 +82,7 @@ from utils import (
     setup_logging,
     step_logger,
     unmark_step_done,
+    validate_alignment_engines,
     write_job,
 )
 from steps.extract  import extract_raw, downmix_to_stereo
@@ -323,6 +326,13 @@ def main() -> None:
     # this one specifically can't just wait for Step 6c to hit a bad
     # value itself.
     validate_hush_config(cfg)
+    # Another semantic check validate_config() can't do on its own:
+    # alignment.engines.* is internally coherent -- exactly one enabled
+    # engine is marked final, and debug_subtitle/final aren't set on an
+    # engine that isn't itself enabled. Same "fail before Step 1a, not
+    # hours in" reasoning as the two checks above -- see
+    # utils.validate_alignment_engines()'s own docstring.
+    validate_alignment_engines(cfg)
     log_level = cfg_get(cfg, "output", "log_level")
     setup_logging(log_level)
     log = step_logger("pipeline")
@@ -443,6 +453,8 @@ def main() -> None:
     for line in retention_summary(cfg).splitlines():
         log.info("%s", line)
     for line in paths_banner(cfg).splitlines():
+        log.info("%s", line)
+    for line in alignment_engines_summary(cfg).splitlines():
         log.info("%s", line)
     for line in utils.censoring_summary(cfg).splitlines():
         log.info("%s", line)
@@ -980,8 +992,9 @@ def main() -> None:
     mfa_fallback_segments = transcribe_st.get("mfa_fallback_segments", 0)
     if mfa_fallback_segments:
         log.info(
-            "  Alignment        : MFA, with whisperx.align() fallback for %d segment(s) "
-            "-- see the per-segment WARN lines above for which, and why.",
+            "  MFA fallback     : %d segment(s) had a whole-segment MFA "
+            "failure and fell back to WhisperX's own timing there -- see "
+            "the per-segment WARN lines above for which, and why.",
             mfa_fallback_segments,
         )
     if encode_st.get("fallback_reason"):
@@ -995,12 +1008,17 @@ def main() -> None:
             encode_st.get("encoder", "?"), encode_st.get("bitrate", "?"),
         )
     srt_st = state.get("transcript_srt", {})
-    # Sorted numerically for any numbered stage key ("1", "2", ...),
-    # with "final" always last -- matches the order export_srt() itself
-    # returns sources in (see steps/transcript_srt.py), and stays correct
-    # however many alignment stages this job ends up with.
+    # Sorted by this pipeline's own engine registry order
+    # (utils.ALIGNMENT_ENGINE_NAMES), with "final" always last -- matches
+    # the order export_srt() itself returns sources in (see
+    # steps/transcript_srt.py), and stays correct however many engines
+    # this job ends up with debug_subtitle turned on for.
     srt_keys_reported = sorted(
-        srt_st.keys(), key=lambda k: (k == "final", int(k) if k != "final" else 0)
+        srt_st.keys(),
+        key=lambda k: (
+            k == "final",
+            ALIGNMENT_ENGINE_NAMES.index(k) if k in ALIGNMENT_ENGINE_NAMES else len(ALIGNMENT_ENGINE_NAMES),
+        ),
     )
     if srt_keys_reported:
         for key in srt_keys_reported:
@@ -1013,7 +1031,7 @@ def main() -> None:
     elif "6c_transcript_srt" not in state.get("steps_completed", []):
         log.info("  Transcript SRT   : failed this run -- see the [srt] WARN line above; every other output is unaffected.")
     elif bool(cfg_get(cfg, "transcript_srt", "enabled")):
-        log.info("  Transcript SRT   : none (no alignment-stage or authoritative transcript had a word with usable alignment timing)")
+        log.info("  Transcript SRT   : none (no configured engine or the authoritative transcript had a word with usable alignment timing)")
     else:
         log.info("  Transcript SRT   : disabled (transcript_srt.enabled: false)")
     log.info("")
