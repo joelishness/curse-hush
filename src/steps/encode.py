@@ -3,9 +3,10 @@ profanity-hush — Step 6b: encode censored audio to match the original codec
 
 Re-encodes audio_censored.wav (Step 6's raw PCM output) into a standalone
 compressed audio file, matching the ORIGINAL audio track's codec, bitrate,
-sample rate, and channel layout as closely as ffmpeg's available encoders
-allow — as its own single-input ffmpeg invocation, with no video file
-involved at all.
+and sample rate as closely as ffmpeg's available encoders allow — as its
+own single-input ffmpeg invocation, with no video file involved at all.
+Channel count/layout is NOT part of that match — see "Channel handling"
+below for why, and for what changed there.
 
 Why this exists as a separate step (split out of steps/mux.py):
 
@@ -41,6 +42,50 @@ purely as a defensive belt-and-suspenders measure — it should be a no-op
 given the above, but costs nothing to pin explicitly rather than rely on
 whatever a given ffmpeg version's default happens to be.
 
+Channel handling — encode what's actually there, not what the source
+claims:
+
+audio_censored.wav is ALWAYS stereo. Every WAV this pipeline produces from
+Step 1b onward is (design doc §12: "The output audio will be stereo
+regardless of the original channel count" — Steps 1b through 6 all process
+a 2-channel downmix, never the source's original channel layout;
+per-channel processing is unbuilt future work, design doc §13.3). An
+earlier version of this step didn't account for that here specifically: it
+asked the encoder to target the ORIGINAL video's own channel count/layout
+(5.1, 7.1, ...) regardless of what audio_censored.wav actually contained.
+That doesn't restore the original mix — there's nothing left to restore,
+the extra channels were downmixed away at Step 1b — it just tells the
+encoder to fabricate silent channels around the same two channels of real
+audio. Confirmed directly, not assumed: encoding a genuinely-stereo WAV
+with an output `channel_layout` of `5.1` produces a file ffprobe happily
+reports as real 5.1, but `astats` shows channels 3-6 sitting at -inf dB
+(pure digital silence) before any lossy compression, and at the codec's
+own noise floor (~-100dB, completely inaudible) after — not a lesser
+surround mix, nothing.
+
+Two concrete problems followed from that, one silent and one loud:
+  - Silent: every multi-channel source this pipeline has successfully
+    processed to date has produced a final file whose audio track *claims*
+    the source's original channel count (a media info panel would show
+    "7.1", say) while every channel past stereo carries no signal at all.
+  - Loud: ffmpeg's own ac3/eac3/dca encoders all cap out at 5.1 (confirmed
+    directly against real encoder output — see `_pick_encoder`'s docstring
+    for dca specifically). A 7.1/8-channel source falling back to ac3 (the
+    exact case that surfaced this) asks the encoder for a channel_layout
+    it structurally cannot produce at all, and the whole step fails:
+    `Specified channel layout '7.1' is not supported by the ac3 encoder`.
+
+Fixed by deriving channel count/layout from audio_censored_path itself —
+what's actually about to be handed to the encoder — rather than from the
+original video's probed stream. This is strictly a two-channel value today
+(see above), but reads it live rather than hardcoding `2` specifically so
+this stays correct with no further change if a future per-channel
+pipeline (§13.3) ever makes audio_censored.wav genuinely multi-channel.
+Sample rate is NOT changed by this fix — still targets the original
+stream's own rate (`-ar`), since resampling is a real, non-fabricating
+operation, and matching it keeps this audio in sync with the untouched
+video stream Step 7 copies alongside it.
+
 Input  : original video file (probed only — never opened as an ffmpeg
          input here), audio_censored.wav (Step 6)
 Output : audio_encoded.mka
@@ -53,9 +98,12 @@ streams have their own quirks as bare files. Using .mka for all of them
 means Step 7 never needs to know or care which encoder Step 6b picked; it
 only ever stream-copies whatever single audio track is inside.
 
-Probe phase, codec map, and the ac3-fallback rules below are unchanged
-from the pre-split design (still per design doc §8) — only *where* they
-run has moved, from inside the mux command to here, one step earlier.
+Probe phase, codec map, and ac3-fallback rules for CHOOSING an encoder are
+unchanged from the pre-split design (still per design doc §8) — only
+*where* they run has moved, from inside the mux command to here, one step
+earlier. What that chosen encoder is then told to actually produce is a
+separate question — see "Channel handling" above for the one part of that
+which isn't just carried over from the original stream's own metadata.
 
 audio_censored.wav gets the same re-verify-before-consuming treatment
 dialog_censored.wav gets in steps/recombine.py, against the duration/
@@ -134,6 +182,17 @@ DEFAULT_BITRATE: dict[str, int] = {
 }
 
 AC3_MAX_BITRATE = 640_000  # ffmpeg's ac3 encoder ceiling -- used for fallbacks
+
+# Fallback name for a channel count ffprobe doesn't report as a named
+# layout -- confirmed directly that even a plain pipeline-produced
+# pcm_s16le stereo WAV reports channel_layout "unknown" despite genuinely
+# having 2 channels, which is exactly the shape of file this step now
+# probes for its encoding target (see "Channel handling" in the module
+# docstring). Keyed by count so it resolves correctly for whatever's
+# actually present, not just 2 -- the 6/8 entries stay here for forward
+# compatibility with a future per-channel pipeline (design doc §13.3),
+# not because today's code path can reach them (audio_censored.wav is
+# always 2ch under the current architecture).
 DEFAULT_CHANNEL_LAYOUT = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}
 
 
@@ -146,8 +205,10 @@ def encode(
 ) -> Path:
     """
     Step 6b: encode audio_censored.wav (Step 6) to audio_encoded.mka,
-    matching the original video's audio codec/bitrate/sample rate/channel
-    layout — as a standalone, single-input ffmpeg command.
+    matching the original video's audio codec/bitrate/sample rate — as a
+    standalone, single-input ffmpeg command. Channel count/layout is NOT
+    matched to the original; see the module docstring's "Channel
+    handling" section for why.
 
     Returns the path to audio_encoded.mka.
     """
@@ -202,16 +263,29 @@ def encode(
     stream = _probe_audio_stream(video_path, log)
     encoder, bitrate, fallback_reason = _pick_encoder(stream, log)
 
-    ch         = stream.get("channels") or 2
-    raw_layout = stream.get("channel_layout")
+    orig_ch         = stream.get("channels") or 2
+    raw_orig_layout = stream.get("channel_layout")
+    orig_layout     = raw_orig_layout if raw_orig_layout and raw_orig_layout.lower() != "unknown" \
+        else DEFAULT_CHANNEL_LAYOUT.get(orig_ch, f"{orig_ch}ch")
+    rate   = stream.get("sample_rate") or "44100"
+    delay  = (stream.get("tags") or {}).get("DELAY")
+
+    # What's actually handed to the encoder for channel count/layout comes
+    # from audio_censored_path itself, never from the original video's
+    # stream above -- see "Channel handling" in the module docstring for
+    # why (short version: this file is always stereo regardless of the
+    # source's own channel count, so asking the encoder to target the
+    # source's original layout just fabricates silent channels rather
+    # than restoring anything).
+    censored_stream = _probe_audio_stream(audio_censored_path, log)
+    ch         = censored_stream.get("channels") or 2
+    raw_layout = censored_stream.get("channel_layout")
     layout     = raw_layout if raw_layout and raw_layout.lower() != "unknown" \
         else DEFAULT_CHANNEL_LAYOUT.get(ch, "stereo")
-    rate       = stream.get("sample_rate") or "44100"
-    delay      = (stream.get("tags") or {}).get("DELAY")
 
     log.info(
         "  original audio: codec=%s  channels=%s (%s)  sample_rate=%s Hz  bitrate=%s",
-        stream.get("codec_name", "unknown"), ch, layout, rate, stream.get("bit_rate", "?"),
+        stream.get("codec_name", "unknown"), orig_ch, orig_layout, rate, stream.get("bit_rate", "?"),
     )
     if fallback_reason:
         log.warning(
@@ -223,6 +297,21 @@ def encode(
         log.info("  → re-encoding censored audio to %s%s", encoder,
                   f" at {bitrate} bps" if bitrate else " (lossless, no bitrate target)")
 
+    if ch < orig_ch:
+        log.warning(
+            "  Source is %s (%d ch), but audio_censored.wav itself only has "
+            "%d channel(s) -- this pipeline censors audio in stereo "
+            "throughout (Steps 1b-6; design doc §12), so there is nothing "
+            "beyond stereo to encode here. Encoding as %s (%d ch): the "
+            "honest channel count for what this file actually contains, "
+            "not %s -- claiming the source's original layout on stereo-only "
+            "content would produce a file that LOOKS like a full surround "
+            "mix (ffprobe would report %s) while every channel past stereo "
+            "carried nothing but silence.",
+            orig_layout, orig_ch, ch, layout, ch, orig_layout, orig_layout,
+        )
+    log.info("  encoding target: channels=%d (%s)  sample_rate=%s Hz", ch, layout, rate)
+
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(audio_censored_path),
@@ -231,6 +320,17 @@ def encode(
     if bitrate:  # 0 for lossless encoders (flac, pcm_*) -- no -b:a target
         cmd += ["-b:a", str(bitrate)]
     cmd += ["-ar", str(rate), "-channel_layout", str(layout)]
+    if encoder == "dca":
+        # ffmpeg's own DTS encoder is still flagged experimental --
+        # confirmed directly, not assumed: it refuses to run at all
+        # without this, citing "experimental codecs are not enabled".
+        # There's no quality/stability signal behind that flag worth
+        # heeding here (dca has shipped, unchanged in this respect, in
+        # every ffmpeg release this pipeline has targeted); it's just an
+        # upstream label that's never been lifted. Scoped to this one
+        # encoder rather than added unconditionally, since no other
+        # entry in CODEC_MAP needs it.
+        cmd += ["-strict", "-2"]
     if delay:
         cmd += ["-metadata:s:a:0", f"DELAY={delay}"]
     # Defensive only -- a single-input encode has no other file's
@@ -256,11 +356,15 @@ def encode(
 
     state = read_job(job_dir)
     state["encode"] = {
-        "output":                encoded_out.name,
-        "encoder":               encoder,
-        "bitrate":               bitrate,
-        "fallback_reason":       fallback_reason,
-        "audio_encoded_sha256":  encoded_hash,
+        "output":                  encoded_out.name,
+        "encoder":                 encoder,
+        "bitrate":                 bitrate,
+        "channels":                ch,
+        "channel_layout":          layout,
+        "original_channels":       orig_ch,
+        "original_channel_layout": orig_layout,
+        "fallback_reason":         fallback_reason,
+        "audio_encoded_sha256":    encoded_hash,
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "6b_encode")
@@ -271,13 +375,20 @@ def encode(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _probe_audio_stream(video_path: Path, log: logging.LoggerAdapter) -> dict:
+def _probe_audio_stream(path: Path, log: logging.LoggerAdapter) -> dict:
     """
-    Probe the original video's primary audio stream for the fields Step 6b
-    needs: codec_name, profile (only to distinguish DTS-HD MA from plain
-    DTS -- see _pick_encoder), bit_rate, sample_rate, channels,
-    channel_layout, and the DELAY tag (A/V sync offset, present only on
-    some mkvmerge-authored files).
+    Probe path's primary audio stream for codec_name, profile (only to
+    distinguish DTS-HD MA from plain DTS -- see _pick_encoder), bit_rate,
+    sample_rate, channels, channel_layout, and the DELAY tag (A/V sync
+    offset, present only on some mkvmerge-authored files).
+
+    Two call sites in this module, on two different kinds of file: the
+    original video (codec/bitrate/sample-rate/DELAY -- what encode()
+    matches) and audio_censored_path itself (channels/channel_layout --
+    what encode() actually has to hand the encoder; see "Channel
+    handling" in the module docstring for why those come from different
+    places). Every field this function reads is meaningful on either
+    kind of input; each call site just uses a different subset of them.
 
     A private, step-local duplicate of steps/extract.py's own probe
     rather than a shared import -- matches this codebase's existing
@@ -295,7 +406,7 @@ def _probe_audio_stream(video_path: Path, log: logging.LoggerAdapter) -> dict:
             "stream=codec_name,profile,bit_rate,sample_rate,channels,channel_layout",
             "-show_entries", "stream_tags=DELAY",
             "-of", "json",
-            str(video_path),
+            str(path),
         ],
         log,
     )
@@ -303,7 +414,7 @@ def _probe_audio_stream(video_path: Path, log: logging.LoggerAdapter) -> dict:
     streams = data.get("streams", [])
     if not streams:
         raise RuntimeError(
-            f"No audio streams found in {video_path.name}.  "
+            f"No audio streams found in {path.name}.  "
             "Verify the file is a valid video/audio container."
         )
     return streams[0]
