@@ -86,6 +86,33 @@ stream's own rate (`-ar`), since resampling is a real, non-fabricating
 operation, and matching it keeps this audio in sync with the untouched
 video stream Step 7 copies alongside it.
 
+Track title:
+
+The audio stream's own `title` tag — a free-text label a media player
+shows in its track picker — is carried forward completely verbatim when
+this step downmixes, never reformatted or parsed. It's an arbitrary
+string with no fixed structure a parser could safely rely on: confirmed
+directly against a real file in this library, whose title reads
+"Surround 7.1" on a stream ffprobe reports as plain 2-channel stereo
+(the file was downmixed/transcoded upstream of this pipeline at some
+point, and whatever produced it never updated the title to match — see
+steps/extract.py's own comment on exactly this mismatch). Since the text
+itself can't be trusted to describe the stream it's attached to, and
+isn't safe to parse for anything more structured than "here is some
+text," the only thing done to it here is prepend a short, fixed prefix.
+
+When this step genuinely downmixes (orig_ch > ch, same condition as
+above), the output title becomes "Stereo from {orig_title}" (e.g.
+"Stereo from Surround 7.1"), falling back to "Stereo from {orig_layout}"
+(e.g. "Stereo from 7.1") only when there's no original title at all to
+carry forward. When nothing was actually downmixed here, orig_title —
+if the source had one — passes through completely unchanged: this is
+what lets someone looking at a finished file's track list tell the
+primary/full mix apart from something that was already stereo to begin
+with (e.g. a commentary track). Either way, this step only ever adds a
+fixed prefix or leaves a title alone — it never edits, reformats, or
+second-guesses the text itself.
+
 Input  : original video file (probed only — never opened as an ffmpeg
          input here), audio_censored.wav (Step 6)
 Output : audio_encoded.mka
@@ -269,6 +296,7 @@ def encode(
         else DEFAULT_CHANNEL_LAYOUT.get(orig_ch, f"{orig_ch}ch")
     rate   = stream.get("sample_rate") or "44100"
     delay  = (stream.get("tags") or {}).get("DELAY")
+    orig_title = (stream.get("tags") or {}).get("title")
 
     # What's actually handed to the encoder for channel count/layout comes
     # from audio_censored_path itself, never from the original video's
@@ -297,7 +325,8 @@ def encode(
         log.info("  → re-encoding censored audio to %s%s", encoder,
                   f" at {bitrate} bps" if bitrate else " (lossless, no bitrate target)")
 
-    if ch < orig_ch:
+    downmixed = ch < orig_ch
+    if downmixed:
         log.warning(
             "  Source is %s (%d ch), but audio_censored.wav itself only has "
             "%d channel(s) -- this pipeline censors audio in stereo "
@@ -310,7 +339,22 @@ def encode(
             "carried nothing but silence.",
             orig_layout, orig_ch, ch, layout, ch, orig_layout, orig_layout,
         )
-    log.info("  encoding target: channels=%d (%s)  sample_rate=%s Hz", ch, layout, rate)
+
+    # See "Track title" in the module docstring. orig_title is carried
+    # forward completely verbatim -- never reformatted or parsed, since
+    # it's an arbitrary free-text string with no fixed structure. A
+    # genuine downmix prefixes it with "Stereo from "; the orig_layout
+    # fallback only fires when there's no original title at all to carry
+    # forward. When there's no downmix, orig_title (which may be None)
+    # passes through completely unchanged.
+    if downmixed:
+        new_title = f"Stereo from {orig_title}" if orig_title else f"Stereo from {orig_layout}"
+    else:
+        new_title = orig_title
+    log.info(
+        "  encoding target: channels=%d (%s)  sample_rate=%s Hz  title=%s",
+        ch, layout, rate, new_title or "(none)",
+    )
 
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -331,6 +375,8 @@ def encode(
         # encoder rather than added unconditionally, since no other
         # entry in CODEC_MAP needs it.
         cmd += ["-strict", "-2"]
+    if new_title:
+        cmd += ["-metadata:s:a:0", f"title={new_title}"]
     if delay:
         cmd += ["-metadata:s:a:0", f"DELAY={delay}"]
     # Defensive only -- a single-input encode has no other file's
@@ -361,8 +407,10 @@ def encode(
         "bitrate":                 bitrate,
         "channels":                ch,
         "channel_layout":          layout,
+        "title":                   new_title,
         "original_channels":       orig_ch,
         "original_channel_layout": orig_layout,
+        "original_title":          orig_title,
         "fallback_reason":         fallback_reason,
         "audio_encoded_sha256":    encoded_hash,
     }
@@ -379,16 +427,24 @@ def _probe_audio_stream(path: Path, log: logging.LoggerAdapter) -> dict:
     """
     Probe path's primary audio stream for codec_name, profile (only to
     distinguish DTS-HD MA from plain DTS -- see _pick_encoder), bit_rate,
-    sample_rate, channels, channel_layout, and the DELAY tag (A/V sync
-    offset, present only on some mkvmerge-authored files).
+    sample_rate, channels, channel_layout, and two stream tags: DELAY
+    (A/V sync offset, present only on some mkvmerge-authored files) and
+    title (a free-text track label -- see "Track title" in the module
+    docstring).
 
     Two call sites in this module, on two different kinds of file: the
-    original video (codec/bitrate/sample-rate/DELAY -- what encode()
-    matches) and audio_censored_path itself (channels/channel_layout --
-    what encode() actually has to hand the encoder; see "Channel
-    handling" in the module docstring for why those come from different
-    places). Every field this function reads is meaningful on either
-    kind of input; each call site just uses a different subset of them.
+    original video (codec/bitrate/sample-rate/DELAY/title -- what
+    encode() matches, or in title's case, decides whether to trust) and
+    audio_censored_path itself (channels/channel_layout -- what encode()
+    actually has to hand the encoder; see "Channel handling" in the
+    module docstring for why those come from different places).
+    audio_censored_path is never expected to carry its own title or
+    DELAY tag (it's a plain WAV this pipeline built itself, not
+    something with authored metadata) -- fetching the same full set from
+    both calls anyway is simpler than a second, narrower query, and
+    reading a tag that isn't there just returns None. Every field this
+    function reads is meaningful on at least one call site; each just
+    uses a different subset of them.
 
     A private, step-local duplicate of steps/extract.py's own probe
     rather than a shared import -- matches this codebase's existing
@@ -404,7 +460,7 @@ def _probe_audio_stream(path: Path, log: logging.LoggerAdapter) -> dict:
             "-select_streams", "a:0",
             "-show_entries",
             "stream=codec_name,profile,bit_rate,sample_rate,channels,channel_layout",
-            "-show_entries", "stream_tags=DELAY",
+            "-show_entries", "stream_tags=DELAY,title",
             "-of", "json",
             str(path),
         ],
